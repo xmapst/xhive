@@ -4,6 +4,10 @@
 // time.After 每次调用都会创建新的 channel 和 timer 对象，在海量定时器场景下会产生大量短生命周期对象；
 // 时间轮算法通过固定大小的槽位数组重用内存，每次 tick 只检查当前层级，避免全量遍历，
 // 在游戏服务器数千个同时活跃的定时器场景下具有显著的性能优势。
+//
+// 时间表示：对外与对内统一使用 Go 内置时间类型——绝对时刻用 time.Time，时间间隔/粒度用 time.Duration。
+// 仅时间轮分级所必需的 tick 计数保留为 int64（位运算分级的算法要求），它表示 timerTick 的整数倍计数，
+// 由 now.UnixNano() / int64(timerTick) 推导，本身不承载具体时间单位。
 package timer
 
 import (
@@ -16,13 +20,24 @@ import (
 
 // 时间轮配置常量。
 const (
-	// timerTick 时间轮最小触发粒度（毫秒），使用 2 的幂次方便于后续位运算计算层级掩码。
+	// timerTick 时间轮最小触发粒度，使用 2 的幂次方便于后续位运算计算层级掩码。
 	// 4ms 的精度对游戏逻辑（如技能 CD、AI 决策）已足够，远优于内核调度的典型抖动范围。
-	timerTick = 4
+	timerTick = 4 * time.Millisecond
 
 	// timerLevel 时间轮分级数，决定支持的最大定时时长。
 	// 28 级支持的最大时长约为 2^28 × 4ms ≈ 12.4 天，覆盖绝大多数游戏业务场景。
 	timerLevel = 28
+)
+
+// opKind 分发器操作类型，显式区分发送到 chanOp 的命令语义，
+// 取代以往靠 deadline/cb 是否为零值隐式判断操作的写法，避免歧义。
+type opKind int8
+
+const (
+	opNew    opKind = iota // 新建定时器
+	opUpdate               // 更新到期时刻（加速/延迟）
+	opCancel               // 取消定时器
+	opStop                 // 停止分发器主循环
 )
 
 // Event 定时器触发事件接口，供 Mgr 消费者调用。
@@ -50,10 +65,11 @@ type dispatcher struct {
 
 // dispatcherTimer 时间轮内部使用的定时器节点，同时复用为操作命令的载体。
 type dispatcherTimer struct {
-	name  string      // 做消息统计用
-	id    int64       // 定时器唯一 ID，ID=0 为内置停止信号，禁止业务使用
-	endTs int64       // 到期绝对时间戳（毫秒），endTs=0 表示取消操作
-	cb    func(int64) // 到期回调函数，cb=nil 且 endTs≠0 表示更新操作（移动槽位）
+	op       opKind      // 操作类型，决定 doOp 的处理分支
+	name     string      // 做消息统计用
+	id       int64       // 定时器唯一 ID，opStop 信号约定 id=0，禁止业务使用
+	deadline time.Time   // 到期绝对时刻
+	cb       func(int64) // 到期回调函数
 }
 
 // Cb 安全执行定时器回调，通过 recover 捕获 panic 防止单个回调异常崩溃整个进程。
@@ -99,7 +115,7 @@ func (disp *dispatcher) Run() {
 
 // run 时间轮主循环，在独立 goroutine 中运行，通过 select 多路复用两类事件：
 //   - chanOp：处理来自业务层的增删改操作命令
-//   - tickTimer.C：每隔 timerTick 毫秒推进一次时间轮，检查并触发到期定时器
+//   - tickTimer.C：每隔 timerTick 推进一次时间轮，检查并触发到期定时器
 func (disp *dispatcher) run() {
 	defer func() {
 		if x := recover(); x != nil {
@@ -107,65 +123,63 @@ func (disp *dispatcher) run() {
 		}
 	}()
 
-	lastTick := time.Now().UnixMilli() / timerTick
-	tickTimer := time.NewTimer(timerTick * time.Millisecond)
+	lastTick := time.Now().UnixNano() / int64(timerTick)
+	tickTimer := time.NewTimer(timerTick)
 	for {
 		select {
 		case t := <-disp.chanOp:
 			if !disp.doOp(t) {
-				return // 收到 id=0 停止信号，退出主循环
+				return // 收到 opStop 停止信号，退出主循环
 			}
 		case <-tickTimer.C:
-			tickTimer.Reset(timerTick * time.Millisecond)
+			tickTimer.Reset(timerTick)
 			lastTick = disp.doTick(time.Now(), lastTick)
 		}
 	}
 }
 
-// doOp 解析并执行定时器操作命令，通过 dispatcherTimer 字段的组合区分不同操作：
-//   - endTs == 0：取消定时器
-//   - id == 0：停止分发器（约定的内置信号）
-//   - endTs != 0 && cb != nil：新建定时器
-//   - endTs != 0 && cb == nil：更新定时器到期时间（加速/延迟）
+// doOp 根据 op 字段执行定时器操作命令，返回 false 表示需要停止分发器主循环。
 func (disp *dispatcher) doOp(t *dispatcherTimer) bool {
-	// 取消操作：先将 ID 写入 canceledTimers 快速过滤集合，
-	// 再从时间轮物理删除，确保即使定时器已投递到 ChanTimer 也不会被触发
-	if t.endTs == 0 {
+	switch t.op {
+	case opCancel:
+		// 取消操作：先将 ID 写入 canceledTimers 快速过滤集合，
+		// 再从时间轮物理删除，确保即使定时器已投递到 chanFired 也不会被触发
 		disp.canceledTimers.Store(t.id, struct{}{})
 		disp.delete(t.id)
 		return true
-	}
 
-	// 若定时器在操作执行前已被取消，忽略后续的新建/更新操作，防止"取消后重建"的竞态
-	if _, canceled := disp.canceledTimers.Load(t.id); canceled {
-		return true
-	}
-
-	// id=0 是约定的停止信号，返回 false 使 run() 退出主循环
-	if t.id == 0 {
+	case opStop:
+		// 约定的停止信号，返回 false 使 run() 退出主循环
 		return false
-	}
 
-	// 新建定时器：清除旧的取消标记（防止 Cancel 后立即 NewTimer 时被误过滤），并放入时间轮
-	if t.endTs != 0 && t.cb != nil {
+	case opNew:
+		// 若定时器在操作执行前已被取消，忽略新建，防止"取消后重建"的竞态
+		if _, canceled := disp.canceledTimers.Load(t.id); canceled {
+			return true
+		}
+		// 清除可能残留的取消标记（防止 Cancel 后立即 New 时被误过滤），并放入时间轮
 		disp.canceledTimers.Delete(t.id)
 		disp.place(t)
 		return true
-	}
 
-	// 更新定时器到期时间：从旧槽位取出，更新 endTs，放入新槽位
-	if t.endTs != 0 && t.cb == nil {
+	case opUpdate:
+		// 同样受取消标记保护：已取消的定时器不再更新
+		if _, canceled := disp.canceledTimers.Load(t.id); canceled {
+			return true
+		}
+		// 从旧槽位取出，更新 deadline，放入新槽位
 		oldt := disp.delete(t.id)
 		if oldt != nil {
-			oldt.endTs = t.endTs
+			oldt.deadline = t.deadline
 			disp.place(oldt)
 		} else {
 			slog.Error("delay timer get old timer fail", "timer_id", t.id)
 		}
 		return true
-	}
 
-	return true
+	default:
+		return true
+	}
 }
 
 // delete 从时间轮各层级中删除指定 ID 的定时器，同时清理 canceledTimers 中的标记防止内存泄漏。
@@ -194,9 +208,9 @@ func (disp *dispatcher) place(t *dispatcherTimer) {
 		return
 	}
 
-	diff := t.endTs - time.Now().UnixMilli()
+	diff := t.deadline.Sub(time.Now())
 	if diff <= 0 {
-		// 已到期，非阻塞投递：ChanTimer 满时跳过，等待下次 tick 重试
+		// 已到期，非阻塞投递：chanFired 满时跳过，等待下次 tick 重试
 		select {
 		case disp.chanFired <- t:
 		default:
@@ -221,8 +235,7 @@ func (disp *dispatcher) place(t *dispatcherTimer) {
 // 防时钟跳变：若时钟发生跳变（如系统时间被修正），逐步推进而非一次性跳到当前时刻，
 // 确保中间层级的定时器降级操作不被跳过，保证大时长定时器能正确触发。
 func (disp *dispatcher) doTick(now time.Time, lastTick int64) int64 {
-	nowMs := now.UnixMilli()
-	nowTick := nowMs / timerTick
+	nowTick := now.UnixNano() / int64(timerTick)
 	if nowTick-lastTick < 1 {
 		return nowTick
 	}
@@ -235,7 +248,7 @@ func (disp *dispatcher) doTick(now time.Time, lastTick int64) int64 {
 		for i := timerLevel - 1; i >= 0; i-- {
 			mask := (1 << uint(i)) - 1
 			if lastTick&int64(mask) == 0 {
-				disp.trigger(nowMs, i)
+				disp.trigger(now, i)
 			}
 		}
 
@@ -252,7 +265,7 @@ func (disp *dispatcher) doTick(now time.Time, lastTick int64) int64 {
 // 层级降级的时机：当定时器的剩余时间已短于当前层级的时间跨度时，
 // 移至更精确的低层级，使其在正确的时刻被检测到。
 // 最低层（level=0）中到期的定时器通过非阻塞 select 投递，发送失败则在下次 tick 重试。
-func (disp *dispatcher) trigger(nowMs int64, level int) {
+func (disp *dispatcher) trigger(now time.Time, level int) {
 	slotMap := disp.timerSlots[level]
 	for k, v := range slotMap {
 		// 快速过滤已取消的定时器，避免触发无效回调
@@ -262,13 +275,13 @@ func (disp *dispatcher) trigger(nowMs int64, level int) {
 			continue
 		}
 
-		// 位移运算等价于 timerTick * 2^level，避免乘法溢出风险
-		if v.endTs-nowMs < ((1 << uint(level)) * timerTick) {
+		// 位移运算等价于 timerTick × 2^level
+		if v.deadline.Sub(now) < (timerTick << uint(level)) {
 			if level != 0 {
 				// 将定时器降级到更精确的层级，确保在合适的时刻被触发
 				disp.timerSlots[level-1][k] = v
 				delete(slotMap, k)
-			} else if nowMs >= v.endTs {
+			} else if !now.Before(v.deadline) {
 				// 最低层已到期，非阻塞投递；发送失败（通道满）则保留在槽位，等待下次 tick
 				select {
 				case disp.chanFired <- v:
@@ -281,38 +294,36 @@ func (disp *dispatcher) trigger(nowMs int64, level int) {
 }
 
 // Stop 向分发器发送停止信号，通知主循环退出。
-//
-// 通过发送 id=0 的特殊命令实现：约定 id=0 为内置停止信号，业务层 ID 从 1 开始。
 func (disp *dispatcher) Stop() {
-	disp.chanOp <- &dispatcherTimer{name: "stop", id: 0, endTs: 0}
+	disp.chanOp <- &dispatcherTimer{op: opStop, name: "stop", id: 0}
 }
 
-// Update 更新定时器的到期时间，用于加速或延迟已存在的定时器。
+// Update 更新定时器的到期时刻，用于加速或延迟已存在的定时器。
 //
 // 通过 chanOp 将更新操作异步发送到分发器 goroutine 处理，
 // 保证时间轮数据的单线程访问，无需外部加锁。
-func (disp *dispatcher) Update(name string, timerID, newEndTs int64) {
-	disp.chanOp <- &dispatcherTimer{name: name, id: timerID, endTs: newEndTs}
+func (disp *dispatcher) Update(name string, timerID int64, deadline time.Time) {
+	disp.chanOp <- &dispatcherTimer{op: opUpdate, name: name, id: timerID, deadline: deadline}
 }
 
 // New 创建定时器并放入时间轮，timerID 为 0 时自动生成全局唯一 ID。
 //
 // 通过 chanOp 异步发送创建命令，由分发器 goroutine 执行实际的槽位分配操作。
-func (disp *dispatcher) New(name string, timerID, timeout int64, cb func(int64)) int64 {
+func (disp *dispatcher) New(name string, timerID int64, deadline time.Time, cb func(int64)) int64 {
 	if timerID == 0 {
 		timerID = disp.atomicID.Add(1)
 	}
-	disp.chanOp <- &dispatcherTimer{name: name, id: timerID, endTs: timeout, cb: cb}
+	disp.chanOp <- &dispatcherTimer{op: opNew, name: name, id: timerID, deadline: deadline, cb: cb}
 	return timerID
 }
 
 // Cancel 取消定时器，采用"先标记后删除"的双重机制确保取消的即时生效性。
 //
 // 先立即将 timerID 写入 canceledTimers（快速过滤集合），
-// 使已投递到 ChanTimer 但尚未被消费的到期事件也能被过滤掉，
+// 使已投递到 chanFired 但尚未被消费的到期事件也能被过滤掉，
 // 再通过 chanOp 异步发送物理删除命令，从时间轮槽位中移除定时器节点，
 // 两者结合保证取消操作在逻辑层面的即时性和内存层面的最终一致性。
 func (disp *dispatcher) Cancel(name string, timerID int64) {
 	disp.canceledTimers.Store(timerID, struct{}{}) // 立即生效：即使定时器已到期且在通道中排队，也会被过滤
-	disp.chanOp <- &dispatcherTimer{name: name, id: timerID, endTs: 0}
+	disp.chanOp <- &dispatcherTimer{op: opCancel, name: name, id: timerID}
 }

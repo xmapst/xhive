@@ -32,14 +32,18 @@ type IRPC interface {
 type ITimer interface {
 	// RegisterTimer 注册指定类型定时器的处理函数，同 name 仅能注册一个处理器（后注册覆盖前者）。
 	RegisterTimer(name string, handler timer.Handler)
-	// NewTimer 创建并启动一个定时器，返回定时器 ID。
-	NewTimer(name string, duraMs int64, opts ...timer.Option) int64
-	// AccTimer 加速指定定时器，提前其触发时间。
-	AccTimer(id int64, kind timer.AccKind, value int64) error
-	// DelayTimer 延迟指定定时器，推迟其触发时间。
-	DelayTimer(id int64, kind timer.AccKind, value int64) (err error)
-	// UpdateTimer 直接设置定时器的绝对到期时间戳（毫秒），用于需要精确控制触发时刻的场景
-	UpdateTimer(id int64, endTs int64)
+	// NewTimer 创建并启动一个定时器，d 为相对当前时刻的延迟时长，返回定时器 ID。
+	NewTimer(name string, d time.Duration, opts ...timer.Option) int64
+	// AccAbsTimer 按绝对时长加速定时器，使其提前触发。
+	AccAbsTimer(id int64, d time.Duration) error
+	// AccPctTimer 按万分比加速定时器，使其提前触发。
+	AccPctTimer(id int64, pct int64) error
+	// DelayAbsTimer 按绝对时长延迟定时器，使其推迟触发。
+	DelayAbsTimer(id int64, d time.Duration) error
+	// DelayPctTimer 按万分比延迟定时器，使其推迟触发。
+	DelayPctTimer(id int64, pct int64) error
+	// UpdateTimer 直接设置定时器的绝对到期时刻，用于需要精确控制触发时刻的场景。
+	UpdateTimer(id int64, deadline time.Time)
 	// CancelTimer 取消指定 ID 的定时器，对已触发或已取消的定时器调用是安全的（幂等）。
 	CancelTimer(id int64)
 }
@@ -139,21 +143,19 @@ func (s *Skeleton) close() {
 
 // scheduleDumpTimer 计算下一个触发时刻并创建一次性定时器，错峰 30s到60s 随机抖动
 func (s *Skeleton) scheduleDumpTimer() {
-	// 每15分钟整点执行
-	nowTs := time.Now().UnixMilli()
-	nextTs := s.dayStartTs(nowTs)
-	for nextTs <= nowTs {
-		nextTs += timer.HourMs
+	// 每整点执行
+	now := time.Now()
+	next := s.dayStart(now)
+	for !next.After(now) {
+		next = next.Add(time.Hour)
 	}
 	// 增加一个随机30s到60s之间的随机变量来错峰
-	jitter := rand.Int64N(30000) + 30000
-	s.NewTimer(timerKindDumpStat, nextTs-nowTs+jitter)
+	jitter := time.Duration(rand.Int64N(int64(30*time.Second))) + 30*time.Second
+	s.NewTimer(timerKindDumpStat, next.Sub(now)+jitter)
 }
 
-func (s *Skeleton) dayStartTs(nowMs int64) int64 {
-	now := time.Unix(nowMs/timer.SecMs, (nowMs%timer.SecMs)*int64(time.Millisecond))
-	nowDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	return nowDay.UnixMilli()
+func (s *Skeleton) dayStart(now time.Time) time.Time {
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 }
 
 // dumpStat dump 并可选重置统计
@@ -176,24 +178,34 @@ func (s *Skeleton) RegisterTimer(name string, handler timer.Handler) {
 	s.timer.Register(name, handler)
 }
 
-// NewTimer 创建并启动一个定时器，返回定时器 ID。
-func (s *Skeleton) NewTimer(name string, duraMs int64, opts ...timer.Option) int64 {
-	return s.timer.New(name, duraMs, opts...)
+// NewTimer 创建并启动一个定时器，d 为相对当前时刻的延迟时长，返回定时器 ID。
+func (s *Skeleton) NewTimer(name string, d time.Duration, opts ...timer.Option) int64 {
+	return s.timer.New(name, d, opts...)
 }
 
-// AccTimer 按指定方式加速定时器，提前其触发时间。
-func (s *Skeleton) AccTimer(id int64, kind timer.AccKind, value int64) error {
-	return s.timer.Acc(id, kind, value)
+// AccAbsTimer 按绝对时长加速定时器，使其提前触发。
+func (s *Skeleton) AccAbsTimer(id int64, d time.Duration) error {
+	return s.timer.AccAbs(id, d)
 }
 
-// DelayTimer 按指定方式延迟定时器，推迟其触发时间。
-func (s *Skeleton) DelayTimer(id int64, kind timer.AccKind, value int64) error {
-	return s.timer.Delay(id, kind, value)
+// AccPctTimer 按万分比加速定时器，使其提前触发。
+func (s *Skeleton) AccPctTimer(id int64, pct int64) error {
+	return s.timer.AccPct(id, pct)
 }
 
-// UpdateTimer 直接设置定时器的绝对到期时间戳（毫秒），用于需要精确控制触发时刻的场景
-func (s *Skeleton) UpdateTimer(id int64, endTs int64) {
-	s.timer.Update(id, endTs)
+// DelayAbsTimer 按绝对时长延迟定时器，使其推迟触发。
+func (s *Skeleton) DelayAbsTimer(id int64, d time.Duration) error {
+	return s.timer.DelayAbs(id, d)
+}
+
+// DelayPctTimer 按万分比延迟定时器，使其推迟触发。
+func (s *Skeleton) DelayPctTimer(id int64, pct int64) error {
+	return s.timer.DelayPct(id, pct)
+}
+
+// UpdateTimer 直接设置定时器的绝对到期时刻，用于需要精确控制触发时刻的场景。
+func (s *Skeleton) UpdateTimer(id int64, deadline time.Time) {
+	s.timer.Update(id, deadline)
 }
 
 // CancelTimer 取消指定 ID 的定时器，同时清理业务层元数据，对已触发/已取消的定时器调用安全（幂等）。

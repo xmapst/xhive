@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/xmapst/xhive/chanrpc"
-	"github.com/xmapst/xhive/timer"
 )
 
 // skMsg 是 Skeleton 测试专用的本地 RPC 消息类型，避免依赖其他包的导出类型。
@@ -57,7 +56,7 @@ func TestSkeletonOnRunProcessesRPCAndTimer(t *testing.T) {
 	if err := s.RegisterChanRPC(skMsg{}, func(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
 		rpcHit <- ci.Request.(skMsg).Value
 		// 在 OnRun goroutine 内创建定时器，符合 timer.Mgr 的单 goroutine 访问约定。
-		s.NewTimer("evt", 8)
+		s.NewTimer("evt", 8*time.Millisecond)
 		return &chanrpc.RetInfo{Ack: skMsg{Value: "ack"}}
 	}); err != nil {
 		t.Fatalf("RegisterChanRPC error = %v", err)
@@ -173,35 +172,47 @@ func TestSkeletonRPCToMissingModule(t *testing.T) {
 	s.Cast("no-such-module", skMsg{})
 }
 
-// TestSkeletonTimerForwarders 覆盖 AccTimer/DelayTimer/UpdateTimer/CancelTimer 的转发。
+// TestSkeletonTimerForwarders 覆盖 AccAbsTimer/AccPctTimer/DelayAbsTimer/DelayPctTimer/UpdateTimer/CancelTimer 的转发。
 func TestSkeletonTimerForwarders(t *testing.T) {
 	s := NewSkeleton("sk-timer-fwd")
 	s.RegisterTimer("t", func(int64, map[string]string) {})
 	s.timer.Run()
 	defer s.timer.Stop()
 
-	id := s.NewTimer("t", 5000)
+	id := s.NewTimer("t", 5*time.Second)
 	if id == 0 {
 		t.Fatal("NewTimer() = 0")
 	}
-	if err := s.AccTimer(id, timer.AccAbs, 100); err != nil {
-		t.Fatalf("AccTimer() error = %v", err)
+	if err := s.AccAbsTimer(id, 100*time.Millisecond); err != nil {
+		t.Fatalf("AccAbsTimer() error = %v", err)
 	}
-	if err := s.DelayTimer(id, timer.AccAbs, 100); err != nil {
-		t.Fatalf("DelayTimer() error = %v", err)
+	if err := s.DelayAbsTimer(id, 100*time.Millisecond); err != nil {
+		t.Fatalf("DelayAbsTimer() error = %v", err)
 	}
-	s.UpdateTimer(id, time.Now().UnixMilli()+9000)
+	if err := s.AccPctTimer(id, 1000); err != nil {
+		t.Fatalf("AccPctTimer() error = %v", err)
+	}
+	if err := s.DelayPctTimer(id, 1000); err != nil {
+		t.Fatalf("DelayPctTimer() error = %v", err)
+	}
+	s.UpdateTimer(id, time.Now().Add(9*time.Second))
 	s.CancelTimer(id) // 幂等，再次取消安全。
 	s.CancelTimer(id)
 
 	// 对不存在定时器的转发应返回错误 / 安全无操作。
-	if err := s.AccTimer(999999, timer.AccAbs, 1); err == nil {
-		t.Fatal("AccTimer(missing) err = nil, want non-nil")
+	if err := s.AccAbsTimer(999999, time.Millisecond); err == nil {
+		t.Fatal("AccAbsTimer(missing) err = nil, want non-nil")
 	}
-	if err := s.DelayTimer(999999, timer.AccAbs, 1); err == nil {
-		t.Fatal("DelayTimer(missing) err = nil, want non-nil")
+	if err := s.DelayAbsTimer(999999, time.Millisecond); err == nil {
+		t.Fatal("DelayAbsTimer(missing) err = nil, want non-nil")
 	}
-	s.UpdateTimer(999999, time.Now().UnixMilli())
+	if err := s.AccPctTimer(999999, 1); err == nil {
+		t.Fatal("AccPctTimer(missing) err = nil, want non-nil")
+	}
+	if err := s.DelayPctTimer(999999, 1); err == nil {
+		t.Fatal("DelayPctTimer(missing) err = nil, want non-nil")
+	}
+	s.UpdateTimer(999999, time.Now())
 }
 
 // TestSkeletonScheduleDumpTimer 直接覆盖 scheduleDumpTimer 的整点计算与抖动逻辑。

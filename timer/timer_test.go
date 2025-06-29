@@ -5,19 +5,13 @@ import (
 	"time"
 )
 
-func TestTimerConstants(t *testing.T) {
-	if SecMs != 1000 || MinMs != 60*SecMs || HourMs != 60*MinMs || DayMs != 24*HourMs {
-		t.Fatalf("time constants mismatch")
-	}
-}
-
 func TestMgrNewFindAndCancel(t *testing.T) {
 	mgr := NewMgr(8)
 	mgr.Register("once", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
 
-	id := mgr.New("once", 50, WithMetadata(map[string]string{"k": "v"}))
+	id := mgr.New("once", 50*time.Millisecond, WithMetadata(map[string]string{"k": "v"}))
 	if id == 0 {
 		t.Fatal("New() returned 0")
 	}
@@ -67,7 +61,7 @@ func TestMgrTickerCommonCallbackAndEvent(t *testing.T) {
 	mgr.Run()
 	defer mgr.Stop()
 
-	id := mgr.New("tick", 10, WithTicker(), WithMetadata(map[string]string{"mode": "ticker"}))
+	id := mgr.New("tick", 10*time.Millisecond, WithTicker(), WithMetadata(map[string]string{"mode": "ticker"}))
 	if id == 0 {
 		t.Fatal("New() returned 0")
 	}
@@ -90,75 +84,95 @@ func TestMgrTickerCommonCallbackAndEvent(t *testing.T) {
 	mgr.Cancel(id)
 }
 
-func TestMgrAccDelayUpdateAndCalcNewRemain(t *testing.T) {
+func TestMgrAccDelayUpdateAndAdjust(t *testing.T) {
 	mgr := NewMgr(8)
 	mgr.Register("once", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
 
-	id := mgr.New("once", 100)
+	id := mgr.New("once", 100*time.Millisecond)
 	if id == 0 {
 		t.Fatal("New() returned 0")
 	}
-	before := mgr.Find(id).EndTs()
-	if err := mgr.Acc(id, AccAbs, 10); err != nil {
-		t.Fatalf("Acc() error = %v", err)
+	before := mgr.Find(id).Deadline()
+	if err := mgr.AccAbs(id, 10*time.Millisecond); err != nil {
+		t.Fatalf("AccAbs() error = %v", err)
 	}
-	afterAcc := mgr.Find(id).EndTs()
-	if afterAcc > before {
-		t.Fatalf("Acc() endTs = %d, want <= %d", afterAcc, before)
+	afterAcc := mgr.Find(id).Deadline()
+	if afterAcc.After(before) {
+		t.Fatalf("AccAbs() deadline = %v, want <= %v", afterAcc, before)
 	}
-	if err := mgr.Delay(id, AccAbs, 20); err != nil {
-		t.Fatalf("Delay() error = %v", err)
+	if err := mgr.DelayAbs(id, 20*time.Millisecond); err != nil {
+		t.Fatalf("DelayAbs() error = %v", err)
 	}
-	afterDelay := mgr.Find(id).EndTs()
-	if afterDelay < afterAcc {
-		t.Fatalf("Delay() endTs = %d, want >= %d", afterDelay, afterAcc)
+	afterDelay := mgr.Find(id).Deadline()
+	if afterDelay.Before(afterAcc) {
+		t.Fatalf("DelayAbs() deadline = %v, want >= %v", afterDelay, afterAcc)
 	}
-	mgr.Update(id, time.Now().UnixMilli()+5)
+	if err := mgr.AccPct(id, 1000); err != nil {
+		t.Fatalf("AccPct() error = %v", err)
+	}
+	if err := mgr.DelayPct(id, 1000); err != nil {
+		t.Fatalf("DelayPct() error = %v", err)
+	}
+	mgr.Update(id, time.Now().Add(5*time.Millisecond))
 
-	if _, err := mgr.calcNewRemain(100, AccAbs, 0, true); err == nil {
-		t.Fatal("calcNewRemain invalid abs should error")
+	// adjustAbs：非法时长、加速、延迟。
+	if _, err := adjustAbs(100, 0, true); err == nil {
+		t.Fatal("adjustAbs invalid duration should error")
 	}
-	if got, err := mgr.calcNewRemain(100, AccAbs, 10, true); err != nil || got != 90 {
-		t.Fatalf("calcNewRemain AccAbs acc = (%d,%v), want (90,nil)", got, err)
+	if got, err := adjustAbs(100, 10, true); err != nil || got != 90 {
+		t.Fatalf("adjustAbs acc = (%d,%v), want (90,nil)", got, err)
 	}
-	if got, err := mgr.calcNewRemain(100, AccAbs, 10, false); err != nil || got != 110 {
-		t.Fatalf("calcNewRemain AccAbs delay = (%d,%v), want (110,nil)", got, err)
+	if got, err := adjustAbs(100, 10, false); err != nil || got != 110 {
+		t.Fatalf("adjustAbs delay = (%d,%v), want (110,nil)", got, err)
 	}
-	if got, err := mgr.calcNewRemain(100, AccPct, 1000, true); err != nil || got != 90 {
-		t.Fatalf("calcNewRemain AccPct acc = (%d,%v), want (90,nil)", got, err)
-	}
-	if got, err := mgr.calcNewRemain(100, AccPct, 1000, false); err != nil || got != 110 {
-		t.Fatalf("calcNewRemain AccPct delay = (%d,%v), want (110,nil)", got, err)
-	}
-	if _, err := mgr.calcNewRemain(100, AccPct, PctBase+1, true); err == nil {
-		t.Fatal("calcNewRemain invalid pct should error")
-	}
-	if _, err := mgr.calcNewRemain(100, AccKind(99), 1, true); err == nil {
-		t.Fatal("calcNewRemain unknown kind should error")
+	// 加速不允许早于当前时刻：remain-d 为负时归零。
+	if got, err := adjustAbs(10, 20, true); err != nil || got != 0 {
+		t.Fatalf("adjustAbs acc clamp = (%d,%v), want (0,nil)", got, err)
 	}
 
-	if err := mgr.Acc(999, AccAbs, 1); err == nil {
-		t.Fatal("Acc(missing) error = nil, want non-nil")
+	// adjustPct：加速、延迟、越界。
+	if got, err := adjustPct(100, 1000, true); err != nil || got != 90 {
+		t.Fatalf("adjustPct acc = (%d,%v), want (90,nil)", got, err)
 	}
-	if err := mgr.Delay(999, AccAbs, 1); err == nil {
-		t.Fatal("Delay(missing) error = nil, want non-nil")
+	if got, err := adjustPct(100, 1000, false); err != nil || got != 110 {
+		t.Fatalf("adjustPct delay = (%d,%v), want (110,nil)", got, err)
+	}
+	if _, err := adjustPct(100, PctBase+1, true); err == nil {
+		t.Fatal("adjustPct over-range should error")
+	}
+	if _, err := adjustPct(100, 0, true); err == nil {
+		t.Fatal("adjustPct zero pct should error")
+	}
+
+	// 缺失定时器的错误分支。
+	if err := mgr.AccAbs(999, time.Millisecond); err == nil {
+		t.Fatal("AccAbs(missing) error = nil, want non-nil")
+	}
+	if err := mgr.DelayAbs(999, time.Millisecond); err == nil {
+		t.Fatal("DelayAbs(missing) error = nil, want non-nil")
+	}
+	if err := mgr.AccPct(999, 1); err == nil {
+		t.Fatal("AccPct(missing) error = nil, want non-nil")
+	}
+	if err := mgr.DelayPct(999, 1); err == nil {
+		t.Fatal("DelayPct(missing) error = nil, want non-nil")
 	}
 }
 
 func TestMgrNewFailureBranches(t *testing.T) {
 	mgr := NewMgr(8)
-	if got := mgr.New("missing", 10); got != 0 {
+	if got := mgr.New("missing", 10*time.Millisecond); got != 0 {
 		t.Fatalf("New(missing handler) = %d, want 0", got)
 	}
 	mgr.Register("once", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
-	if got := mgr.New("once", 10, WithID(7)); got != 7 {
+	if got := mgr.New("once", 10*time.Millisecond, WithID(7)); got != 7 {
 		t.Fatalf("New(with id) = %d, want 7", got)
 	}
-	if got := mgr.New("once", 10, WithID(7)); got != 0 {
+	if got := mgr.New("once", 10*time.Millisecond, WithID(7)); got != 0 {
 		t.Fatalf("New(duplicate id) = %d, want 0", got)
 	}
 }
@@ -166,7 +180,7 @@ func TestMgrNewFailureBranches(t *testing.T) {
 func TestDispatcherPlaceTriggerCancelAndStop(t *testing.T) {
 	disp := newDispatcher(4)
 	hit := make(chan int64, 1)
-	late := &dispatcherTimer{name: "late", id: 1, endTs: time.Now().Add(10 * time.Millisecond).UnixMilli(), cb: func(id int64) { hit <- id }}
+	late := &dispatcherTimer{op: opNew, name: "late", id: 1, deadline: time.Now().Add(10 * time.Millisecond), cb: func(id int64) { hit <- id }}
 	disp.place(late)
 	found := false
 	for _, slot := range disp.timerSlots {
@@ -179,7 +193,7 @@ func TestDispatcherPlaceTriggerCancelAndStop(t *testing.T) {
 		t.Fatal("place() did not store timer in any slot")
 	}
 
-	ready := &dispatcherTimer{name: "ready", id: 2, endTs: time.Now().Add(-time.Millisecond).UnixMilli(), cb: func(id int64) { hit <- id }}
+	ready := &dispatcherTimer{op: opNew, name: "ready", id: 2, deadline: time.Now().Add(-time.Millisecond), cb: func(id int64) { hit <- id }}
 	disp.place(ready)
 	select {
 	case ev := <-disp.chanFired:
@@ -207,32 +221,32 @@ func TestDispatcherPlaceTriggerCancelAndStop(t *testing.T) {
 		t.Fatalf("delete(missing) = %#v, want nil", got)
 	}
 
-	if !disp.doOp(&dispatcherTimer{name: "new", id: 3, endTs: time.Now().Add(time.Second).UnixMilli(), cb: func(int64) {}}) {
+	if !disp.doOp(&dispatcherTimer{op: opNew, name: "new", id: 3, deadline: time.Now().Add(time.Second), cb: func(int64) {}}) {
 		t.Fatal("doOp(new) = false, want true")
 	}
-	if !disp.doOp(&dispatcherTimer{name: "update", id: 3, endTs: time.Now().Add(2 * time.Second).UnixMilli()}) {
+	if !disp.doOp(&dispatcherTimer{op: opUpdate, name: "update", id: 3, deadline: time.Now().Add(2 * time.Second)}) {
 		t.Fatal("doOp(update) = false, want true")
 	}
-	if !disp.doOp(&dispatcherTimer{name: "cancel", id: 3, endTs: 0}) {
+	if !disp.doOp(&dispatcherTimer{op: opCancel, name: "cancel", id: 3}) {
 		t.Fatal("doOp(cancel) = false, want true")
 	}
-	if disp.doOp(&dispatcherTimer{name: "stop", id: 0, endTs: 1}) {
+	if disp.doOp(&dispatcherTimer{op: opStop, name: "stop", id: 0}) {
 		t.Fatal("doOp(stop) = true, want false")
 	}
 }
 
 func TestDispatcherTickUpdateNewAndPanicRecover(t *testing.T) {
 	disp := newDispatcher(4)
-	id := disp.New("n", 0, time.Now().Add(20*time.Millisecond).UnixMilli(), func(int64) {})
+	id := disp.New("n", 0, time.Now().Add(20*time.Millisecond), func(int64) {})
 	if id == 0 {
 		t.Fatal("New() generated id 0")
 	}
-	disp.Update("n", id, time.Now().Add(10*time.Millisecond).UnixMilli())
-	if got := disp.doTick(time.Now().Add(20*time.Millisecond), time.Now().UnixMilli()/timerTick-1); got == 0 {
+	disp.Update("n", id, time.Now().Add(10*time.Millisecond))
+	if got := disp.doTick(time.Now().Add(20*time.Millisecond), time.Now().UnixNano()/int64(timerTick)-1); got == 0 {
 		t.Fatal("doTick() returned 0, want non-zero tick")
 	}
 
-	panicTimer := &dispatcherTimer{name: "panic", id: 9, cb: func(int64) { panic("boom") }}
+	panicTimer := &dispatcherTimer{op: opNew, name: "panic", id: 9, cb: func(int64) { panic("boom") }}
 	panicTimer.Cb()
 	if panicTimer.cb != nil {
 		t.Fatal("Cb() should nil out callback")
@@ -242,23 +256,23 @@ func TestDispatcherTickUpdateNewAndPanicRecover(t *testing.T) {
 	}
 }
 
-// TestTimerAccessors 覆盖 Timer 的 StartTs/EndTs 等访问器以及 RangeMetadata 的提前终止分支。
+// TestTimerAccessors 覆盖 Timer 的 StartAt/Deadline 等访问器以及 RangeMetadata 的提前终止分支。
 func TestTimerAccessors(t *testing.T) {
 	mgr := NewMgr(8)
 	mgr.Register("acc", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
 
-	id := mgr.New("acc", 1000, WithMetadata(map[string]string{"a": "1", "b": "2"}))
+	id := mgr.New("acc", time.Second, WithMetadata(map[string]string{"a": "1", "b": "2"}))
 	tm := mgr.Find(id)
 	if tm == nil {
 		t.Fatal("Find() = nil")
 	}
-	if tm.StartTs() == 0 {
-		t.Fatal("StartTs() = 0, want non-zero")
+	if tm.StartAt().IsZero() {
+		t.Fatal("StartAt() is zero, want non-zero")
 	}
-	if tm.EndTs() != tm.StartTs()+1000 {
-		t.Fatalf("EndTs() = %d, want StartTs()+1000 = %d", tm.EndTs(), tm.StartTs()+1000)
+	if !tm.Deadline().Equal(tm.StartAt().Add(time.Second)) {
+		t.Fatalf("Deadline() = %v, want StartAt()+1s = %v", tm.Deadline(), tm.StartAt().Add(time.Second))
 	}
 
 	// RangeMetadata 在回调首次返回 false 时应立即终止遍历，visited 至多为 1。
@@ -286,7 +300,7 @@ func TestUpdateMissingTimer(t *testing.T) {
 	mgr.Run()
 	defer mgr.Stop()
 	// 不应 panic，且无副作用。
-	mgr.Update(123456, time.Now().UnixMilli()+1000)
+	mgr.Update(123456, time.Now().Add(time.Second))
 }
 
 // TestCommonCbHandlerMissing 覆盖 commonCb 在 handler 缺失时记录错误并返回的分支。
@@ -294,9 +308,9 @@ func TestUpdateMissingTimer(t *testing.T) {
 func TestCommonCbHandlerMissing(t *testing.T) {
 	mgr := NewMgr(8)
 	mgr.timers[1] = &Timer{
-		id:    1,
-		name:  "no-handler",
-		endTs: time.Now().UnixMilli() - 10,
+		id:       1,
+		name:     "no-handler",
+		deadline: time.Now().Add(-10 * time.Millisecond),
 	}
 	// 不应 panic；handler 不存在时仅记录日志后返回。
 	mgr.commonCb(1)
@@ -308,20 +322,20 @@ func TestCommonCbTimerMissing(t *testing.T) {
 	mgr.commonCb(99999) // timers 中无此 ID，应安全返回。
 }
 
-// TestCommonCbTickerReschedule 覆盖 Ticker 在 commonCb 中的自动续期分支（endTs/startTs 更新）。
+// TestCommonCbTickerReschedule 覆盖 Ticker 在 commonCb 中的自动续期分支（deadline/startAt 更新）。
 func TestCommonCbTickerReschedule(t *testing.T) {
 	mgr := NewMgr(8)
 	mgr.Register("tick", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
 
-	id := mgr.New("tick", 10, WithTicker())
+	id := mgr.New("tick", 10*time.Millisecond, WithTicker())
 	tm := mgr.Find(id)
 	if tm == nil {
 		t.Fatal("Find() = nil")
 	}
-	oldStart := tm.startTs
-	oldEnd := tm.endTs
+	oldStart := tm.startAt
+	oldEnd := tm.deadline
 
 	mgr.commonCb(id) // 直接触发一次续期。
 
@@ -329,21 +343,21 @@ func TestCommonCbTickerReschedule(t *testing.T) {
 	if tm2 == nil {
 		t.Fatal("ticker should still exist after reschedule")
 	}
-	if tm2.startTs != oldEnd {
-		t.Fatalf("after reschedule startTs = %d, want old endTs %d", tm2.startTs, oldEnd)
+	if !tm2.startAt.Equal(oldEnd) {
+		t.Fatalf("after reschedule startAt = %v, want old deadline %v", tm2.startAt, oldEnd)
 	}
-	if tm2.endTs != oldEnd+(oldEnd-oldStart) {
-		t.Fatalf("after reschedule endTs = %d, want %d", tm2.endTs, oldEnd+(oldEnd-oldStart))
+	if !tm2.deadline.Equal(oldEnd.Add(oldEnd.Sub(oldStart))) {
+		t.Fatalf("after reschedule deadline = %v, want %v", tm2.deadline, oldEnd.Add(oldEnd.Sub(oldStart)))
 	}
 }
 
 // TestDispatcherTriggerDemotesAndCancels 覆盖 trigger 的高层级降级路径与取消过滤路径。
 func TestDispatcherTriggerDemotesAndCancels(t *testing.T) {
 	disp := newDispatcher(8)
-	now := time.Now().UnixMilli()
+	now := time.Now()
 
 	// 放置一个剩余时间较长的定时器，使其落在较高层级，随后 trigger 时被降级。
-	high := &dispatcherTimer{name: "high", id: 1, endTs: now + 100, cb: func(int64) {}}
+	high := &dispatcherTimer{op: opNew, name: "high", id: 1, deadline: now.Add(100 * time.Millisecond), cb: func(int64) {}}
 	disp.place(high)
 
 	// 找到 high 所在层级。
@@ -358,8 +372,8 @@ func TestDispatcherTriggerDemotesAndCancels(t *testing.T) {
 		t.Fatalf("high timer placed at level %d, want > 0 for demotion test", level)
 	}
 
-	// 用一个远大于其剩余时间跨度的 nowMs 调用 trigger，触发降级到 level-1。
-	disp.trigger(now+90, level)
+	// 用一个远大于其剩余时间跨度的 now 调用 trigger，触发降级到 level-1。
+	disp.trigger(now.Add(90*time.Millisecond), level)
 	if _, ok := disp.timerSlots[level][1]; ok {
 		t.Fatal("timer not removed from original level after trigger")
 	}
@@ -368,7 +382,7 @@ func TestDispatcherTriggerDemotesAndCancels(t *testing.T) {
 	}
 
 	// 取消过滤路径：标记取消后 trigger 应将其从槽位删除。
-	canceled := &dispatcherTimer{name: "cancel", id: 2, endTs: now + 100, cb: func(int64) {}}
+	canceled := &dispatcherTimer{op: opNew, name: "cancel", id: 2, deadline: now.Add(100 * time.Millisecond), cb: func(int64) {}}
 	disp.place(canceled)
 	disp.canceledTimers.Store(int64(2), struct{}{})
 	for i := range disp.timerSlots {
@@ -387,7 +401,7 @@ func TestDispatcherTriggerDemotesAndCancels(t *testing.T) {
 func TestDispatcherPlaceCanceledSkips(t *testing.T) {
 	disp := newDispatcher(8)
 	disp.canceledTimers.Store(int64(5), struct{}{})
-	disp.place(&dispatcherTimer{id: 5, endTs: time.Now().UnixMilli() + 1000, cb: func(int64) {}})
+	disp.place(&dispatcherTimer{op: opNew, id: 5, deadline: time.Now().Add(time.Second), cb: func(int64) {}})
 	for i := range disp.timerSlots {
 		if _, ok := disp.timerSlots[i][5]; ok {
 			t.Fatal("canceled timer should not be placed into any slot")
@@ -398,8 +412,8 @@ func TestDispatcherPlaceCanceledSkips(t *testing.T) {
 // TestDispatcherDoOpUpdateMissing 覆盖 doOp 更新一个不存在定时器时的错误日志分支。
 func TestDispatcherDoOpUpdateMissing(t *testing.T) {
 	disp := newDispatcher(8)
-	// endTs != 0 且 cb == nil 为更新操作；id 不在轮中走 oldt == nil 分支。
-	if !disp.doOp(&dispatcherTimer{name: "u", id: 42, endTs: time.Now().UnixMilli() + 1000}) {
+	// opUpdate 且 id 不在轮中走 oldt == nil 分支。
+	if !disp.doOp(&dispatcherTimer{op: opUpdate, name: "u", id: 42, deadline: time.Now().Add(time.Second)}) {
 		t.Fatal("doOp(update missing) = false, want true")
 	}
 }
@@ -409,13 +423,17 @@ func TestDispatcherDoOpCanceledThenRebuild(t *testing.T) {
 	disp := newDispatcher(8)
 	disp.canceledTimers.Store(int64(7), struct{}{})
 	// 已取消标记存在时，新建操作应被忽略（返回 true 但不放入槽位）。
-	if !disp.doOp(&dispatcherTimer{name: "n", id: 7, endTs: time.Now().UnixMilli() + 1000, cb: func(int64) {}}) {
+	if !disp.doOp(&dispatcherTimer{op: opNew, name: "n", id: 7, deadline: time.Now().Add(time.Second), cb: func(int64) {}}) {
 		t.Fatal("doOp = false, want true")
 	}
 	for i := range disp.timerSlots {
 		if _, ok := disp.timerSlots[i][7]; ok {
 			t.Fatal("canceled timer should not be rebuilt while cancel mark present")
 		}
+	}
+	// opUpdate 同样受取消标记保护，应被忽略。
+	if !disp.doOp(&dispatcherTimer{op: opUpdate, name: "n", id: 7, deadline: time.Now().Add(time.Second)}) {
+		t.Fatal("doOp(update canceled) = false, want true")
 	}
 }
 
@@ -438,7 +456,7 @@ func TestDispatcherFullEndToEnd(t *testing.T) {
 	defer disp.Stop()
 
 	fired := make(chan int64, 1)
-	id := disp.New("e2e", 0, time.Now().Add(12*time.Millisecond).UnixMilli(), func(tid int64) {
+	id := disp.New("e2e", 0, time.Now().Add(12*time.Millisecond), func(tid int64) {
 		fired <- tid
 	})
 
