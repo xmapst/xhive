@@ -6,7 +6,7 @@ import (
 )
 
 func TestMgrNewFindAndCancel(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	mgr.Register("once", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
@@ -48,7 +48,7 @@ func TestMgrNewFindAndCancel(t *testing.T) {
 }
 
 func TestMgrTickerCommonCallbackAndEvent(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	count := 0
 	fired := make(chan struct{}, 2)
 	mgr.Register("tick", func(_ int64, metadata map[string]string) {
@@ -68,7 +68,7 @@ func TestMgrTickerCommonCallbackAndEvent(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case ev := <-mgr.Event():
-			ev.Cb()
+			ev.Callback()
 		case <-time.After(2 * time.Second):
 			t.Fatal("wait Event() timeout")
 		}
@@ -85,7 +85,7 @@ func TestMgrTickerCommonCallbackAndEvent(t *testing.T) {
 }
 
 func TestMgrAccDelayUpdateAndAdjust(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	mgr.Register("once", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
@@ -162,7 +162,7 @@ func TestMgrAccDelayUpdateAndAdjust(t *testing.T) {
 }
 
 func TestMgrNewFailureBranches(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	if got := mgr.New("missing", 10*time.Millisecond); got != 0 {
 		t.Fatalf("New(missing handler) = %d, want 0", got)
 	}
@@ -177,79 +177,83 @@ func TestMgrNewFailureBranches(t *testing.T) {
 	}
 }
 
-func TestDispatcherPlaceTriggerCancelAndStop(t *testing.T) {
+// TestDispatcherNewFireCancelAndStop 覆盖 New→堆→fire→chanFired 路径、Cancel 的事件过滤、
+// 同 ID 重建，以及 Stop 幂等。
+func TestDispatcherNewFireCancelAndStop(t *testing.T) {
 	disp := newDispatcher(4)
-	hit := make(chan int64, 1)
-	late := &dispatcherTimer{op: opNew, name: "late", id: 1, deadline: time.Now().Add(10 * time.Millisecond), cb: func(id int64) { hit <- id }}
-	disp.place(late)
-	found := false
-	for _, slot := range disp.timerSlots {
-		if _, ok := slot[1]; ok {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("place() did not store timer in any slot")
-	}
+	disp.Run()
+	hit := make(chan int64, 2)
 
-	ready := &dispatcherTimer{op: opNew, name: "ready", id: 2, deadline: time.Now().Add(-time.Millisecond), cb: func(id int64) { hit <- id }}
-	disp.place(ready)
+	// 立即到期：派发循环应将其投递为 Event，消费后回调执行。
+	id := disp.New("ready", 0, time.Now(), func(tid int64) { hit <- tid })
 	select {
 	case ev := <-disp.chanFired:
-		ev.Cb()
+		ev.Callback()
 	case <-time.After(2 * time.Second):
 		t.Fatal("ready timer not fired")
 	}
 	select {
-	case id := <-hit:
-		if id != 2 {
-			t.Fatalf("fired id = %d, want 2", id)
+	case got := <-hit:
+		if got != id {
+			t.Fatalf("fired id = %d, want %d", got, id)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("callback not executed")
 	}
 
-	disp.Cancel("late", 1)
-	if _, ok := disp.canceledTimers.Load(int64(1)); !ok {
-		t.Fatal("Cancel() did not mark canceled timer")
+	// New 同步登记句柄表；Cancel 同步置取消标记，使已排队事件在 Callback 中被过滤。
+	id2 := disp.New("late", 0, time.Now().Add(time.Hour), func(int64) {})
+	disp.mu.Lock()
+	dt := disp.entries[id2]
+	disp.mu.Unlock()
+	if dt == nil {
+		t.Fatal("New() did not register entry in handle table")
 	}
-	if got := disp.delete(1); got == nil {
-		t.Fatal("delete() = nil, want timer")
+	disp.Cancel(id2)
+	if !dt.canceled.Load() {
+		t.Fatal("Cancel() did not set canceled flag")
 	}
-	if got := disp.delete(999); got != nil {
-		t.Fatalf("delete(missing) = %#v, want nil", got)
+	dt.callback = func(int64) { t.Fatal("canceled timer callback must not run") }
+	dt.Callback() // 已取消，应被过滤，不触发回调
+
+	// 同 ID 重建：旧节点被标记取消，句柄表同步替换为新节点。
+	id3 := disp.New("dup", 0, time.Now().Add(time.Hour), func(int64) {})
+	disp.mu.Lock()
+	old := disp.entries[id3]
+	disp.mu.Unlock()
+	_ = disp.New("dup", id3, time.Now().Add(2*time.Hour), func(int64) {})
+	disp.mu.Lock()
+	cur := disp.entries[id3]
+	disp.mu.Unlock()
+	if cur == old {
+		t.Fatal("rebuild with same id did not replace entry in handle table")
+	}
+	if !old.canceled.Load() {
+		t.Fatal("rebuild did not mark old entry canceled")
 	}
 
-	if !disp.doOp(&dispatcherTimer{op: opNew, name: "new", id: 3, deadline: time.Now().Add(time.Second), cb: func(int64) {}}) {
-		t.Fatal("doOp(new) = false, want true")
-	}
-	if !disp.doOp(&dispatcherTimer{op: opUpdate, name: "update", id: 3, deadline: time.Now().Add(2 * time.Second)}) {
-		t.Fatal("doOp(update) = false, want true")
-	}
-	if !disp.doOp(&dispatcherTimer{op: opCancel, name: "cancel", id: 3}) {
-		t.Fatal("doOp(cancel) = false, want true")
-	}
-	if disp.doOp(&dispatcherTimer{op: opStop, name: "stop", id: 0}) {
-		t.Fatal("doOp(stop) = true, want false")
-	}
+	disp.Stop()
+	disp.Stop() // 幂等：重复 Stop 不应 panic
 }
 
-func TestDispatcherTickUpdateNewAndPanicRecover(t *testing.T) {
+// TestDispatcherUpdateAndPanicRecover 覆盖 Update 重置到期时刻、Update 缺失定时器的错误分支，
+// 以及 Callback 的 panic 恢复与回调引用释放。
+func TestDispatcherUpdateAndPanicRecover(t *testing.T) {
 	disp := newDispatcher(4)
-	id := disp.New("n", 0, time.Now().Add(20*time.Millisecond), func(int64) {})
+	disp.Run()
+	defer disp.Stop()
+
+	id := disp.New("n", 0, time.Now().Add(time.Hour), func(int64) {})
 	if id == 0 {
 		t.Fatal("New() generated id 0")
 	}
-	disp.Update("n", id, time.Now().Add(10*time.Millisecond))
-	if got := disp.doTick(time.Now().Add(20*time.Millisecond), time.Now().UnixNano()/int64(timerTick)-1); got == 0 {
-		t.Fatal("doTick() returned 0, want non-zero tick")
-	}
+	disp.Update(id, time.Now().Add(2*time.Hour))   // 命中分支
+	disp.Update(999999, time.Now().Add(time.Hour)) // 缺失分支，仅记录日志
 
-	panicTimer := &dispatcherTimer{op: opNew, name: "panic", id: 9, cb: func(int64) { panic("boom") }}
-	panicTimer.Cb()
-	if panicTimer.cb != nil {
-		t.Fatal("Cb() should nil out callback")
+	panicTimer := &entry{name: "panic", id: 9, callback: func(int64) { panic("boom") }}
+	panicTimer.Callback()
+	if panicTimer.callback != nil {
+		t.Fatal("Callback() should nil out callback")
 	}
 	if panicTimer.Name() != "panic" {
 		t.Fatalf("Name() = %q, want panic", panicTimer.Name())
@@ -258,7 +262,7 @@ func TestDispatcherTickUpdateNewAndPanicRecover(t *testing.T) {
 
 // TestTimerAccessors 覆盖 Timer 的 StartAt/Deadline 等访问器以及 RangeMetadata 的提前终止分支。
 func TestTimerAccessors(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	mgr.Register("acc", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
@@ -288,43 +292,43 @@ func TestTimerAccessors(t *testing.T) {
 
 // TestFindByNameMiss 覆盖 FindByName 未命中返回 nil 的分支。
 func TestFindByNameMiss(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	if got := mgr.FindByName("does-not-exist"); got != nil {
 		t.Fatalf("FindByName(miss) = %#v, want nil", got)
 	}
 }
 
-// TestUpdateMissingTimer 覆盖 Mgr.Update 在定时器不存在时的提前返回分支。
+// TestUpdateMissingTimer 覆盖 Manager.Update 在定时器不存在时的提前返回分支。
 func TestUpdateMissingTimer(t *testing.T) {
-	mgr := NewMgr(8)
+	mgr := NewManager(8)
 	mgr.Run()
 	defer mgr.Stop()
 	// 不应 panic，且无副作用。
 	mgr.Update(123456, time.Now().Add(time.Second))
 }
 
-// TestCommonCbHandlerMissing 覆盖 commonCb 在 handler 缺失时记录错误并返回的分支。
+// TestCommonCallbackHandlerMissing 覆盖 commonCallback 在 handler 缺失时记录错误并返回的分支。
 // 通过手动构造一个 timers 中存在、但 handlers 中无对应 name 的定时器触发。
-func TestCommonCbHandlerMissing(t *testing.T) {
-	mgr := NewMgr(8)
+func TestCommonCallbackHandlerMissing(t *testing.T) {
+	mgr := NewManager(8)
 	mgr.timers[1] = &Timer{
 		id:       1,
 		name:     "no-handler",
 		deadline: time.Now().Add(-10 * time.Millisecond),
 	}
 	// 不应 panic；handler 不存在时仅记录日志后返回。
-	mgr.commonCb(1)
+	mgr.commonCallback(1)
 }
 
-// TestCommonCbTimerMissing 覆盖 commonCb 在定时器元数据不存在时的提前返回分支。
-func TestCommonCbTimerMissing(t *testing.T) {
-	mgr := NewMgr(8)
-	mgr.commonCb(99999) // timers 中无此 ID，应安全返回。
+// TestCommonCallbackTimerMissing 覆盖 commonCallback 在定时器元数据不存在时的提前返回分支。
+func TestCommonCallbackTimerMissing(t *testing.T) {
+	mgr := NewManager(8)
+	mgr.commonCallback(99999) // timers 中无此 ID，应安全返回。
 }
 
-// TestCommonCbTickerReschedule 覆盖 Ticker 在 commonCb 中的自动续期分支（deadline/startAt 更新）。
-func TestCommonCbTickerReschedule(t *testing.T) {
-	mgr := NewMgr(8)
+// TestCommonCallbackTickerReschedule 覆盖 Ticker 在 commonCallback 中的自动续期分支（deadline/startAt 更新）。
+func TestCommonCallbackTickerReschedule(t *testing.T) {
+	mgr := NewManager(8)
 	mgr.Register("tick", func(_ int64, _ map[string]string) {})
 	mgr.Run()
 	defer mgr.Stop()
@@ -337,7 +341,7 @@ func TestCommonCbTickerReschedule(t *testing.T) {
 	oldStart := tm.startAt
 	oldEnd := tm.deadline
 
-	mgr.commonCb(id) // 直接触发一次续期。
+	mgr.commonCallback(id) // 直接触发一次续期。
 
 	tm2 := mgr.Find(id)
 	if tm2 == nil {
@@ -351,101 +355,15 @@ func TestCommonCbTickerReschedule(t *testing.T) {
 	}
 }
 
-// TestDispatcherTriggerDemotesAndCancels 覆盖 trigger 的高层级降级路径与取消过滤路径。
-func TestDispatcherTriggerDemotesAndCancels(t *testing.T) {
-	disp := newDispatcher(8)
-	now := time.Now()
-
-	// 放置一个剩余时间较长的定时器，使其落在较高层级，随后 trigger 时被降级。
-	high := &dispatcherTimer{op: opNew, name: "high", id: 1, deadline: now.Add(100 * time.Millisecond), cb: func(int64) {}}
-	disp.place(high)
-
-	// 找到 high 所在层级。
-	level := -1
-	for i := range disp.timerSlots {
-		if _, ok := disp.timerSlots[i][1]; ok {
-			level = i
-			break
-		}
-	}
-	if level <= 0 {
-		t.Fatalf("high timer placed at level %d, want > 0 for demotion test", level)
-	}
-
-	// 用一个远大于其剩余时间跨度的 now 调用 trigger，触发降级到 level-1。
-	disp.trigger(now.Add(90*time.Millisecond), level)
-	if _, ok := disp.timerSlots[level][1]; ok {
-		t.Fatal("timer not removed from original level after trigger")
-	}
-	if _, ok := disp.timerSlots[level-1][1]; !ok {
-		t.Fatal("timer not demoted to lower level")
-	}
-
-	// 取消过滤路径：标记取消后 trigger 应将其从槽位删除。
-	canceled := &dispatcherTimer{op: opNew, name: "cancel", id: 2, deadline: now.Add(100 * time.Millisecond), cb: func(int64) {}}
-	disp.place(canceled)
-	disp.canceledTimers.Store(int64(2), struct{}{})
-	for i := range disp.timerSlots {
-		if _, ok := disp.timerSlots[i][2]; ok {
-			disp.trigger(now, i)
-		}
-	}
-	for i := range disp.timerSlots {
-		if _, ok := disp.timerSlots[i][2]; ok {
-			t.Fatal("canceled timer not removed by trigger")
-		}
-	}
-}
-
-// TestDispatcherPlaceCanceledSkips 覆盖 place 在定时器已被取消时直接返回的分支。
-func TestDispatcherPlaceCanceledSkips(t *testing.T) {
-	disp := newDispatcher(8)
-	disp.canceledTimers.Store(int64(5), struct{}{})
-	disp.place(&dispatcherTimer{op: opNew, id: 5, deadline: time.Now().Add(time.Second), cb: func(int64) {}})
-	for i := range disp.timerSlots {
-		if _, ok := disp.timerSlots[i][5]; ok {
-			t.Fatal("canceled timer should not be placed into any slot")
-		}
-	}
-}
-
-// TestDispatcherDoOpUpdateMissing 覆盖 doOp 更新一个不存在定时器时的错误日志分支。
-func TestDispatcherDoOpUpdateMissing(t *testing.T) {
-	disp := newDispatcher(8)
-	// opUpdate 且 id 不在轮中走 oldt == nil 分支。
-	if !disp.doOp(&dispatcherTimer{op: opUpdate, name: "u", id: 42, deadline: time.Now().Add(time.Second)}) {
-		t.Fatal("doOp(update missing) = false, want true")
-	}
-}
-
-// TestDispatcherDoOpCanceledThenRebuild 覆盖 doOp 在已取消标记存在时忽略新建/更新的竞态保护分支。
-func TestDispatcherDoOpCanceledThenRebuild(t *testing.T) {
-	disp := newDispatcher(8)
-	disp.canceledTimers.Store(int64(7), struct{}{})
-	// 已取消标记存在时，新建操作应被忽略（返回 true 但不放入槽位）。
-	if !disp.doOp(&dispatcherTimer{op: opNew, name: "n", id: 7, deadline: time.Now().Add(time.Second), cb: func(int64) {}}) {
-		t.Fatal("doOp = false, want true")
-	}
-	for i := range disp.timerSlots {
-		if _, ok := disp.timerSlots[i][7]; ok {
-			t.Fatal("canceled timer should not be rebuilt while cancel mark present")
-		}
-	}
-	// opUpdate 同样受取消标记保护，应被忽略。
-	if !disp.doOp(&dispatcherTimer{op: opUpdate, name: "n", id: 7, deadline: time.Now().Add(time.Second)}) {
-		t.Fatal("doOp(update canceled) = false, want true")
-	}
-}
-
 // TestNewDispatcherDefaultLen 覆盖 newDispatcher 在 l<=0 时使用默认容量的分支。
 func TestNewDispatcherDefaultLen(t *testing.T) {
 	disp := newDispatcher(0)
-	if cap(disp.chanOp) != 10000 || cap(disp.chanFired) != 10000 {
-		t.Fatalf("default cap = (%d,%d), want (10000,10000)", cap(disp.chanOp), cap(disp.chanFired))
+	if cap(disp.chanFired) != 10000 {
+		t.Fatalf("default cap = %d, want 10000", cap(disp.chanFired))
 	}
 	disp2 := newDispatcher(-5)
-	if cap(disp2.chanOp) != 10000 {
-		t.Fatalf("negative len cap = %d, want 10000", cap(disp2.chanOp))
+	if cap(disp2.chanFired) != 10000 {
+		t.Fatalf("negative len cap = %d, want 10000", cap(disp2.chanFired))
 	}
 }
 
@@ -462,7 +380,7 @@ func TestDispatcherFullEndToEnd(t *testing.T) {
 
 	select {
 	case ev := <-disp.chanFired:
-		ev.Cb()
+		ev.Callback()
 	case <-time.After(2 * time.Second):
 		t.Fatal("dispatcher did not fire timer via run loop")
 	}

@@ -58,7 +58,7 @@ type ITimer interface {
 // 无需重写 OnStart 和 ChanRPC（Skeleton 已提供默认实现）。
 type Skeleton struct {
 	name   string
-	timer  *timer.Mgr      // 定时器管理器，负责创建、调度和取消定时任务
+	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
 	server *chanrpc.Server // ChanRPC 服务端，接收并路由来自其他模块的 RPC 调用
 	client *chanrpc.Client // ChanRPC 客户端，向其他模块发起 RPC 调用
 	stat   *stat.TPStats   // 消息耗时统计
@@ -73,7 +73,7 @@ const timerKindDumpStat = "TimerKindDumpStat"
 func NewSkeleton(name string) *Skeleton {
 	s := &Skeleton{
 		name:   name,
-		timer:  timer.NewMgr(100000),
+		timer:  timer.NewManager(100000),
 		server: chanrpc.NewServer(100000),
 		client: chanrpc.NewClient(100000),
 		stat:   stat.NewTPStats(100000),
@@ -111,7 +111,7 @@ func (s *Skeleton) OnRun(ctx context.Context) {
 			return
 		case t := <-s.timer.Event():
 			startUs := time.Now().UnixMicro()
-			t.Cb()
+			t.Callback()
 			s.recordStat(t.Name(), time.Now().UnixMicro()-startUs)
 		case ri := <-s.client.ChanAsyncRet:
 			startUs := time.Now().UnixMicro()

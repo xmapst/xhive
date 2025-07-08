@@ -37,9 +37,9 @@ func runSkeleton(s *Skeleton) (context.CancelFunc, <-chan struct{}) {
 // TestSkeletonOnRunProcessesRPCAndTimer 启动 OnRun 事件循环，验证它能消费
 // server.ChanCall（RPC 调用）与 timer.Event（定时器），并在 ctx 取消后干净退出（覆盖 close）。
 //
-// 注意：timer.Mgr 设计为仅在 OnRun 所在 goroutine 内无锁访问，因此定时器的创建必须
+// 注意：timer.Manager 设计为仅在 OnRun 所在 goroutine 内无锁访问，因此定时器的创建必须
 // 发生在事件循环内部——本测试在 RPC handler（由 OnRun goroutine 执行）中调用 NewTimer，
-// 避免跨 goroutine 访问 Mgr 内部 map 触发数据竞争。
+// 避免跨 goroutine 访问 Manager 内部 map 触发数据竞争。
 func TestSkeletonOnRunProcessesRPCAndTimer(t *testing.T) {
 	s := NewSkeleton("sk-self")
 	mod := &skModule{Skeleton: s}
@@ -55,7 +55,7 @@ func TestSkeletonOnRunProcessesRPCAndTimer(t *testing.T) {
 	rpcHit := make(chan string, 1)
 	if err := s.RegisterChanRPC(skMsg{}, func(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
 		rpcHit <- ci.Request.(skMsg).Value
-		// 在 OnRun goroutine 内创建定时器，符合 timer.Mgr 的单 goroutine 访问约定。
+		// 在 OnRun goroutine 内创建定时器，符合 timer.Manager 的单 goroutine 访问约定。
 		s.NewTimer("evt", 8*time.Millisecond)
 		return &chanrpc.RetInfo{Ack: skMsg{Value: "ack"}}
 	}); err != nil {
