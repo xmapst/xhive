@@ -24,7 +24,7 @@ type IModule interface {
 	Name() string              // 模块唯一名称，用于日志标识和跨模块 RPC 寻址
 	OnInit() error             // 模块初始化，任一模块失败则终止整个应用启动流程
 	OnRun(ctx context.Context) // 模块主循环，应监听 ctx.Done() 并在收到取消信号时退出
-	OnDestroy()                // 模块销毁，在 goroutine 完全退出后调用，负责释放所有资源
+	OnDestroy()                // 模块销毁，在 goroutine 完全退出前调用，负责释放所有资源
 	ChanRPC() *chanrpc.Server  // 返回模块的 ChanRPC 服务端，nil 表示该模块不接受外部 RPC 调用
 }
 
@@ -446,10 +446,10 @@ func (a *app) RemoveDynamicModule(name string) bool {
 		return false
 	}
 
+	a.destroyModule(wrapper)
+
 	wrapper.cancel()  // 发送停止信号，通知模块 OnStart 退出
 	wrapper.wg.Wait() // 等待 OnStart goroutine 完全退出后再继续
-
-	a.destroyModule(wrapper)
 
 	a.dynamicModules.Delete(name)
 

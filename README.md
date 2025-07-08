@@ -39,9 +39,9 @@
 | --- | --- |
 | **Actor 模型** | 每个模块单 goroutine 串行处理所有事件（RPC / 回调 / 定时器），消除内部并发竞争，无需加锁。 |
 | **ChanRPC** | 基于 channel 的进程内 RPC，支持 `Cast`（单向）/ `AsyncCall`（异步）/ `Call`（同步）三种语义，消息路由 O(1)。 |
-| **多级时间轮定时器** | 4ms 精度、最大约 12.4 天时长，支持一次性 Timer / 周期 Ticker，可加速 / 延迟 / 取消，低 GC 压力。 |
+| **最小堆定时器** | 单 goroutine 派发 + 最小堆调度，精度无损、无最大时长上限、无 tick 空转，支持一次性 Timer / 周期 Ticker，可加速 / 延迟 / 取消。 |
 | **静态 + 动态模块** | 静态模块随应用启停；动态模块支持运行时热加载 / 热卸载，panic 不影响进程。 |
-| **优雅关闭** | 监听 `SIGINT/SIGTERM`，按逆序（LIFO）停止模块，每个模块独立超时保护。 |
+| **优雅关闭** | 监听 `SIGINT/SIGKILL/SIGTERM`，按逆序（LIFO）停止模块，每个模块独立超时保护。 |
 | **可扩展信号管理** | 业务层可注册 `SIGHUP`（配置热重载）等自定义信号处理器，并发执行且 panic 隔离。 |
 | **内置性能统计** | 每个模块自动统计消息处理耗时的 TP25~TP100 分位，定期 dump，便于定位积压瓶颈。 |
 | **零外部依赖** | 仅依赖 Go 标准库（`log/slog` 等），开箱即用。 |
@@ -86,10 +86,10 @@
    └─────────────────┘         └─────────────────┘
 
    每个模块的事件循环（Skeleton.OnRun）通过 select 串行处理：
-     ① ctx.Done()      —— 框架停止信号
-     ② timer.Event()   —— 定时器到期
+     ① ctx.Done()          —— 框架停止信号
+     ② timer.Event()       —— 定时器到期
      ③ client.ChanAsyncRet —— 异步 RPC 回调
-     ④ server.ChanCall —— 其他模块发来的 RPC 请求
+     ④ server.ChanCall     —— 其他模块发来的 RPC 请求
 ```
 
 ---
@@ -209,7 +209,7 @@ type IModule interface {
 	Name() string              // 模块唯一名称，用于日志与 RPC 寻址
 	OnInit() error             // 初始化；任一模块失败则终止整个应用启动
 	OnRun(ctx context.Context) // 主循环；应监听 ctx.Done() 并在收到取消时退出
-	OnDestroy()                // 销毁；在 goroutine 完全退出后调用，释放资源
+	OnDestroy()                // 销毁；模块关闭流程中调用，释放资源
 	ChanRPC() *chanrpc.Server  // 返回 RPC 服务端；nil 表示不接受外部 RPC
 }
 ```
@@ -258,7 +258,12 @@ ri := m.Call("config", &GetReq{Key: "max"})
 
 ### Timer 定时器
 
-`timer` 包实现**多级时间轮**（28 级、4ms 精度、最大约 12.4 天），相比 `time.After` 在海量定时器场景下显著降低 GC 压力与 CPU 开销。
+`timer` 包采用**单 goroutine 派发 + 最小堆**（`container/heap`）调度：所有定时器按到期时刻组织进一个最小堆，由唯一的派发 goroutine 维护，醒来后批量投递已到期的定时器到 `chanFired`，回调由消费方（`Skeleton.OnRun`）的单一 goroutine 执行。
+
+相比备选方案：
+
+- 相比多级时间轮：**精度无损**（不被 tick 粒度钉死）、**无最大定时时长上限**、无 tick 空转；
+- 相比 `time.AfterFunc`：到期触发不再为每个定时器 spawn 一个 runtime goroutine——无论 1 个还是十万个定时器同时到期，派发始终只用这一个 goroutine，消除海量定时器扎堆到期时的 goroutine 尖峰。
 
 ```go
 // 一次性定时器：5 秒后触发
@@ -282,8 +287,8 @@ m.CancelTimer(id)                         // 取消（幂等）
 
 框架启动时默认绑定：
 
-- `SIGINT` / `SIGTERM` → **触发优雅关闭**（框架保留，不可覆盖）
-- `SIGHUP` → 默认仅记录日志，继续运行（可被业务处理器叠加）
+- `SIGINT` / `SIGKILL` / `SIGTERM` → **触发优雅关闭**（框架保留，不可覆盖）
+- `SIGHUP` → 仅在业务层未注册处理器时，默认记录日志并继续运行（业务注册后默认行为不再追加）
 
 业务层可注册自定义信号处理器（同一信号支持多个处理器，**并发执行且 panic 隔离**）：
 
@@ -294,7 +299,7 @@ xhive.RegisterSignal(func() {
 }, syscall.SIGHUP)
 ```
 
-> 向 `SIGINT/SIGTERM` 注册会返回错误——它们由框架独占。
+> 向 `SIGINT/SIGKILL/SIGTERM` 注册会返回错误——它们由框架独占。
 
 ### 动态模块（热加载）
 
@@ -315,7 +320,7 @@ xhive.RemoveDynamicModule("activity")
 
 ### 统计（TPStats）
 
-每个 `Skeleton` 内置 `stat.TPStats`，自动记录每类消息的处理耗时（微秒），并周期性（每 15 分钟整点 + 30~60s 随机抖动错峰）dump TP25 / TP50 / TP75 / TP90 / TP95 / TP99 / TP100 分位与平均值。
+每个 `Skeleton` 内置 `stat.TPStats`，自动记录每类消息的处理耗时（微秒），并周期性（每个整点 + 30~60s 随机抖动错峰）dump TP 分位与平均值，dump 后重置。
 
 ```go
 // 主动获取处理耗时最长的前 n 类消息（JSON）
@@ -335,14 +340,15 @@ fmt.Println(xhive.Stats())
 ```
 AppStateNone ──Register/Run──► AppStateInit ──全部 OnInit 成功──► AppStateRun
                                     │                                  │
-                          任一 OnInit 失败                       收到 SIGINT/SIGTERM
+                          任一 OnInit 失败                       收到 SIGINT/SIGKILL/SIGTERM
                                     │                                  │
                                     ▼                                  ▼
                               启动中止(返回)                       AppStateStop
                                                                        │
                                                   ① 关闭全部动态模块
+                                                     cancel → 等待退出 → OnDestroy
                                                   ② 静态模块按逆序(LIFO)关闭
-                                                     cancel → 等待退出(超时30min) → OnDestroy
+                                                     OnDestroy → cancel → 等待退出(超时30min)
                                                                        │
                                                                        ▼
                                                                   AppStateNone
@@ -389,8 +395,8 @@ xhive/
 │   ├── def.go      #   消息 ID、CallInfo / RetInfo、CallOption
 │   ├── server.go   #   RPC 服务端：路由表 + 消息执行
 │   └── client.go   #   RPC 客户端：三种调用语义 + 优雅关闭
-├── timer/          # 多级时间轮定时器
-│   ├── dispatcher.go #  时间轮调度核心（28 级，4ms 精度）
+├── timer/          # 最小堆定时器
+│   ├── dispatcher.go #  调度核心（单 goroutine 派发 + container/heap 最小堆）
 │   └── manager.go  #   业务层定时器 API（New/AccAbs/AccPct/DelayAbs/DelayPct/Cancel/Ticker）
 └── stat/
     └── tpstat.go   # 消息耗时 TP 分位统计

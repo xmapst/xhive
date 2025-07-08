@@ -21,7 +21,7 @@ type Handler func(timerID int64, metadata map[string]string)
 // Timer 业务层定时器的完整元数据。
 //
 // 设计上将业务语义（name、metadata）与调度数据（startAt、deadline、isTicker）分开存储，
-// 业务层通过 Manager 的 API 操作定时器，底层 dispatcher 只负责时间轮调度，
+// 业务层通过 Manager 的 API 操作定时器，底层 dispatcher 只负责最小堆调度，
 // 两层通过 timerID 解耦，使业务逻辑与调度算法互不依赖。
 type Timer struct {
 	id       int64             // 定时器唯一 ID，与 dispatcher 层共享同一 ID
@@ -67,7 +67,7 @@ func (t *Timer) RangeMetadata(f func(string, string) bool) {
 	}
 }
 
-// Manager 业务层定时器管理器，封装底层时间轮分发器，提供类型化的定时器 API。
+// Manager 业务层定时器管理器，封装底层最小堆分发器，提供类型化的定时器 API。
 //
 // 设计特点：
 //   - timers map 存储所有活跃定时器的业务元数据，handlers map 按 name 存储回调函数
@@ -77,7 +77,7 @@ func (t *Timer) RangeMetadata(f func(string, string) bool) {
 type Manager struct {
 	timers     map[int64]*Timer   // timerID → 业务层定时器元数据
 	handlers   map[string]Handler // name → 触发回调函数
-	dispatcher *dispatcher        // 底层多级时间轮分发器
+	dispatcher *dispatcher        // 底层最小堆分发器
 }
 
 // NewManager 创建定时器管理器，参数 l 为底层分发器的通道容量。
@@ -94,12 +94,12 @@ func (tm *Manager) Register(name string, handler Handler) {
 	tm.handlers[name] = handler
 }
 
-// Run 启动底层时间轮分发器的后台 goroutine，必须在创建定时器之前调用。
+// Run 启动底层分发器的后台 goroutine，必须在创建定时器之前调用。
 func (tm *Manager) Run() {
 	tm.dispatcher.Run()
 }
 
-// Stop 停止底层时间轮分发器，发送停止信号后分发器主循环退出。
+// Stop 停止底层分发器，发送停止信号后分发器主循环退出。
 func (tm *Manager) Stop() {
 	tm.dispatcher.Stop()
 }
