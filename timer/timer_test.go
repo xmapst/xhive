@@ -65,7 +65,7 @@ func TestMgrTickerCommonCallbackAndEvent(t *testing.T) {
 	if id == 0 {
 		t.Fatal("New() returned 0")
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case ev := <-mgr.Event():
 			ev.Callback()
