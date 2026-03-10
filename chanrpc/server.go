@@ -1,36 +1,49 @@
 package chanrpc
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"reflect"
 	"runtime/debug"
 	"sync/atomic"
+
+	"github.com/xmapst/xhive/chanx"
 )
 
 // Server ChanRPC 服务端，接收并处理来自 Client 的 RPC 调用。
 //
-// 每个模块持有一个 Server 实例，所有外部 RPC 调用通过有缓冲的 ChanCall 通道排队，
-// 在模块的事件循环（Skeleton.OnStart）中串行出队处理，从而保证模块内部状态访问无并发竞争。
+// 每个模块持有一个 Server 实例，所有外部 RPC 调用通过无界队列排队，
+// 在模块的事件循环（Skeleton.OnRun）中通过 Server.Event() 串行出队处理，从而保证模块内部状态访问无并发竞争。
 //
 // 架构优势：消息路由通过 functions 哈希表实现 O(1) 查找，
 // 相比传统的 switch-case 分发，新增消息类型只需调用 Register 注册一次，扩展成本极低。
 type Server struct {
-	functions map[uint32]Handler // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
-	ChanCall  chan *CallInfo     // RPC 调用的缓冲通道，容量决定最大可积压的未处理调用数量
-	closed    atomic.Bool        // 关闭标志，采用原子操作保证多 goroutine 并发访问时的可见性
+	functions map[uint32]Handler          // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
+	chanCall  *chanx.Unbounded[*CallInfo] // RPC 调用队列，发送方永不阻塞、永不失败
+	closed    atomic.Bool                 // 关闭标志，采用原子操作保证多 goroutine 并发访问时的可见性
 }
 
-// NewServer 创建指定缓冲容量的 ChanRPC 服务端。
+// NewServer 创建 ChanRPC 服务端。
 //
-// callLen 决定消息积压的峰值上限：超出后，非阻塞模式的发送方收到 channel full 错误，
-// 阻塞模式的发送方等待超时后收到 ErrCallTimeout。
-// 应根据模块的消息处理速率和业务峰值流量合理设置此值，过小导致背压，过大增加内存占用。
-func NewServer(callLen int) *Server {
+// initCap 是内部环形缓冲区的初始容量提示，用于减少高频场景下的反复扩容，
+// 不再是硬性上限：队列会随积压自动增长，也会在消费跟上后自动收缩。
+// 如需对积压做主动告警或限流，请基于 Server.Len() 自行判断，
+// 不要依赖“发送失败”这个信号——它已经不存在了。
+func NewServer(initCap int) *Server {
 	s := new(Server)
 	s.functions = map[uint32]Handler{}
-	s.ChanCall = make(chan *CallInfo, callLen)
+	s.chanCall = chanx.NewUnbounded[*CallInfo](context.Background(),
+		chanx.WithInitialCapacity(initCap))
 	return s
+}
+
+func (s *Server) Event() <-chan *CallInfo {
+	return s.chanCall.Out()
+}
+
+func (s *Server) Len() int {
+	return s.chanCall.Len()
 }
 
 // Register 注册消息处理函数，通过传入 message 实例的类型自动推导消息名。
@@ -100,7 +113,7 @@ func (s *Server) exec(ci *CallInfo) (err error) {
 	return ci.ret(ret)
 }
 
-// Exec 公开的消息执行入口，在模块的 OnStart 事件循环中逐一调用。
+// Exec 公开的消息执行入口，在模块的 OnRun 事件循环中逐一调用。
 //
 // 执行前将 hasRet 重置为 false，允许处理函数通过 CallInfo.ret 延迟响应
 // （如异步等待数据库返回后再回包），而不强制在 handler 返回时立即响应。
@@ -123,11 +136,11 @@ func (s *Server) IsClosed() bool {
 // Close 关闭服务端并清空消息队列，向所有积压的调用方回包 ErrServerClosed 错误。
 //
 // 使用 CompareAndSwap 保证 Close 的幂等性（重复调用安全，不会 panic）。
-// 关闭流程：先将 closed 置为 true 阻断新调用写入 → 再 close(ChanCall) →
+// 关闭流程：先将 closed 置为 true 阻断新调用写入 → 再关闭内部无界队列的发送端 →
 // 最后排空队列中的积压消息并逐一回包，防止调用方因无响应而永久等待。
 //
-// 注意：close(ChanCall) 后立即遍历通道是安全的，
-// for range 会在通道排空后自动退出，不会阻塞。
+// 注意：内部队列 Close() 后立即遍历 Out() 是安全的，
+// 缓冲区读尽后 Out() 会自动关闭，for range 不会阻塞。
 func (s *Server) Close() {
 	// CAS 保证只有第一次 Close 调用真正执行关闭逻辑，后续调用直接返回
 	if !s.closed.CompareAndSwap(false, true) {
@@ -135,10 +148,10 @@ func (s *Server) Close() {
 		return
 	}
 
-	close(s.ChanCall)
+	s.chanCall.Close()
 
 	// 排空队列中尚未处理的调用，向每个调用方返回服务已关闭错误，避免死锁
-	for ci := range s.ChanCall {
+	for ci := range s.chanCall.Out() {
 		_ = ci.ret(&RetInfo{
 			Err: ErrServerClosed,
 		})

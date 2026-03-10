@@ -45,8 +45,8 @@ const (
 
 // moduleWrapper 为 IModule 附加框架运行时所需的控制元数据。
 //
-// ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 OnStart 应退出主循环；
-// wg 用于等待模块 goroutine 完全退出后再调用 OnDestroy，保证资源清理的时序正确。
+// ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 OnRun 应退出主循环；
+// wg 用于等待模块 goroutine 完全退出，保证关闭流程可同步等待完成。
 type moduleWrapper struct {
 	IModule
 	ctx    context.Context
@@ -120,9 +120,8 @@ func (a *app) appendModuleStats(builder *strings.Builder, moduleType string, wra
 	rpcServer := wrapper.ChanRPC()
 
 	if rpcServer != nil {
-		channelLen := len(rpcServer.ChanCall)
 		builder.WriteString(fmt.Sprintf("%s: %s, rpc_queue_length: %d\n",
-			moduleType, wrapper.Name(), channelLen))
+			moduleType, wrapper.Name(), rpcServer.Len()))
 	} else {
 		builder.WriteString(fmt.Sprintf("%s: %s, rpc_queue_length: N/A\n",
 			moduleType, wrapper.Name()))
@@ -179,9 +178,10 @@ func (a *app) Register(mods ...IModule) error {
 	return nil
 }
 
-// Run 注册并启动所有模块，阻塞至所有信号处理完毕（通常是收到 SIGINT/SIGKILL/SIGTERM 后优雅关闭）。
+// Run 注册并启动所有模块，阻塞至所有信号处理完毕（通常是收到 SIGINT/SIGTERM 后优雅关闭）。
 //
-// 框架默认注册 SIGINT/SIGKILL/SIGTERM → 优雅关闭，SIGHUP → 仅记录日志继续运行。
+// 框架默认注册 SIGINT/SIGTERM → 优雅关闭，SIGHUP → 仅记录日志继续运行。
+// SIGKILL 仅作为框架保留信号禁止业务注册，操作系统不会把它投递给进程处理。
 // 业务层可在 Run 调用前通过 RegisterSignal 覆盖默认处理器，或注册额外信号（如 SIGUSR1）。
 func (a *app) Run(mods ...IModule) {
 	stopped := make(chan struct{})
@@ -218,7 +218,7 @@ func (a *app) Run(mods ...IModule) {
 //  1. 状态检查，防止重复启动
 //  2. 将 Run 参数中的模块追加到 modules 列表（支持 Register + Run 两种注册方式）
 //  3. 依次调用 OnInit，任一失败则中止启动并返回 false
-//  4. 为每个模块启动独立 goroutine 并运行 OnStart
+//  4. 为每个模块启动独立 goroutine 并运行 OnRun
 //
 // 顶层 panic recover：捕获启动过程中的意外 panic，记录完整堆栈后以退出码 255 终止进程，
 // 防止进程在不确定状态下继续运行造成数据损坏。
@@ -278,7 +278,7 @@ func (a *app) start(mods ...IModule) bool {
 	return true
 }
 
-// onRunModule 在独立 goroutine 中运行模块的 OnStart 主循环。
+// onRunModule 在独立 goroutine 中运行模块的 OnRun 主循环。
 //
 // runtime.LockOSThread 将 goroutine 绑定到专用系统线程：
 //   - 保证某些依赖线程本地状态的库（如 OpenGL、部分 CGO 库）能正常工作
@@ -338,7 +338,7 @@ func (a *app) stop() {
 	slog.Info("application shutdown complete")
 }
 
-// shutdownModule 优雅关闭单个模块，完整流程为：发送停止信号 → 等待 goroutine 退出（含超时保护）→ 调用 OnDestroy。
+// shutdownModule 优雅关闭单个静态模块，完整流程为：调用 OnDestroy → 发送停止信号 → 等待 goroutine 退出（含超时保护）。
 //
 // 超时保护通过独立 goroutine + done channel 实现，而非直接阻塞，
 // 原因是 wg.Wait 本身不支持超时，需要借助 select 和 timer 组合。
@@ -349,7 +349,7 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 	slog.Info("destroying module", "module", wrapper.Name())
 	a.destroyModule(wrapper)
 
-	// 通过 context 取消向模块的 OnStart 发送停止信号
+	// 通过 context 取消向模块的 OnRun 发送停止信号
 	wrapper.cancel()
 	// 在辅助 goroutine 中等待模块退出，配合 select + timer 实现超时保护
 	done := make(chan struct{})
@@ -428,9 +428,9 @@ func (a *app) AddDynamicModules(mods ...IModule) error {
 // RemoveDynamicModule 同步移除并销毁指定名称的动态模块。
 //
 // 完整操作序列：
-//  1. cancel：向模块发送停止信号，通知 OnStart 退出主循环
-//  2. wg.Wait：阻塞等待 OnStart goroutine 完全退出
-//  3. OnDestroy：调用销毁钩子释放模块资源
+//  1. OnDestroy：调用销毁钩子释放模块资源
+//  2. cancel：向模块发送停止信号，通知 OnRun 退出主循环
+//  3. wg.Wait：阻塞等待 OnRun goroutine 完全退出
 //  4. Delete：从 dynamicModules 移除，释放引用
 //
 // 该操作是同步阻塞的，调用方会等待模块完全停止后才返回，
@@ -448,8 +448,8 @@ func (a *app) RemoveDynamicModule(name string) bool {
 
 	a.destroyModule(wrapper)
 
-	wrapper.cancel()  // 发送停止信号，通知模块 OnStart 退出
-	wrapper.wg.Wait() // 等待 OnStart goroutine 完全退出后再继续
+	wrapper.cancel()  // 发送停止信号，通知模块 OnRun 退出
+	wrapper.wg.Wait() // 等待 OnRun goroutine 完全退出后再继续
 
 	a.dynamicModules.Delete(name)
 
@@ -474,12 +474,12 @@ func (a *app) removeAllDynamicModules() {
 	}
 }
 
-// RegisterSignal 注册信号
+// RegisterSignal 注册信号。
 //
-// 同一信号可多次注册，收到信号时按注册顺序依次调用所有处理器，处理器间互不影响：
+// 同一信号可多次注册；收到信号时会为每个处理器启动 goroutine 并等待全部完成，不保证完成顺序：
 //   - SIGHUP：可叠加多个热重载逻辑，每个处理器独立执行
 //
-// SIGINT / SIGKILL / SIGTERM 由框架独占管理（固定触发优雅关闭），传入时返回错误。
+// SIGINT / SIGTERM 为可捕获的框架保留信号；SIGKILL 不可被进程捕获，也作为保留信号禁止业务注册。
 //
 // 示例（在游戏模块 OnInit 中注册 SIGHUP 热重载）：
 //

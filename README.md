@@ -38,10 +38,10 @@
 | 特性 | 说明 |
 | --- | --- |
 | **Actor 模型** | 每个模块单 goroutine 串行处理所有事件（RPC / 回调 / 定时器），消除内部并发竞争，无需加锁。 |
-| **ChanRPC** | 基于 channel 的进程内 RPC，支持 `Cast`（单向）/ `AsyncCall`（异步）/ `Call`（同步）三种语义，消息路由 O(1)。 |
-| **最小堆定时器** | 单 goroutine 派发 + 最小堆调度，精度无损、无最大时长上限、无 tick 空转，支持一次性 Timer / 周期 Ticker，可加速 / 延迟 / 取消。 |
+| **ChanRPC** | 基于无界 channel 队列的进程内 RPC，支持 `Cast`（单向）/ `AsyncCall`（异步）/ `Call`（同步）三种语义，消息路由 O(1)。 |
+| **最小堆定时器** | 单 goroutine 派发 + 最小堆调度，精度无损、无最大时长上限、无 tick 空转，支持一次性 Timer / 周期 Ticker，可加速 / 延迟 / 精确更新 / 取消。 |
 | **静态 + 动态模块** | 静态模块随应用启停；动态模块支持运行时热加载 / 热卸载，panic 不影响进程。 |
-| **优雅关闭** | 监听 `SIGINT/SIGKILL/SIGTERM`，按逆序（LIFO）停止模块，每个模块独立超时保护。 |
+| **优雅关闭** | 监听 `SIGINT/SIGTERM` 触发优雅关闭；`SIGKILL` 为框架保留信号但操作系统不可捕获，不能用于优雅关闭。关闭时先处理动态模块，再按逆序（LIFO）停止静态模块，每个模块独立超时保护。 |
 | **可扩展信号管理** | 业务层可注册 `SIGHUP`（配置热重载）等自定义信号处理器，并发执行且 panic 隔离。 |
 | **内置性能统计** | 每个模块自动统计消息处理耗时的 TP25~TP100 分位，定期 dump，便于定位积压瓶颈。 |
 | **零外部依赖** | 仅依赖 Go 标准库（`log/slog` 等），开箱即用。 |
@@ -86,10 +86,10 @@
    └─────────────────┘         └─────────────────┘
 
    每个模块的事件循环（Skeleton.OnRun）通过 select 串行处理：
-     ① ctx.Done()          —— 框架停止信号
-     ② timer.Event()       —— 定时器到期
-     ③ client.ChanAsyncRet —— 异步 RPC 回调
-     ④ server.ChanCall     —— 其他模块发来的 RPC 请求
+     ① ctx.Done()       —— 框架停止信号
+     ② timer.Event()    —— 定时器到期
+     ③ client.Event()   —— 异步 RPC 回调
+     ④ server.Event()   —— 其他模块发来的 RPC 请求
 ```
 
 ---
@@ -229,7 +229,7 @@ type IModule interface {
 | 定时器 | `RegisterTimer` / `NewTimer` / `AccAbsTimer` / `AccPctTimer` / `DelayAbsTimer` / `DelayPctTimer` / `UpdateTimer` / `CancelTimer` |
 | 统计 | `DumpStat(n)` |
 
-> 内部各组件缓冲区默认为 **100000**，适合高并发场景。若单模块消息量远超此值，需在 `NewSkeleton` 处自行调整以避免背压。
+> 默认配置为：定时器事件通道 **1024**、ChanRPC 服务端队列初始容量 **4096**、客户端异步返回队列初始容量 **4096**、统计采样容量 **8192**。可在 `NewSkeleton` 处通过 `WithTimerChanLen`、`WithServerChanLen`、`WithClientChanLen`、`WithStatCap` 按模块特征调整。
 
 ### ChanRPC 跨模块通信
 
@@ -287,7 +287,8 @@ m.CancelTimer(id)                         // 取消（幂等）
 
 框架启动时默认绑定：
 
-- `SIGINT` / `SIGKILL` / `SIGTERM` → **触发优雅关闭**（框架保留，不可覆盖）
+- `SIGINT` / `SIGTERM` → **触发优雅关闭**（框架保留，不可覆盖）
+- `SIGKILL` → 框架标记为保留信号，但该信号在操作系统层面不可捕获，不能触发优雅关闭
 - `SIGHUP` → 仅在业务层未注册处理器时，默认记录日志并继续运行（业务注册后默认行为不再追加）
 
 业务层可注册自定义信号处理器（同一信号支持多个处理器，**并发执行且 panic 隔离**）：
@@ -299,7 +300,7 @@ xhive.RegisterSignal(func() {
 }, syscall.SIGHUP)
 ```
 
-> 向 `SIGINT/SIGKILL/SIGTERM` 注册会返回错误——它们由框架独占。
+> 向 `SIGINT/SIGKILL/SIGTERM` 注册会返回错误——它们由框架保留；其中 `SIGKILL` 无法被进程捕获，仅作为不可注册的保留项存在。
 
 ### 动态模块（热加载）
 
@@ -312,7 +313,7 @@ xhive.AddDynamicModules(NewActivityModule())
 // 查询当前动态模块名列表
 names := xhive.DynamicModules()
 
-// 同步移除并销毁（cancel → 等待退出 → OnDestroy → 移除）
+// 同步移除并销毁（OnDestroy → cancel → 等待退出 → 移除）
 xhive.RemoveDynamicModule("activity")
 ```
 
@@ -340,13 +341,13 @@ fmt.Println(xhive.Stats())
 ```
 AppStateNone ──Register/Run──► AppStateInit ──全部 OnInit 成功──► AppStateRun
                                     │                                  │
-                          任一 OnInit 失败                       收到 SIGINT/SIGKILL/SIGTERM
+                          任一 OnInit 失败                         收到 SIGINT/SIGTERM
                                     │                                  │
                                     ▼                                  ▼
                               启动中止(返回)                       AppStateStop
                                                                        │
                                                   ① 关闭全部动态模块
-                                                     cancel → 等待退出 → OnDestroy
+                                                     OnDestroy → cancel → 等待退出 → 移除
                                                   ② 静态模块按逆序(LIFO)关闭
                                                      OnDestroy → cancel → 等待退出(超时30min)
                                                                        │
