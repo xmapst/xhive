@@ -19,10 +19,10 @@ type SignalTrap func()
 // 同一信号支持注册多个处理器，收到信号时并发调用、等待全部完成。
 // SIGINT/SIGTERM 由框架固定用于优雅关闭；SIGKILL 不可捕获，仅作为保留信号禁止外部注册。
 type SignalManager struct {
-	sync.RWMutex
 	signals         map[os.Signal][]SignalTrap
 	sigCh           chan os.Signal // 由 Start 创建，nil 表示分发器尚未启动
 	reservedSignals map[os.Signal]struct{}
+	sync.RWMutex
 }
 
 // NewSignalManager 创建 SignalManager，预置框架保留信号。

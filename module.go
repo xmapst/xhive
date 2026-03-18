@@ -62,11 +62,11 @@ type moduleWrapper struct {
 //   - state 使用原子操作读写
 //   - 信号注册与分发由 SignalManager 内部的 RWMutex 保护
 type app struct {
-	sync.RWMutex                    // 保护 modules 切片
-	modules        []*moduleWrapper // 静态模块列表，按优先级排序，启动后不允许修改
-	dynamicModules sync.Map         // 动态模块集合，key 为模块名，支持运行时热加载
-	state          int32            // 应用全局状态，使用 atomic 操作保证原子性
 	sm             *SignalManager
+	dynamicModules sync.Map         // 动态模块集合，key 为模块名，支持运行时热加载
+	modules        []*moduleWrapper // 静态模块列表，按优先级排序，启动后不允许修改
+	sync.RWMutex                    // 保护 modules 切片
+	state          int32            // 应用全局状态，使用 atomic 操作保证原子性
 }
 
 // newApp 创建新的应用框架实例，初始状态为 AppStateNone。

@@ -51,17 +51,17 @@ const (
 // 仅携带定位与改期所需的最小信息——不再像旧实现那样为一次操作 new 一个完整 entry，
 // deadline 仅 opUpdate 使用，opCancel 留零值。
 type command struct {
-	op       opKind    // 操作类型，决定 doOp 的处理分支
-	id       int64     // 目标定时器 ID
 	deadline time.Time // 新到期时刻，仅 opUpdate 使用
+	id       int64     // 目标定时器 ID
+	op       opKind    // 操作类型，决定 doOp 的处理分支
 }
 
 // entry 最小堆中的一条定时器记录，同时复用为投递到 chanFired 的 Event。
 type entry struct {
+	deadline time.Time   // 到期绝对时刻
+	callback func(int64) // 到期回调函数
 	name     string      // 做消息统计用
 	id       int64       // 定时器唯一 ID
-	callback func(int64) // 到期回调函数
-	deadline time.Time   // 到期绝对时刻
 	index    int         // 在最小堆中的下标，-1 表示不在堆中
 	canceled atomic.Bool // 取消标记，已投递但尚未消费的事件据此被过滤
 }
@@ -116,15 +116,15 @@ func (h *entryHeap) Pop() any {
 
 // dispatcher 基于单 goroutine 派发 + 最小堆的定时器分发器。
 type dispatcher struct {
-	atomicID  atomic.Int64     // 定时器唯一 ID 生成器
 	chanFired chan Event       // 定时器到期通知通道，由调用方（Manager）消费
 	chanNew   chan *entry      // 新建定时器通道，送入完整 entry 入堆
 	chanOp    chan command     // 加速/延迟/取消命令通道，送入轻量 command 值
 	done      chan struct{}    // Stop 时关闭，通知派发循环退出并解除阻塞投递
-	stopOnce  sync.Once        // 保证 done 只关闭一次
-	mu        sync.Mutex       // 保护 entries 索引表的并发访问
 	entries   map[int64]*entry // timerID → 条目，供外部 Update/Cancel 定位堆中条目
 	heap      entryHeap        // 最小堆，仅派发 goroutine 访问
+	atomicID  atomic.Int64     // 定时器唯一 ID 生成器
+	stopOnce  sync.Once        // 保证 done 只关闭一次
+	mu        sync.Mutex       // 保护 entries 索引表的并发访问
 }
 
 // newDispatcher 创建并初始化分发器。
