@@ -22,7 +22,7 @@ import (
 type Unbounded[T any] struct {
 	in     chan T
 	out    chan T
-	length int64 // 内部环形缓冲区中当前持有的值的数量
+	length atomic.Int64 // 内部环形缓冲区中当前持有的值的数量
 }
 
 // config 保存 NewUnbounded 的可选配置项。
@@ -89,15 +89,15 @@ func (u *Unbounded[T]) Close() { close(u.in) }
 // BufLen 返回内部环形缓冲区中大致的积压数量，不包含 In、Out 两个
 // channel 自身队列中的值。该结果与转发 goroutine 并发读取，应视为
 // 某一时刻的近似快照，而非精确计数。
-func (u *Unbounded[T]) BufLen() int {
-	return int(atomic.LoadInt64(&u.length))
+func (u *Unbounded[T]) BufLen() int64 {
+	return u.length.Load()
 }
 
 // Len 返回 In、Out 与内部缓冲区中积压数量的近似总和，可安全地并发
 // 调用，适合用作积压量监控或背压告警的依据，但同样只是近似快照，
 // 而非精确计数。
-func (u *Unbounded[T]) Len() int {
-	return len(u.in) + len(u.out) + u.BufLen()
+func (u *Unbounded[T]) Len() int64 {
+	return int64(len(u.in)+len(u.out)) + u.BufLen()
 }
 
 // run 通过内部环形缓冲区将值从 in 转发到 out，直至 in 被关闭且缓冲区
@@ -115,7 +115,7 @@ func (u *Unbounded[T]) run(ctx context.Context, initialCap int) {
 					return
 				}
 				r.push(v)
-				atomic.StoreInt64(&u.length, int64(r.len()))
+				u.length.Store(int64(r.len()))
 			}
 		}
 
@@ -131,7 +131,7 @@ func (u *Unbounded[T]) run(ctx context.Context, initialCap int) {
 					select {
 					case u.out <- r.front():
 						r.pop()
-						atomic.StoreInt64(&u.length, int64(r.len()))
+						u.length.Store(int64(r.len()))
 					case <-ctx.Done():
 						return
 					}
@@ -139,10 +139,10 @@ func (u *Unbounded[T]) run(ctx context.Context, initialCap int) {
 				return
 			}
 			r.push(v)
-			atomic.StoreInt64(&u.length, int64(r.len()))
+			u.length.Store(int64(r.len()))
 		case u.out <- r.front():
 			r.pop()
-			atomic.StoreInt64(&u.length, int64(r.len()))
+			u.length.Store(int64(r.len()))
 		}
 	}
 }

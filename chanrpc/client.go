@@ -41,7 +41,7 @@ func (c *Client) Event() <-chan *RetInfo {
 	return c.chanAsyncRet.Out()
 }
 
-func (c *Client) Len() int {
+func (c *Client) Len() int64 {
 	return c.chanAsyncRet.Len()
 }
 
