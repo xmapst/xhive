@@ -189,11 +189,10 @@ func (s *Skeleton) OnRun(ctx context.Context) {
 	}
 }
 
-// close 在模块退出前有序清理资源：停止定时器 → 关闭 RPC 服务端 → 等待异步调用完成。
+// close 在模块退出前有序清理资源：停止定时器 → 关闭 RPC 服务端 → 关闭 RPC 客户端。
 //
-// 轮询等待异步回调（!Idle）：直到所有发出的异步调用都收到响应并执行完回调，
-// 防止未处理的回调在模块销毁后被执行时访问已释放的资源。
-// 每次调用 client.Close 会处理当前 client.Event() 中的回调，Idle 检查保证全部处理完毕才退出。
+// s.client.Close 内部已经处理了"有 pending 异步调用需要排空"和"无 pending 直接关闭"
+// 两种情况（含超时兜底），这里调用一次即可，不需要在外层轮询 Idle。
 func (s *Skeleton) close() {
 	s.dumpStat(false)
 	s.timer.Stop()
