@@ -200,11 +200,13 @@ func (disp *dispatcher) doOp(cmd command) {
 		disp.mu.Lock()
 		e, ok := disp.entries[cmd.id]
 		disp.mu.Unlock()
-		if ok && e.index >= 0 {
-			e.deadline = cmd.deadline
+		if !ok {
+			slog.Error("update timer not found", "timer_id", cmd.id)
+			return
+		}
+		e.deadline = cmd.deadline
+		if e.index >= 0 {
 			heap.Fix(&disp.heap, e.index)
-		} else {
-			slog.Error("delay timer get old timer fail", "timer_id", cmd.id)
 		}
 
 	case opCancel:

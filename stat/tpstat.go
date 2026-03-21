@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"sync"
 )
@@ -41,9 +42,17 @@ func (s *tpStat) add(cost int64, maxCnt int) {
 	}
 }
 
-// Add 增加消息耗时统计（单位：微秒），name 为空时忽略
+// Add 增加消息耗时统计（单位：微秒），name 为对应类型的零值（如空字符串、0）时忽略。
+//
+// name 是 any：调用方可能传字符串（定时器名）或 uint32（RPC 消息 ID，未注册/
+// Ack 为 nil 时明确约定返回 0），用 reflect.Value.IsZero 统一判断，避免只
+// 过滤字符串空值而漏掉数字类型的零值，导致失败/无意义的调用被计入一个虚假的
+// "0" 分组，污染 Top-N 耗时统计。
 func (s *TPStats) Add(name any, cost int64) {
-	if name == "" {
+	if name == nil {
+		return
+	}
+	if v := reflect.ValueOf(name); v.IsZero() {
 		return
 	}
 	s.Lock()

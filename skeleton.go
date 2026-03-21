@@ -198,11 +198,7 @@ func (s *Skeleton) close() {
 	s.dumpStat(false)
 	s.timer.Stop()
 	s.server.Close()
-	// 循环等待，直到客户端所有异步回调都处理完毕（Idle），防止未处理的回调泄漏
-	for !s.client.Idle() {
-		s.client.Close()
-		slog.Info("skeleton client close", "name", s.Name())
-	}
+	s.client.Close()
 }
 
 // scheduleDumpTimer 计算下一个触发时刻并创建一次性定时器，错峰 30s到60s 随机抖动
