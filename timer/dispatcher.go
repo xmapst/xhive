@@ -1,39 +1,16 @@
-// Package timer 提供基于「单 goroutine 派发 + 最小堆」的定时器管理能力。
+// Package timer 提供基于多级时间轮算法的定时器管理能力。
 //
-// 设计思路：所有定时器条目按到期时刻组织进一个最小堆（container/heap），由唯一的派发
-// goroutine 维护。派发 goroutine 阻塞等待「堆顶最近的到期时刻」，醒来后批量投递所有已到期
-// 的定时器到 chanFired，真正的业务回调由消费方（Skeleton.OnRun）的单一 goroutine 执行。
+// 设计思路：以牺牲少量时间精度（最小粒度 64ms）换取比 time.After 更低的 CPU 开销和 GC 压力。
+// time.After 每次调用都会创建新的 channel 和 timer 对象，在海量定时器场景下会产生大量短生命周期对象；
+// 时间轮算法通过固定大小的槽位数组重用内存，每次 tick 只检查当前层级，避免全量遍历，
+// 在游戏服务器数千个同时活跃的定时器场景下具有显著的性能优势。
 //
-// 相比方案演进中的两种备选：
-//   - 相比多级时间轮：精度无损（不被 tick 粒度钉死），无「最大定时时长」上限，且无 tick 空转；
-//   - 相比 time.AfterFunc：到期触发不再为每个定时器 spawn 一个 runtime goroutine——无论
-//     1 个还是十万个定时器同时到期，派发始终只用这一个 goroutine，消除了海量定时器扎堆到期
-//     时的 goroutine 尖峰。投递本身是纳秒级 channel 发送，串行成本远低于上千 goroutine 的
-//     调度与抢锁开销。
-//
-// 并发模型：
-//   - 最小堆 heap 仅由派发 goroutine 访问，无需加锁；
-//   - 索引表 entries（id → *entry）同时被外部调用方（New/Update/Cancel）与派发 goroutine
-//     访问，由 mu 保护，临界区仅一次 map 读写；
-//   - 新建经 chanNew 送入完整 entry，加速/延迟/取消经 chanOp 送入轻量 command 值，
-//     二者都串行化到派发 goroutine，保证堆的单线程访问；
-//   - chanNew/chanOp/chanFired 均为无界队列：外部调用方（可能就是业务事件循环自身）
-//     向 chanNew/chanOp 发送永不阻塞，派发 goroutine 向 chanFired 投递也永不阻塞。
-//     这避免了一条真实存在的死锁路径——若某个 RPC handler 内同步调用 New/Update
-//     创建或调整定时器，而对应队列恰好写满，事件循环会阻塞在发送上；若此时派发
-//     goroutine 也恰好阻塞在向写满的 chanFired 投递（只有事件循环回到 select 顶层
-//     才能消费），双方就会互相等待、永久卡死。换成无界队列后，第一步永不阻塞，
-//     这条死锁链被从根上切断。
-//   - 取消采用「同步标记 + 异步删堆」：Cancel 立即置 entry.canceled，使已投递到 chanFired
-//     但尚未消费的到期事件也能在 Callback 中被过滤。
-//   - 无界队列的代价：三个队列各自持有一个常驻转发 goroutine，必须显式 Close 才会
-//     退出。run() 是这三个队列在读取方向上唯一的所有者，因此由它在退出时统一负责
-//     关闭；New/Update/Cancel 在 Stop 之后可能仍被业务代码调用，此时向已关闭队列
-//     发送会 panic，均以 recover 兜底，行为退化为「静默丢弃」，不会导致进程崩溃。
+// 时间表示：对外与对内统一使用 Go 内置时间类型——绝对时刻用 time.Time，时间间隔/粒度用 time.Duration。
+// 仅时间轮分级所必需的 tick 计数保留为 int64（位运算分级的算法要求），它表示 timerTick 的整数倍计数，
+// 由 now.UnixNano() / int64(timerTick) 推导，本身不承载具体时间单位。
 package timer
 
 import (
-	"container/heap"
 	"context"
 	"log/slog"
 	"runtime/debug"
@@ -44,7 +21,28 @@ import (
 	"github.com/xmapst/xhive/chanx"
 )
 
-// Event 定时器触发事件接口，供 Manager 消费者调用。
+// 时间轮配置常量。
+const (
+	// timerTick 时间轮最小触发粒度，使用 2 的幂次方便于后续位运算计算层级掩码。
+	timerTick = 64 * time.Millisecond
+
+	// timerLevel 时间轮分级数，当前共有 20 层，槽位索引范围为 0 到 19。
+	// place 最高只会放入第 19 层，因此单个定时器最大可调度时长约为 2^19*64ms ≈ 9.3 小时。
+	timerLevel = 20
+)
+
+// opKind 分发器操作类型，显式区分发送到 chanOp 的命令语义，
+// 取代以往靠 deadline/cb 是否为零值隐式判断操作的写法，避免歧义。
+type opKind int8
+
+const (
+	opNew    opKind = iota // 新建定时器
+	opUpdate               // 更新到期时刻（加速/延迟）
+	opCancel               // 取消定时器
+	opStop                 // 停止分发器主循环
+)
+
+// Event 表示一个已经到期、等待业务层消费的定时器事件。
 type Event interface {
 	// Callback 执行定时器回调，内部捕获 panic，执行后释放回调引用。
 	Callback()
@@ -52,301 +50,289 @@ type Event interface {
 	Name() string
 }
 
-// opKind 派发器操作类型，区分发送到 chanOp 的命令语义。
-type opKind int8
-
-const (
-	opUpdate opKind = iota // 更新到期时刻（加速/延迟）
-	opCancel               // 取消定时器
-)
-
-// command 加速/延迟/取消操作的轻量载体，按值经 chanOp 送入派发 goroutine。
+// dispatcher 多级时间轮定时器分发器。
 //
-// 仅携带定位与改期所需的最小信息——不再像旧实现那样为一次操作 new 一个完整 entry，
-// deadline 仅 opUpdate 使用，opCancel 留零值。
-type command struct {
-	deadline time.Time // 新到期时刻，仅 opUpdate 使用
-	id       int64     // 目标定时器 ID
-	op       opKind    // 操作类型，决定 doOp 的处理分支
+// 核心数据结构：
+//   - timerSlots[i] 存储剩余时间落在 [2^(i-1), 2^i) × timerTick 区间的定时器
+//   - chanOp 通道将外部的增删改操作串行化到分发器 goroutine，避免外部调用方与时间轮逻辑并发修改内部状态
+//   - canceledTimers 采用"双重取消"机制：先在 sync.Map 标记取消，再异步从时间轮物理删除，
+//     使取消操作对已投递到 chanFired 的到期事件也能立即生效
+type dispatcher struct {
+	atomicID       atomic.Int64                           // 定时器唯一 ID 生成器
+	timerSlots     [timerLevel]map[int64]*dispatcherTimer // 分级时间轮槽位，每级对应不同的时间区间
+	chanOp         *chanx.Unbounded[*dispatcherTimer]     // 操作串行化通道，确保时间轮数据的单线程访问
+	chanFired      *chanx.Unbounded[Event]                // 定时器到期通知通道，由调用方（Mgr）消费
+	canceledTimers sync.Map                               // 已取消定时器的快速过滤集合，key 为 timerID
 }
 
-// entry 最小堆中的一条定时器记录，同时复用为投递到 chanFired 的 Event。
-type entry struct {
-	deadline time.Time   // 到期绝对时刻
-	callback func(int64) // 到期回调函数
+// dispatcherTimer 是时间轮内部使用的定时器节点，同时复用为操作命令的载体。
+type dispatcherTimer struct {
+	op       opKind      // 操作类型，决定 doOp 的处理分支
 	name     string      // 做消息统计用
-	id       int64       // 定时器唯一 ID
-	index    int         // 在最小堆中的下标，-1 表示不在堆中
-	canceled atomic.Bool // 取消标记，已投递但尚未消费的事件据此被过滤
+	id       int64       // 定时器唯一 ID，opStop 信号约定 id=0，禁止业务使用
+	deadline time.Time   // 到期绝对时刻
+	cb       func(int64) // 到期回调函数
+	canceled *sync.Map   // 取消标记集合引用，用于过滤已投递但尚未消费的事件
 }
 
 // Callback 安全执行定时器回调，通过 recover 捕获 panic 防止单个回调异常崩溃整个进程。
 //
-// 若定时器在事件投递后、消费前被取消，则跳过回调。
-// 执行后将 callback 置 nil，主动释放回调函数闭包捕获的资源引用，帮助 GC 及时回收。
-func (e *entry) Callback() {
+// 执行后将 cb 置 nil，主动释放回调函数闭包捕获的资源引用，帮助 GC 及时回收。
+func (t *dispatcherTimer) Callback() {
 	defer func() {
-		e.callback = nil // 主动断开引用，允许 GC 回收回调捕获的外部资源（如模块的大对象）
+		t.cb = nil // 主动断开引用，允许 GC 回收回调捕获的外部资源（如模块的大对象）
 		if r := recover(); r != nil {
 			slog.Error("timer callback panic", "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
-	if e.canceled.Load() {
-		return // 事件已在通道中排队但定时器已被取消，过滤掉
+	if t.canceled != nil {
+		if _, canceled := t.canceled.Load(t.id); canceled {
+			return
+		}
 	}
-	e.callback(e.id)
+	if t.cb != nil {
+		t.cb(t.id)
+	}
 }
 
-func (e *entry) Name() string {
-	return e.name
+func (t *dispatcherTimer) Name() string {
+	return t.name
 }
 
-// entryHeap 按 deadline 升序排列的最小堆，实现 container/heap.Interface。
-type entryHeap []*entry
-
-func (h entryHeap) Len() int           { return len(h) }
-func (h entryHeap) Less(i, j int) bool { return h[i].deadline.Before(h[j].deadline) }
-func (h entryHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].index = i
-	h[j].index = j
-}
-
-func (h *entryHeap) Push(x any) {
-	e := x.(*entry)
-	e.index = len(*h)
-	*h = append(*h, e)
-}
-
-func (h *entryHeap) Pop() any {
-	old := *h
-	n := len(old)
-	e := old[n-1]
-	old[n-1] = nil // 避免内存泄漏
-	e.index = -1
-	*h = old[:n-1]
-	return e
-}
-
-// dispatcher 基于单 goroutine 派发 + 最小堆的定时器分发器。
-type dispatcher struct {
-	chanFired *chanx.Unbounded[Event]   // 到期通知队列，由 run() 发送，Manager 消费
-	chanNew   *chanx.Unbounded[*entry]  // 新建定时器队列，外部调用方发送，run() 消费
-	chanOp    *chanx.Unbounded[command] // 加速/延迟/取消命令队列，外部调用方发送，run() 消费
-	done      chan struct{}             // Stop 时关闭，通知派发循环退出
-	entries   map[int64]*entry          // timerID → 条目，供外部 Update/Cancel 定位堆中条目
-	heap      entryHeap                 // 最小堆，仅派发 goroutine 访问
-	atomicID  atomic.Int64              // 定时器唯一 ID 生成器
-	stopOnce  sync.Once                 // 保证 done 只关闭一次
-	closed    atomic.Bool               // Stop 后置真，New/Update/Cancel 据此提前拒绝新请求
-	mu        sync.Mutex                // 保护 entries 索引表的并发访问
-}
-
-// newDispatcher 创建并初始化分发器。
+// newDispatcher 创建并初始化多级时间轮分发器。
 //
-// 参数 bufSize 是三个内部无界队列的初始容量提示，用于减少高频场景下的反复扩容，
-// 不再是硬性上限：New/Update/Cancel 永不因队列满而阻塞或失败。
+// bufSize 指定操作队列和触发队列的初始容量，建议与模块的 ChanRPC 容量保持一致，
+// 以降低大量定时器同时到期时的队列扩容开销。
 func newDispatcher(bufSize int) *dispatcher {
 	if bufSize <= 0 {
 		bufSize = 10000
 	}
+
 	ctx := context.Background()
-	return &dispatcher{
-		chanFired: chanx.NewUnbounded[Event](ctx, chanx.WithInitialCapacity(bufSize)),
-		chanNew:   chanx.NewUnbounded[*entry](ctx, chanx.WithInitialCapacity(bufSize)),
-		chanOp:    chanx.NewUnbounded[command](ctx, chanx.WithInitialCapacity(bufSize)),
-		done:      make(chan struct{}),
-		entries:   make(map[int64]*entry),
+	disp := &dispatcher{
+		chanFired: chanx.NewUnbounded[Event](ctx, chanx.WithInitialCapacity(bufSize), chanx.WithChanCapacity(bufSize, bufSize)),
+		chanOp:    chanx.NewUnbounded[*dispatcherTimer](ctx, chanx.WithInitialCapacity(bufSize), chanx.WithChanCapacity(bufSize, bufSize)),
 	}
+	for k := range disp.timerSlots {
+		disp.timerSlots[k] = make(map[int64]*dispatcherTimer)
+	}
+
+	return disp
 }
 
-// Run 在独立 goroutine 中启动派发主循环。
+// Run 在独立 goroutine 中启动时间轮主循环。
 func (disp *dispatcher) Run() {
 	go disp.run()
 }
 
-// run 派发主循环：始终将定时器重置为「堆顶最近的到期时刻」，并通过 select 多路复用
-// 增删改命令、堆顶到期、停止信号三类事件，全程仅此一个 goroutine 访问堆。
-//
-// 退出时统一关闭三个内部队列：run() 是它们在读取方向上唯一的所有者，也是唯一
-// 知道「此刻不会再有并发读取」的一方，由它负责关闭可以避免转发 goroutine 泄漏。
+// run 时间轮主循环，在独立 goroutine 中运行，通过 select 多路复用两类事件：
+//   - chanOp：处理来自业务层的增删改操作命令
+//   - tickTimer.C：每隔 timerTick 推进一次时间轮，检查并触发到期定时器
 func (disp *dispatcher) run() {
 	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("timer dispatcher crashed", "panic", r, "stack", string(debug.Stack()))
+		if x := recover(); x != nil {
+			slog.Error("timer dispatcher crashed", "panic", x, "stack", string(debug.Stack()))
 		}
-		disp.chanFired.Close()
-		disp.chanNew.Close()
-		disp.chanOp.Close()
 	}()
 
-	timer := time.NewTimer(time.Hour)
-	timer.Stop()
-	defer timer.Stop()
+	lastTick := time.Now().UnixNano() / int64(timerTick)
+	tickTimer := time.NewTimer(timerTick)
+	for {
+		select {
+		case t := <-disp.chanOp.Out():
+			if !disp.doOp(t) {
+				return // 收到 opStop 停止信号，退出主循环
+			}
+		case <-tickTimer.C:
+			tickTimer.Reset(timerTick)
+			lastTick = disp.doTick(time.Now(), lastTick)
+		}
+	}
+}
+
+// doOp 根据 op 字段执行定时器操作命令，返回 false 表示需要停止分发器主循环。
+func (disp *dispatcher) doOp(t *dispatcherTimer) bool {
+	switch t.op {
+	case opCancel:
+		// 取消操作：先将 ID 写入 canceledTimers 快速过滤集合，
+		// 再从时间轮物理删除，确保即使定时器已投递到 chanFired 也不会被触发
+		disp.canceledTimers.Store(t.id, struct{}{})
+		disp.delete(t.id)
+		return true
+
+	case opStop:
+		// 约定的停止信号，返回 false 使 run() 退出主循环
+		return false
+
+	case opNew:
+		// 若定时器在操作执行前已被取消，忽略新建，防止"取消后重建"的竞态
+		if _, canceled := disp.canceledTimers.Load(t.id); canceled {
+			return true
+		}
+		// 同 ID 新建视为替换，先从所有层级删除旧节点，防止旧定时器残留在其他层级重复触发。
+		disp.delete(t.id)
+		// 清除可能残留的取消标记（防止 Cancel 后立即 New 时被误过滤），并放入时间轮
+		disp.canceledTimers.Delete(t.id)
+		t.canceled = &disp.canceledTimers
+		disp.place(t)
+		return true
+
+	case opUpdate:
+		// 同样受取消标记保护：已取消的定时器不再更新
+		if _, canceled := disp.canceledTimers.Load(t.id); canceled {
+			return true
+		}
+		// 从旧槽位取出，更新 deadline，放入新槽位
+		oldt := disp.delete(t.id)
+		if oldt != nil {
+			oldt.deadline = t.deadline
+			oldt.canceled = &disp.canceledTimers
+			disp.place(oldt)
+		} else {
+			slog.Error("delay timer get old timer fail", "timer_id", t.id)
+		}
+		return true
+
+	default:
+		return true
+	}
+}
+
+// delete 从时间轮各层级中删除指定 ID 的定时器，同时清理 canceledTimers 中的标记防止内存泄漏。
+//
+// 从高层级向低层级扫描，是因为剩余时间较短的定时器在低层级，
+// 但已经被降级的定时器可能在任意层，全量扫描保证不遗漏。
+func (disp *dispatcher) delete(timerID int64) *dispatcherTimer {
+	for i := timerLevel - 1; i >= 0; i-- {
+		if v, ok := disp.timerSlots[i][timerID]; ok {
+			delete(disp.timerSlots[i], timerID)
+			disp.canceledTimers.Delete(timerID) // 物理删除成功后清理取消标记
+			return v
+		}
+	}
+	disp.canceledTimers.Delete(timerID) // 定时器已不在轮中，也清理标记，防止 sync.Map 无限累积
+	return nil
+}
+
+// place 将定时器放入时间轮的合适层级。
+//
+// 它先计算剩余时间 diff，再找到满足 diff <= 2^i*timerTick 的最小层级 i。
+// 已到期的定时器会直接投递到触发队列；剩余时间小于 timerTick 的定时器按 timerTick 处理，
+// 避免因精度舍入导致在最低层级反复检查但无法触发。
+func (disp *dispatcher) place(t *dispatcherTimer) {
+	if _, canceled := disp.canceledTimers.Load(t.id); canceled {
+		return
+	}
+
+	diff := t.deadline.Sub(time.Now())
+	if diff <= 0 {
+		// 已到期，直接投递到触发队列。
+		disp.chanFired.In() <- t
+		return
+	}
+	if diff < timerTick {
+		diff = timerTick // 保底最小粒度，防止极短超时导致在最低层级反复检查但不触发
+	}
+	// 从低层级向高层级查找第一个能容纳 diff 的槽位
+	for i := range timerLevel {
+		if diff <= (timerTick << uint(i)) {
+			disp.timerSlots[i][t.id] = t
+			break
+		}
+	}
+}
+
+// doTick 根据当前时间与 lastTick 的差值推进时间轮。
+//
+// 当 nowTick <= lastTick 时，doTick 会保持 lastTick 不回退，避免服务器时间被手动前移后，
+// 后续恢复到原时间时重复扫描已经推进过的 tick 区间，导致定时器重复触发。
+// 当时钟跳到未来时，doTick 会从 lastTick 逐步推进到 nowTick，并在每一步执行层级扫描；
+// 推进到当前 nowTick 后停止，确保中间层级的定时器降级操作不被跳过。
+func (disp *dispatcher) doTick(now time.Time, lastTick int64) int64 {
+	nowTick := now.UnixNano() / int64(timerTick)
+	if nowTick <= lastTick {
+		return lastTick
+	}
 
 	for {
-		var wait <-chan time.Time
-		if len(disp.heap) > 0 {
-			d := max(time.Until(disp.heap[0].deadline), 0)
-			timer.Reset(d) // Go 1.23+ 的 Reset/Stop 不再需要 drain channel
-			wait = timer.C
+		lastTick++
+		// 多级时间轮的核心调度逻辑：
+		// 第 i 层每隔 2^i 个 tick 扫描一次（当 tick 计数的低 i 位全为 0 时触发）
+		// 这样高层级定时器以更低频率被检查，减少不必要的扫描开销
+		for i := timerLevel - 1; i >= 0; i-- {
+			mask := (1 << uint(i)) - 1
+			if lastTick&int64(mask) == 0 {
+				disp.trigger(now, i)
+			}
 		}
 
-		select {
-		case e := <-disp.chanNew.Out():
-			timer.Stop() // 堆将变化，本轮的等待作废，下轮重新计算
-			disp.doNew(e)
-		case cmd := <-disp.chanOp.Out():
-			timer.Stop()
-			disp.doOp(cmd)
-		case <-wait:
-			disp.fireExpired()
-		case <-disp.done:
-			return
+		if lastTick >= nowTick {
+			break
 		}
 	}
+	return nowTick
 }
 
-// doNew 在派发 goroutine 中将新建的 entry 放入最小堆。
-func (disp *dispatcher) doNew(e *entry) {
-	if e.canceled.Load() {
-		return // 入堆前已被取消，忽略
-	}
-	heap.Push(&disp.heap, e)
-}
-
-// doOp 在派发 goroutine 中执行加速/延迟/取消命令，维护最小堆与 entries 索引表。
+// trigger 扫描指定层级的定时器。
 //
-// opUpdate 无条件先更新 e.deadline，只有已入堆（index >= 0）才额外 heap.Fix：
-// e 和 chanNew 里尚未处理的那个 entry 是同一个指针，即便 New 对应的插堆操作
-// 还没被 doNew 处理，这里提前写入的 deadline 也会被稍后的插堆操作直接带上，
-// 不依赖 chanNew/chanOp 两个 channel 谁先被 select 到，从根上避免"创建后立即
-// 调整"的竞态丢更新问题。
-func (disp *dispatcher) doOp(cmd command) {
-	switch cmd.op {
-	case opUpdate:
-		disp.mu.Lock()
-		e, ok := disp.entries[cmd.id]
-		disp.mu.Unlock()
-		if !ok {
-			slog.Error("update timer not found", "timer_id", cmd.id)
-			return
-		}
-		e.deadline = cmd.deadline
-		if e.index >= 0 {
-			heap.Fix(&disp.heap, e.index)
-		}
-
-	case opCancel:
-		disp.mu.Lock()
-		e, ok := disp.entries[cmd.id]
-		if ok {
-			delete(disp.entries, cmd.id)
-		}
-		disp.mu.Unlock()
-		if ok && e.index >= 0 {
-			heap.Remove(&disp.heap, e.index)
-		}
-	}
-}
-
-// fireExpired 弹出所有已到期（deadline ≤ now）的定时器并投递到 chanFired。
-//
-// chanFired 是无界队列，In() 永不阻塞，因此不再需要 select + <-disp.done 兜底——
-// 不存在"投递卡住导致派发循环停摆、进而拖死等待 chanNew/chanOp 的业务 goroutine"
-// 的情况了。已取消的条目跳过投递。这是单 goroutine 串行投递——无论多少定时器
-// 同时到期，都由本 goroutine 顺序处理，不会 spawn 额外 goroutine。
-func (disp *dispatcher) fireExpired() {
-	now := time.Now()
-	for len(disp.heap) > 0 && !disp.heap[0].deadline.After(now) {
-		e := heap.Pop(&disp.heap).(*entry)
-		disp.mu.Lock()
-		delete(disp.entries, e.id)
-		disp.mu.Unlock()
-		if e.canceled.Load() {
+// 当定时器剩余时间已短于当前层级跨度时，trigger 会将其下移至更精确的低层级；
+// 当最低层定时器已经到期时，trigger 会将其投递到触发队列并从槽位中删除。
+func (disp *dispatcher) trigger(now time.Time, level int) {
+	slotMap := disp.timerSlots[level]
+	for k, v := range slotMap {
+		// 快速过滤已取消的定时器，避免触发无效回调
+		if _, canceled := disp.canceledTimers.Load(k); canceled {
+			delete(slotMap, k)
+			disp.canceledTimers.Delete(k)
 			continue
 		}
-		disp.chanFired.In() <- e
-	}
-}
 
-// Event 返回定时器触发通知的只读通道，供 Manager.Event 透传给业务事件循环消费。
-func (disp *dispatcher) Event() <-chan Event {
-	return disp.chanFired.Out()
-}
-
-// Stop 通知派发主循环退出。
-//
-// 三个内部队列的 Close 由 run() 自身的 defer 负责，不在这里做——避免和仍在
-// 运行的 run() goroutine 并发关闭同一队列引发数据竞争。
-func (disp *dispatcher) Stop() {
-	disp.stopOnce.Do(func() {
-		disp.closed.Store(true)
-		close(disp.done)
-	})
-}
-
-// New 创建定时器并放入最小堆，timerID 为 0 时自动生成全局唯一 ID。
-//
-// 若 dispatcher 已经 Stop，提前返回 0（与「未注册 handler」「ID 已存在」等既有
-// 错误场景使用同一套哨兵值语义，调用方无需区分）。
-// panic 恢复：Stop 和本次调用之间存在极小的竞态窗口——closed 标记之后、chanNew
-// 被 run() 关闭之前——此时仍可能向已关闭队列发送而 panic；recover 后回滚已经
-// 写入 entries 的记录，避免残留一条永远不会被处理的孤儿元数据。
-func (disp *dispatcher) New(name string, timerID int64, deadline time.Time, callback func(int64)) (result int64) {
-	if disp.closed.Load() {
-		slog.Warn("dispatcher already stopped, drop new timer", "name", name)
-		return 0
-	}
-	if timerID == 0 {
-		timerID = disp.atomicID.Add(1)
-	}
-	e := &entry{name: name, id: timerID, callback: callback, deadline: deadline, index: -1}
-
-	disp.mu.Lock()
-	if old, ok := disp.entries[timerID]; ok {
-		old.canceled.Store(true) // 同 ID 重建：标记旧条目，使其触发时被过滤
-	}
-	disp.entries[timerID] = e
-	disp.mu.Unlock()
-
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Warn("dispatcher new timer after stop", "name", name, "panic", r)
-			disp.mu.Lock()
-			delete(disp.entries, timerID)
-			disp.mu.Unlock()
-			result = 0
+		// 位移运算等价于 timerTick × 2^level
+		if v.deadline.Sub(now) < (timerTick << uint(level)) {
+			if level != 0 {
+				// 将定时器降级到更精确的层级，确保在合适的时刻被触发
+				disp.timerSlots[level-1][k] = v
+				delete(slotMap, k)
+			} else if !now.Before(v.deadline) {
+				// 最低层已到期，投递成功后从槽位删除，防止重复触发。
+				disp.chanFired.In() <- v
+				delete(slotMap, k)
+			}
 		}
-	}()
+	}
+}
 
-	disp.chanNew.In() <- e
-	return timerID
+// Stop 向分发器发送停止信号，通知主循环退出。
+func (disp *dispatcher) Stop() {
+	disp.chanOp.In() <- &dispatcherTimer{op: opStop, name: "stop", id: 0}
 }
 
 // Update 更新定时器的到期时刻，用于加速或延迟已存在的定时器。
 //
-// Stop 之后的迟到调用会因 chanOp 已关闭而 panic，此处 recover 后静默丢弃，
-// 效果等价于"调整未生效"，与调用方此时本就不该再操作已停止的定时器管理器一致。
-func (disp *dispatcher) Update(timerID int64, deadline time.Time) {
-	defer func() { _ = recover() }()
-	disp.chanOp.In() <- command{op: opUpdate, id: timerID, deadline: deadline}
+// 通过 chanOp 将更新操作异步发送到分发器 goroutine 处理，
+// 保证时间轮数据的单线程访问，无需外部加锁。
+func (disp *dispatcher) Update(name string, timerID int64, deadline time.Time) {
+	disp.chanOp.In() <- &dispatcherTimer{op: opUpdate, name: name, id: timerID, deadline: deadline}
 }
 
-// Cancel 取消定时器：先同步置取消标记（使已投递到 chanFired 但尚未消费的事件被过滤），
-// 再异步从最小堆物理删除，兼顾取消的即时生效与堆状态的最终一致。
+// New 创建定时器并放入时间轮，timerID 为 0 时自动生成全局唯一 ID。
 //
-// 同步标记先于异步命令投递：即使随后向已关闭的 chanOp 发送而被 recover 吞掉，
-// canceled 标记也已经生效，不影响"取消"这个语义本身的正确性，只是堆里的物理
-// 条目会滞留到进程退出（dispatcher 本身也已经在停止流程中，可接受）。
-func (disp *dispatcher) Cancel(timerID int64) {
-	disp.mu.Lock()
-	e, ok := disp.entries[timerID]
-	disp.mu.Unlock()
-	if !ok {
-		return
+// 通过 chanOp 异步发送创建命令，由分发器 goroutine 执行实际的槽位分配操作。
+func (disp *dispatcher) New(name string, timerID int64, deadline time.Time, cb func(int64)) int64 {
+	if timerID == 0 {
+		timerID = disp.atomicID.Add(1)
 	}
-	e.canceled.Store(true)
-	defer func() { _ = recover() }()
-	disp.chanOp.In() <- command{op: opCancel, id: timerID}
+	disp.chanOp.In() <- &dispatcherTimer{op: opNew, name: name, id: timerID, deadline: deadline, cb: cb, canceled: &disp.canceledTimers}
+	return timerID
+}
+
+// Cancel 取消定时器，采用"先标记后删除"的双重机制确保取消的即时生效性。
+//
+// 先立即将 timerID 写入 canceledTimers（快速过滤集合），
+// 使已投递到 chanFired 但尚未被消费的到期事件也能被过滤掉，
+// 再通过 chanOp 异步发送物理删除命令，从时间轮槽位中移除定时器节点，
+// 两者结合保证取消操作在逻辑层面的即时性和内存层面的最终一致性。
+func (disp *dispatcher) Cancel(name string, timerID int64) {
+	disp.canceledTimers.Store(timerID, struct{}{}) // 立即生效：即使定时器已到期且在通道中排队，也会被过滤
+	disp.chanOp.In() <- &dispatcherTimer{op: opCancel, name: name, id: timerID}
 }

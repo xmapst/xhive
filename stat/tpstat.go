@@ -1,3 +1,4 @@
+// Package stat provides lightweight latency percentile statistics helpers.
 package stat
 
 import (
@@ -10,7 +11,10 @@ import (
 	"sync"
 )
 
-// TPStats 统计消息执行时间 Top Percentile，goroutine safe
+// TPStats 统计消息执行时间 Top Percentile，goroutine safe。
+//
+// 结构分两层锁：外层 TPStats.Mutex 保护 stats map 和 globalStat 指针，内层 tpStat.Mutex 保护单个 key 的样本数组。
+// Add 在首次创建某个 key 时必须持有外层锁，防止多个 goroutine 同时创建同一 key 后互相覆盖，造成样本丢失。
 type TPStats struct {
 	globalStat *tpStat
 	stats      map[any]*tpStat
@@ -18,7 +22,7 @@ type TPStats struct {
 	sync.Mutex
 }
 
-// NewTPStats 创建实例，maxCnt 控制每个 key 最多保留的采样数
+// NewTPStats 创建 TPStats 实例，maxCnt 控制每个 key 最多保留的采样数。
 func NewTPStats(maxCnt int) *TPStats {
 	return &TPStats{
 		maxCnt:     maxCnt,
@@ -28,9 +32,11 @@ func NewTPStats(maxCnt int) *TPStats {
 }
 
 type tpStat struct {
+	// records 只保留前 maxCnt 条样本，用于计算分位数；不会无限增长，避免长时间运行内存失控。
 	records []int64
-	count   int64
-	total   int64
+	// count/total 统计所有输入，不受 maxCnt 限制，因此 Avg 和 Count 反映完整流量，TpXX 反映采样窗口。
+	count int64
+	total int64
 	sync.Mutex
 }
 
@@ -56,28 +62,25 @@ func (s *TPStats) Add(name any, cost int64) {
 		return
 	}
 	s.Lock()
+	defer s.Unlock()
 
+	// 外层锁在整个“获取/创建 key 对应 tpStat”的过程中保持持有，确保并发首次 Add 同一 key 时不会覆盖。
+	// globalStat 指针也受外层锁保护，避免与 Reset 并发时读到被替换中的对象。
 	s.globalStat.Lock()
 	s.globalStat.add(cost, s.maxCnt)
 	s.globalStat.Unlock()
 
 	v, found := s.stats[name]
-	if found {
-		s.Unlock()
-		v.Lock()
-		defer v.Unlock()
-		v.add(cost, s.maxCnt)
-	} else {
-		defer s.Unlock()
-		s.stats[name] = &tpStat{
-			records: []int64{cost},
-			count:   1,
-			total:   cost,
-		}
+	if !found {
+		v = &tpStat{}
+		s.stats[name] = v
 	}
+	v.Lock()
+	defer v.Unlock()
+	v.add(cost, s.maxCnt)
 }
 
-// Reset 清空所有统计
+// Reset 清空所有统计。
 func (s *TPStats) Reset() {
 	s.Lock()
 	defer s.Unlock()
@@ -85,7 +88,10 @@ func (s *TPStats) Reset() {
 	s.stats = make(map[any]*tpStat)
 }
 
-// Dump 将统计信息序列化为 JSON 字符串，返回 Tp99 最高的前 n 条
+// Dump 将统计信息序列化为 JSON 字符串，返回 Tp99 最高的前 n 条。
+//
+// Dump 先在外层锁下复制 stats map 的快照，然后释放外层锁，再逐个锁定 tpStat 计算分位数。
+// 这样可以避免长时间持有全局锁阻塞 Add；排序依据使用 Tp99，便于优先暴露尾延迟最高的消息类型。
 func (s *TPStats) Dump(n int) string {
 	s.Lock()
 	snapshot := make(map[any]*tpStat, len(s.stats))
@@ -144,12 +150,13 @@ func (s *tpStat) percentile(records []int64, pct int) int64 {
 	return records[i]
 }
 
-// TpDumpStats Dump 输出结构
+// TpDumpStats 表示 Dump 输出的整体统计结构。
 type TpDumpStats struct {
 	Global *TpDumpStat
 	Kinds  []*TpDumpStat
 }
 
+// TpDumpStat 表示 Dump 输出的单项统计结构。
 type TpDumpStat struct {
 	ID      any   `json:"id,omitempty"`
 	Count   int64 `json:"count,omitempty"`

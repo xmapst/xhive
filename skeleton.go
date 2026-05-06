@@ -309,7 +309,7 @@ func (s *Skeleton) Call(mod string, req any, opts ...chanrpc.CallOption) *chanrp
 	return s.client.Call(server, req, opts...)
 }
 
-// DumpStat 获取前n个处理耗时最长的消息
+// DumpStat 获取前 n 个处理耗时最长的消息。
 func (s *Skeleton) DumpStat(n int) string {
 	return s.stat.Dump(n)
 }
