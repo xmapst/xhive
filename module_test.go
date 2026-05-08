@@ -75,8 +75,18 @@ func TestAppDynamicPartialFailureKeepsStartedModulesAndRemoveAll(t *testing.T) {
 	bad := newTestModule("bad-dyn")
 	bad.initErr = errors.New("bad init")
 
-	if err := a.AddDynamicModules(good, bad); err == nil {
+	results, err := a.AddDynamicModules(good, bad)
+	if err == nil {
 		t.Fatal("AddDynamicModules should fail when later module init fails")
+	}
+	if len(results) != 2 {
+		t.Fatalf("results length = %d, want 2", len(results))
+	}
+	if results[0].Name != "good-dyn" || results[0].Err != nil {
+		t.Fatalf("results[0] = %+v, want good-dyn success", results[0])
+	}
+	if results[1].Name != "bad-dyn" || results[1].Err == nil {
+		t.Fatalf("results[1] = %+v, want bad-dyn failure", results[1])
 	}
 	waitClosed(t, good.runStarted, time.Second)
 	if a.ChanRPC("good-dyn") != good.server {

@@ -68,7 +68,7 @@ func TestSkeletonRegisterChanRPCAndRPCWrappers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		caller.OnRun(ctx)
+		caller.Serve(ctx)
 		close(done)
 	}()
 	defer func() {
@@ -124,7 +124,7 @@ func TestSkeletonTimerWrappersAndStat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		s.OnRun(ctx)
+		s.Serve(ctx)
 		close(done)
 	}()
 	defer func() {

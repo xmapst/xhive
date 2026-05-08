@@ -75,17 +75,34 @@ func (c *Client) check(s *Server, request any) (uint32, error) {
 
 // Call 向指定 Server 发起同步 RPC 调用，阻塞等待处理结果后返回。
 //
-// 每次调用创建独立的一次性 syncRet，而非共用 chanAsyncRet，
-// 目的是隔离并发 Call 的响应通道，防止多个同时进行的 Call 互相"抢包"。
-// syncRet 是普通 channel，无需显式回收，用完由 GC 自动处理。
-//
-// 等待响应采用“无限等待 + 周期告警”策略：投递到 Server.chanCall 本身不会阻塞（无界队列），
-// 真正的等待风险在于 Server 迟迟不处理，因此每 5 秒记录一次告警用于诊断，
-// 但不会主动超时返回；调用方仍需避免在事件循环中形成循环等待。
+// 等价于 CallWithContext(context.Background(), s, request, opts...)：
+// 不支持通过 ctx 主动取消等待，仅通过周期告警日志诊断长时间未响应的调用。
+// 保留该方法是为了兼容既有调用方，新代码建议直接使用 CallWithContext
+// 以获得真正的超时/取消能力。
 //
 // 警告：在事件循环中使用 Call 会阻塞本模块对其他消息的处理；
 // 若对端模块同时向本模块发起 Call，则形成循环等待（死锁），生产环境应优先使用 AsyncCall。
 func (c *Client) Call(s *Server, request any, opts ...CallOption) *RetInfo {
+	return c.CallWithContext(context.Background(), s, request, opts...)
+}
+
+// CallWithContext 向指定 Server 发起同步 RPC 调用，阻塞等待处理结果、
+// ctx 被取消或超时三者之一发生后返回。
+//
+// 每次调用创建独立的一次性 syncRet，而非共用 chanAsyncRet，
+// 目的是隔离并发 Call 的响应通道，防止多个同时进行的 Call 互相"抢包"。
+// syncRet 是普通 channel，无需显式回收，用完由 GC 自动处理。
+//
+// 相比 Call 固定的"无限等待 + 周期告警"策略，CallWithContext 允许调用方
+// 通过 ctx（如 context.WithTimeout）主动放弃等待：ctx 被取消时立即返回
+// 携带 ctx.Err() 的 RetInfo，而不必永久阻塞在等待响应上。
+// 需要注意：ctx 取消只影响调用方的等待，不会取消 Server 端已经入队、
+// 正在处理的调用，对端处理完成后仍会尝试回包（届时 syncRet 已无人接收，
+// send 会返回 false，转化为 ErrRetDropped，属于预期行为）。
+//
+// 警告：在事件循环中使用 CallWithContext 会阻塞本模块对其他消息的处理；
+// 若对端模块同时向本模块发起 Call，则形成循环等待（死锁），生产环境应优先使用 AsyncCall。
+func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, opts ...CallOption) *RetInfo {
 	id, err := c.check(s, request)
 	if err != nil {
 		slog.Warn("chanrpc sync call failed", "id", id, "err", err)
@@ -111,6 +128,9 @@ func (c *Client) Call(s *Server, request any, opts ...CallOption) *RetInfo {
 		select {
 		case ri := <-chanRet:
 			return ri
+		case <-ctx.Done():
+			slog.Warn("chanrpc call canceled", "id", id, "err", ctx.Err())
+			return &RetInfo{Err: ctx.Err()}
 		case <-tick.C:
 			slog.Warn("chanrpc call timeout", "id", id)
 		}

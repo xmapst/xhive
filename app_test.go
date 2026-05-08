@@ -45,7 +45,7 @@ func (m *testModule) OnInit() error {
 	return m.initErr
 }
 
-func (m *testModule) OnRun(ctx context.Context) {
+func (m *testModule) Serve(ctx context.Context) {
 	m.runCount.Add(1)
 	close(m.runStarted)
 	<-ctx.Done()
@@ -136,7 +136,7 @@ func TestAppStartValidationAndInitFailure(t *testing.T) {
 func TestAppDynamicModulesLifecycle(t *testing.T) {
 	a := newApp()
 	dyn := newTestModule("dyn")
-	if err := a.AddDynamicModules(nil, dyn); err != nil {
+	if _, err := a.AddDynamicModules(nil, dyn); err != nil {
 		t.Fatalf("AddDynamicModules failed: %v", err)
 	}
 	waitClosed(t, dyn.runStarted, time.Second)
@@ -163,7 +163,7 @@ func TestAppDynamicInitFailureDoesNotStoreModule(t *testing.T) {
 	a := newApp()
 	bad := newTestModule("bad-dyn")
 	bad.initErr = errors.New("boom")
-	if err := a.AddDynamicModules(bad); err == nil {
+	if _, err := a.AddDynamicModules(bad); err == nil {
 		t.Fatal("AddDynamicModules should fail")
 	}
 	if a.ChanRPC("bad-dyn") != nil {
@@ -240,8 +240,8 @@ func TestSkeletonOptionsWrappersAndEventLoop(t *testing.T) {
 	if s.ChanRPC() == nil {
 		t.Fatal("ChanRPC should not be nil")
 	}
-	if s.dayStart(time.Date(2026, 7, 7, 12, 1, 2, 0, time.UTC)).Hour() != 0 {
-		t.Fatal("dayStart should return midnight")
+	if s.startOfDay(time.Date(2026, 7, 7, 12, 1, 2, 0, time.UTC)).Hour() != 0 {
+		t.Fatal("startOfDay should return midnight")
 	}
 
 	timerCalled := make(chan map[string]string, 1)
@@ -254,7 +254,7 @@ func TestSkeletonOptionsWrappersAndEventLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		s.OnRun(ctx)
+		s.Serve(ctx)
 		close(done)
 	}()
 

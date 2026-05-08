@@ -25,8 +25,8 @@ type IModule interface {
 	Name() string
 	// OnInit 执行模块初始化，任一模块失败则终止整个应用启动流程。
 	OnInit() error
-	// OnRun 执行模块主循环，应监听 ctx.Done() 并在收到取消信号时退出。
-	OnRun(ctx context.Context)
+	// Serve 执行模块主循环，应监听 ctx.Done() 并在收到取消信号时退出。
+	Serve(ctx context.Context)
 	// OnDestroy 执行模块销毁，在 goroutine 完全退出前调用，负责释放所有资源。
 	OnDestroy()
 	// ChanRPC 返回模块的 ChanRPC 服务端，nil 表示该模块不接受外部 RPC 调用。
@@ -45,11 +45,31 @@ const (
 )
 
 const (
-	// defaultShutdownTimeout 单个模块优雅关闭的最大等待时间。
+	// defaultShutdownTimeout 单个模块优雅关闭的默认最大等待时间。
 	// 设置为 30 分钟是为了兼容可能持有长时间锁或大批量数据落盘的模块，
 	// 超时后记录错误日志但不强制终止，避免数据损坏，由运维介入处理。
+	//
+	// 该值仅作为 app.shutdownTimeout 字段的默认值；不同模块对关闭时限的
+	// 容忍度差异很大，写死的全局常量缺乏灵活性，业务可通过
+	// WithShutdownTimeout 选项按需覆盖。
 	defaultShutdownTimeout = 30 * time.Minute
 )
+
+// AppOption 用于自定义 app 实例的可选行为。
+type AppOption func(*app)
+
+// WithShutdownTimeout 自定义单个模块优雅关闭的最大等待时间。
+//
+// 超时后仅记录错误日志，不会强制终止模块 goroutine（避免数据损坏），
+// 因此该值应结合具体模块可能持有的最长阻塞操作（如大批量落盘、外部调用）来设置。
+// d <= 0 时该选项不生效，沿用 defaultShutdownTimeout。
+func WithShutdownTimeout(d time.Duration) AppOption {
+	return func(a *app) {
+		if d > 0 {
+			a.shutdownTimeout = d
+		}
+	}
+}
 
 // moduleWrapper 为 IModule 附加框架运行时所需的控制元数据。
 //
@@ -62,38 +82,63 @@ type moduleWrapper struct {
 	wg     sync.WaitGroup
 }
 
+// newModuleWrapper 构造 moduleWrapper 并初始化其停止信号 context。
+//
+// 该构造逻辑原先在 Register 与 start 中各自重复实现一次，收敛到此处
+// 之后两处调用方只需一行代码即可复用，避免后续新增字段时两处遗漏同步修改。
+func newModuleWrapper(mod IModule) *moduleWrapper {
+	wrapper := &moduleWrapper{IModule: mod}
+	wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
+	return wrapper
+}
+
 // app 是应用框架的核心结构，统一管理静态模块列表和动态模块集合。
 //
 // 并发安全说明：
-//   - modules 切片通过嵌入的 RWMutex 保护，启动后仅读
+//   - modules 切片与 state 共用同一把 RWMutex 保护：Register/start 需要在
+//     持锁状态下原子地完成"检查状态 + 追加模块"，避免两个操作分离时出现
+//     TOCTOU 竞态（例如并发调用 Register 与 Run 时都读到 AppStateNone）
 //   - dynamicModules 使用 sync.Map，原生支持并发增删改查
-//   - state 使用原子操作读写
 //   - 信号注册与分发由 SignalManager 内部的 RWMutex 保护
 type app struct {
-	sm             *SignalManager
-	dynamicModules sync.Map         // 动态模块集合，key 为模块名，支持运行时热加载
-	modules        []*moduleWrapper // 静态模块列表，按优先级排序，启动后不允许修改
-	sync.RWMutex                    // 保护 modules 切片
-	state          int32            // 应用全局状态，使用 atomic 操作保证原子性
+	sm              *SignalManager
+	dynamicModules  sync.Map         // 动态模块集合，key 为模块名，支持运行时热加载
+	modules         []*moduleWrapper // 静态模块列表，按优先级排序，启动后不允许修改
+	shutdownTimeout time.Duration    // 单个模块优雅关闭的最大等待时间，可通过 WithShutdownTimeout 自定义
+	sync.RWMutex                     // 保护 modules 切片与 state 字段的读写
+	state           atomic.Int32     // 应用全局状态，读写均在持锁状态下进行，Stats/State 对外仍以原子读保证快照一致
 }
 
 // newApp 创建新的应用框架实例，初始状态为 AppStateNone。
-func newApp() *app {
-	return &app{
-		sm:      NewSignalManager(),
-		state:   AppStateNone,
-		modules: make([]*moduleWrapper, 0),
+func newApp(opts ...AppOption) *app {
+	a := &app{
+		sm:              NewSignalManager(),
+		modules:         make([]*moduleWrapper, 0),
+		shutdownTimeout: defaultShutdownTimeout,
 	}
+	a.setState(AppStateNone)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(a)
+		}
+	}
+	return a
 }
 
-// setState 通过原子写入更新应用状态，确保状态变更对所有 goroutine 立即可见。
+// setState 更新应用状态。调用方必须已持有写锁（Lock），
+// 状态变更与 modules 切片的读写共享同一把锁，避免出现"检查状态"和
+// "追加模块"两步操作之间被其他 goroutine 插入导致的 TOCTOU 竞态。
 func (a *app) setState(state int32) {
-	atomic.StoreInt32(&a.state, state)
+	a.state.Store(state)
 }
 
 // State 通过原子读取获取应用当前状态，可在任意 goroutine 中安全调用。
+//
+// 注意：State 不加锁，是一个"当前时刻的近似快照"，
+// 用于外部监控和只读判断场景；涉及状态变更的操作（Register/start/stop）
+// 内部会在持锁状态下重新校验，不依赖此处的读取结果做决策。
 func (a *app) State() int32 {
-	return atomic.LoadInt32(&a.state)
+	return a.state.Load()
 }
 
 // Stats 返回所有模块（静态 + 动态）的 RPC 队列积压状态统计字符串。
@@ -124,15 +169,18 @@ func (a *app) Stats() string {
 }
 
 // appendModuleStats 将单个模块的状态信息追加到 builder，内部实现复用。
+//
+// 直接使用 fmt.Fprintf 写入 builder，避免 fmt.Sprintf 产生的中间字符串
+// 分配后再 WriteString 拷贝一次，减少一次内存分配与拷贝。
 func (a *app) appendModuleStats(builder *strings.Builder, moduleType string, wrapper *moduleWrapper) {
 	rpcServer := wrapper.ChanRPC()
 
 	if rpcServer != nil {
-		builder.WriteString(fmt.Sprintf("%s: %s, rpc_queue_length: %d\n",
-			moduleType, wrapper.Name(), rpcServer.Len()))
+		_, _ = fmt.Fprintf(builder, "%s: %s, rpc_queue_length: %d\n",
+			moduleType, wrapper.Name(), rpcServer.Len())
 	} else {
-		builder.WriteString(fmt.Sprintf("%s: %s, rpc_queue_length: N/A\n",
-			moduleType, wrapper.Name()))
+		_, _ = fmt.Fprintf(builder, "%s: %s, rpc_queue_length: N/A\n",
+			moduleType, wrapper.Name())
 	}
 }
 
@@ -168,8 +216,15 @@ func (a *app) getChanRPCDynamic(name string) *chanrpc.Server {
 //
 // 静态模块在应用整个生命周期中持续运行，不支持热卸载。
 // 若应用已处于运行或停止状态则返回错误，防止运行时并发修改 modules 切片引发数据竞争。
+//
+// 状态检查与追加操作在同一把写锁内完成（而非分离为"先读状态、再加锁追加"），
+// 避免 Register 与 Run 并发调用时，两个 goroutine 都读到 AppStateNone
+// 后同时进入各自的追加/启动流程，产生 TOCTOU 竞态。
 func (a *app) Register(mods ...IModule) error {
-	if a.State() != AppStateNone {
+	a.Lock()
+	defer a.Unlock()
+
+	if a.state.Load() != AppStateNone {
 		return fmt.Errorf("application is already running")
 	}
 
@@ -177,13 +232,7 @@ func (a *app) Register(mods ...IModule) error {
 		if mod == nil {
 			continue
 		}
-		a.Lock()
-		wrapper := &moduleWrapper{
-			IModule: mod,
-		}
-		wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
-		a.modules = append(a.modules, wrapper)
-		a.Unlock()
+		a.modules = append(a.modules, newModuleWrapper(mod))
 	}
 
 	return nil
@@ -226,10 +275,10 @@ func (a *app) Run(mods ...IModule) {
 // start 按顺序初始化并启动所有已注册的模块。
 //
 // 执行流程：
-//  1. 状态检查，防止重复启动
-//  2. 将 Run 参数中的模块追加到 modules 列表（支持 Register + Run 两种注册方式）
-//  3. 依次调用 OnInit，任一失败则中止启动并返回 false
-//  4. 为每个模块启动独立 goroutine 并运行 OnRun
+//  1. 状态检查 + 将 Run 参数中的模块追加到 modules 列表，两步在同一把写锁内完成，
+//     防止并发调用 Register/start 时出现 TOCTOU 竞态（支持 Register + Run 两种注册方式）
+//  2. 依次调用 OnInit，任一失败则中止启动并返回 false
+//  3. 为每个模块启动独立 goroutine 并运行 OnRun
 //
 // 顶层 panic recover：捕获启动过程中的意外 panic，记录完整堆栈后以退出码 255 终止进程，
 // 防止进程在不确定状态下继续运行造成数据损坏。
@@ -240,32 +289,31 @@ func (a *app) start(mods ...IModule) bool {
 			os.Exit(255)
 		}
 	}()
-	currentState := a.State()
+
+	a.Lock()
+	currentState := a.state.Load()
 	if currentState != AppStateNone {
+		a.Unlock()
 		slog.Error("application cannot start twice", "current_state", currentState)
 		return false
 	}
 
-	a.Lock()
 	for _, mod := range mods {
 		if mod == nil {
 			continue
 		}
-		wrapper := &moduleWrapper{
-			IModule: mod,
-		}
-		wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
-		a.modules = append(a.modules, wrapper)
+		a.modules = append(a.modules, newModuleWrapper(mod))
 	}
-	a.Unlock()
-
-	if len(a.modules) == 0 {
+	moduleCount := len(a.modules)
+	if moduleCount == 0 {
+		a.Unlock()
 		slog.Warn("no modules provided to start")
 		return false
 	}
-
 	a.setState(AppStateInit)
-	slog.Info("application starting", "module_count", len(a.modules))
+	a.Unlock()
+
+	slog.Info("application starting", "module_count", moduleCount)
 	for _, wrapper := range a.modules {
 		slog.Info("module startup order", "module", wrapper.Name())
 	}
@@ -281,15 +329,17 @@ func (a *app) start(mods ...IModule) bool {
 	// 所有模块初始化完成后，并发启动各自的 goroutine
 	for _, wrapper := range a.modules {
 		wrapper.wg.Add(1)
-		go a.onRunModule(wrapper, false)
+		go a.serveModule(wrapper, false)
 	}
 
+	a.Lock()
 	a.setState(AppStateRun)
+	a.Unlock()
 	slog.Info("application started successfully")
 	return true
 }
 
-// onRunModule 在独立 goroutine 中运行模块的 OnRun 主循环。
+// serveModule 在独立 goroutine 中运行模块的 OnRun 主循环。
 //
 // runtime.LockOSThread 将 goroutine 绑定到专用系统线程：
 //   - 保证某些依赖线程本地状态的库（如 OpenGL、部分 CGO 库）能正常工作
@@ -298,7 +348,7 @@ func (a *app) start(mods ...IModule) bool {
 // panic 处理策略差异：
 //   - 静态模块（dynamic=false）panic 后调用 os.Exit(255)，确保进程不在不确定状态下运行
 //   - 动态模块（dynamic=true）panic 仅记录日志，不影响其他模块和进程的正常运行
-func (a *app) onRunModule(wrapper *moduleWrapper, dynamic bool) {
+func (a *app) serveModule(wrapper *moduleWrapper, dynamic bool) {
 	runtime.LockOSThread()
 	defer func() {
 		runtime.UnlockOSThread()
@@ -310,9 +360,9 @@ func (a *app) onRunModule(wrapper *moduleWrapper, dynamic bool) {
 			}
 		}
 	}()
-	slog.Info("started module", "module", wrapper.Name())
 
-	wrapper.OnRun(wrapper.ctx)
+	slog.Info("started module", "module", wrapper.Name())
+	wrapper.Serve(wrapper.ctx)
 	slog.Info("module stopped", "module", wrapper.Name())
 }
 
@@ -325,17 +375,21 @@ func (a *app) onRunModule(wrapper *moduleWrapper, dynamic bool) {
 // 逆序关闭保证了"被依赖模块（先启动）在依赖它的模块（后启动）完全停止后才销毁"的时序，
 // 避免在销毁时访问已销毁模块的资源。
 func (a *app) stop() {
-	currentState := a.State()
+	a.Lock()
+	currentState := a.state.Load()
 	if currentState == AppStateStop {
+		a.Unlock()
 		slog.Warn("application already stopping")
 		return
 	}
 	if currentState == AppStateNone {
+		a.Unlock()
 		slog.Warn("application is not running")
 		return
 	}
-
 	a.setState(AppStateStop)
+	a.Unlock()
+
 	slog.Info("application shutdown initiated")
 
 	// 先关闭动态模块，它们通常依赖静态模块提供的服务
@@ -350,7 +404,9 @@ func (a *app) stop() {
 		a.shutdownModule(a.modules[i])
 	}
 
+	a.Lock()
 	a.setState(AppStateNone)
+	a.Unlock()
 	slog.Info("application shutdown complete")
 }
 
@@ -360,8 +416,6 @@ func (a *app) stop() {
 // 原因是 wg.Wait 本身不支持超时，需要借助 select 和 timer 组合。
 // 超时后不强制退出，仅记录错误，因为强制终止可能导致数据损坏（如正在写数据库）。
 func (a *app) shutdownModule(wrapper *moduleWrapper) {
-	slog.Info("signaling module shutdown", "module", wrapper.Name())
-
 	slog.Info("destroying module", "module", wrapper.Name())
 	a.destroyModule(wrapper)
 
@@ -374,7 +428,7 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 		close(done)
 	}()
 
-	timer := time.NewTimer(defaultShutdownTimeout)
+	timer := time.NewTimer(a.shutdownTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
@@ -410,35 +464,55 @@ func (a *app) DynamicModules() (res []string) {
 	return
 }
 
+// AddDynamicModuleResult 记录 AddDynamicModules 中单个模块的处理结果。
+//
+// 相比原先"任一模块初始化失败即刻返回 error，调用方无法知道具体
+// 哪些模块成功、哪些失败"的方式，结构化结果使调用方可以精确地知道
+// 每个模块的最终状态，从而决定是否需要针对失败模块重试或告警，
+// 而不必去猜测已经悄悄启动成功的模块有哪些。
+type AddDynamicModuleResult struct {
+	Name string // 模块名称
+	Err  error  // 初始化错误；nil 表示该模块已成功初始化并启动
+}
+
 // AddDynamicModules 在运行时动态添加并启动一批模块，支持热加载。
 //
 // 与静态模块相比，动态模块的特殊之处：
 //   - panic 不会导致进程退出，仅记录日志（onStartModule 的 dynamic=true 参数控制）
 //   - 支持通过 RemoveDynamicModule 单独卸载，不影响其他模块
-//   - 模块按传入顺序依次初始化，任一失败则停止并返回错误（已成功初始化的模块不自动回滚）
-func (a *app) AddDynamicModules(mods ...IModule) error {
-	var wrappers []*moduleWrapper
+//   - 模块按传入顺序依次初始化，任一失败不会中止后续模块的初始化尝试
+//     （已成功初始化的模块不会因后面某个模块失败而回滚）
+//
+// 返回值为每个非 nil 模块的处理结果列表，调用方可据此精确判断哪些模块
+// 成功、哪些失败及失败原因；若全部成功，err 为 nil，否则 err 汇总了
+// 所有失败模块的名称，便于快速定位问题而无需遍历 results。
+func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err error) {
+	var failedNames []string
+
 	for _, mod := range mods {
 		if mod == nil {
 			continue
 		}
-		wrapper := &moduleWrapper{
-			IModule: mod,
+		wrapper := newModuleWrapper(mod)
+		name := wrapper.Name()
+
+		if initErr := wrapper.OnInit(); initErr != nil {
+			slog.Error("module init error", "module", name, "err", initErr)
+			results = append(results, AddDynamicModuleResult{Name: name, Err: initErr})
+			failedNames = append(failedNames, name)
+			continue
 		}
-		wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
-		wrappers = append(wrappers, wrapper)
+
+		wrapper.wg.Add(1)
+		go a.serveModule(wrapper, true) // dynamic=true：panic 不会退出进程
+		a.dynamicModules.Store(name, wrapper)
+		results = append(results, AddDynamicModuleResult{Name: name})
 	}
 
-	for _, wrapper := range wrappers {
-		if err := wrapper.OnInit(); err != nil {
-			slog.Error("module init error", "module", wrapper.Name(), "err", err)
-			return fmt.Errorf("module %s init failed: %w", wrapper.Name(), err)
-		}
-		wrapper.wg.Add(1)
-		go a.onRunModule(wrapper, true) // dynamic=true：panic 不会退出进程
-		a.dynamicModules.Store(wrapper.Name(), wrapper)
+	if len(failedNames) > 0 {
+		err = fmt.Errorf("dynamic modules init failed: %s", strings.Join(failedNames, ", "))
 	}
-	return nil
+	return results, err
 }
 
 // RemoveDynamicModule 同步移除并销毁指定名称的动态模块。

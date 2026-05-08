@@ -159,7 +159,7 @@ func main() {
 type IModule interface {
 	Name() string
 	OnInit() error
-	OnRun(ctx context.Context)
+	Serve(ctx context.Context)
 	OnDestroy()
 	ChanRPC() *chanrpc.Server
 }
@@ -171,7 +171,7 @@ type IModule interface {
 
 1. 静态模块按注册顺序执行 `OnInit`。
 2. 任一静态模块 `OnInit` 失败，应用启动失败。
-3. `OnRun` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`。
+3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`。
 4. `OnDestroy` 用于释放业务资源。
 5. 静态模块 panic 会导致进程退出；动态模块 panic 只记录日志。
 
@@ -381,7 +381,7 @@ _ = removed
 
 动态模块特性：
 
-- `AddDynamicModules` 会立即执行 `OnInit`，成功后启动 `OnRun`。
+- `AddDynamicModules` 会立即执行 `OnInit`，成功后启动 `Serve`。
 - `RemoveDynamicModule` 同步执行 `OnDestroy`、取消 context、等待 goroutine 退出，再删除模块记录。
 - 动态模块 panic 不会退出进程。
 - 批量添加中途失败时，已经启动的动态模块不会自动回滚。
@@ -478,7 +478,7 @@ go test -race ./...
 
 ### 为什么模块内通常不需要加锁？
 
-因为模块内部事件都在该模块的 `OnRun` goroutine 中串行处理。只要业务状态只在该事件循环内访问，就不会发生并发读写。
+因为模块内部事件都在该模块的 `Serve` goroutine 中串行处理。只要业务状态只在该事件循环内访问，就不会发生并发读写。
 
 ### 什么时候用 AsyncCall，什么时候用 Call？
 

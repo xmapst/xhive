@@ -104,6 +104,55 @@ func TestRingGrowShrinkAndOrder(t *testing.T) {
 	}
 }
 
+// TestRingShrinkHysteresis 验证 ring 的收缩迟滞策略：刚进入满足收缩
+// 条件的区间时不会立即收缩；只有连续 shrinkStreakThreshold 次 pop
+// 都满足收缩条件才会真正收缩容量。
+func TestRingShrinkHysteresis(t *testing.T) {
+	r := newRing[int](2)
+	for i := 0; i < 40; i++ {
+		r.push(i)
+	}
+	grownCap := len(r.buf) // count=40, cap=64
+	if grownCap <= 2 {
+		t.Fatalf("ring did not grow, cap=%d", grownCap)
+	}
+
+	// 从 40 降到 16（cap 的 25%）需要 pop 24 次；从这次 pop 起才开始
+	// 满足收缩条件，计数器从 0 累加到 1。
+	for i := 0; i < 24; i++ {
+		r.pop()
+	}
+	if len(r.buf) != grownCap {
+		t.Fatalf("ring shrunk prematurely: cap=%d, want %d", len(r.buf), grownCap)
+	}
+	if r.shrinkStreak != 1 {
+		t.Fatalf("shrinkStreak = %d, want 1 after first qualifying pop", r.shrinkStreak)
+	}
+
+	// 继续 pop 到累计计数为 shrinkStreakThreshold-1（还差最后一次未收缩）。
+	// count 从 16 降到 16-(shrinkStreakThreshold-2)，占用率进一步降低，
+	// 始终满足收缩条件。
+	for i := 0; i < shrinkStreakThreshold-2; i++ {
+		r.pop()
+	}
+	if r.shrinkStreak != shrinkStreakThreshold-1 {
+		t.Fatalf("shrinkStreak = %d, want %d", r.shrinkStreak, shrinkStreakThreshold-1)
+	}
+	if len(r.buf) != grownCap {
+		t.Fatalf("ring shrunk prematurely at streak=%d: cap=%d, want %d",
+			r.shrinkStreak, len(r.buf), grownCap)
+	}
+
+	// 第 shrinkStreakThreshold 次满足条件的 pop：应真正触发收缩并清零计数。
+	r.pop()
+	if len(r.buf) >= grownCap {
+		t.Fatalf("ring did not shrink after reaching streak threshold: cap=%d", len(r.buf))
+	}
+	if r.shrinkStreak != 0 {
+		t.Fatalf("shrinkStreak should reset after shrink, got %d", r.shrinkStreak)
+	}
+}
+
 func TestRingMinimumCapacityClamp(t *testing.T) {
 	r := newRing[int](0)
 	if len(r.buf) != 1 || r.minCap != 1 {

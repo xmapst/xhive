@@ -67,8 +67,8 @@ func (s *Server) Register(message any, f Handler) error {
 	}
 
 	if _, ok := s.functions[id]; ok {
-		slog.Error("duplicate message", "id", id)
-		return fmt.Errorf("%d: already registered", id)
+		slog.Error("duplicate message", "id", id, "type", reflect.TypeOf(message))
+		return fmt.Errorf("chanrpc register: id=%d type=%v already registered", id, reflect.TypeOf(message))
 	}
 	slog.Info("chanrpc register", "id", id)
 	s.functions[id] = f

@@ -17,12 +17,16 @@ import (
 //   - Cast：单向投递，无响应，吞吐最高，适合通知/事件
 //   - AsyncCall：异步调用，回调在调用方 goroutine 执行，无锁安全，推荐使用
 //   - Call：同步阻塞，有死锁风险，仅在确认无循环依赖时使用
+//   - CallWithContext：同 Call，但支持通过 ctx 主动取消/超时等待
 type IRPC interface {
 	// Cast 单向消息投递，不等待结果，适合日志上报、事件通知等不需要响应的场景。
 	Cast(mod string, req any, opts ...chanrpc.CallOption)
 	// Call 同步 RPC 调用，阻塞等待对端处理完成并返回结果。
 	// 警告：若调用链形成环（A→B→A），将导致死锁，生产环境应优先使用 AsyncCall。
 	Call(mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo
+	// CallWithContext 同 Call，但允许通过 ctx（如 context.WithTimeout）主动
+	// 放弃等待，ctx 被取消时立即返回携带 ctx.Err() 的 RetInfo，而非无限等待。
+	CallWithContext(ctx context.Context, mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo
 	// AsyncCall 异步 RPC 调用，立即返回，结果通过 cb 回调在调用方 goroutine 处理。
 	// 回调在事件循环中串行执行，可安全访问模块内部状态，无需加锁。
 	AsyncCall(mod string, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error
@@ -150,7 +154,7 @@ func (s *Skeleton) Name() string {
 	return s.name
 }
 
-// OnRun 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
+// Serve 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
 //
 // 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
 //  1. ctx.Done()：接收框架的停止信号，触发模块关闭流程
@@ -160,7 +164,7 @@ func (s *Skeleton) Name() string {
 //
 // 单 goroutine 串行处理是性能与正确性权衡的结果：
 // 牺牲了 CPU 并行利用率，换取了零锁开销和极低的编程复杂度。
-func (s *Skeleton) OnRun(ctx context.Context) {
+func (s *Skeleton) Serve(ctx context.Context) {
 	s.timer.Run()
 	s.RegisterTimer(timerKindDumpStat, func(_ int64, _ map[string]string) {
 		s.dumpStat(true)
@@ -189,7 +193,11 @@ func (s *Skeleton) OnRun(ctx context.Context) {
 	}
 }
 
-// close 在模块退出前有序清理资源：停止定时器 → 关闭 RPC 服务端 → 关闭 RPC 客户端。
+// close 在模块退出前有序清理资源：dump 最后一次统计 → 停止定时器 → 关闭 RPC 服务端 → 关闭 RPC 客户端。
+//
+// dumpStat(false) 中 reset 传 false：整个 s.stat 实例即将随 Skeleton 一起被丢弃，
+// 没有必要再执行一次 Reset 清空样本（与 commonCb 中周期性 dump 后需要 reset=true
+// 以便继续统计下一小时的场景不同，这里是"最后一瞥"，reset 与否不影响后续行为）。
 //
 // s.client.Close 内部已经处理了"有 pending 异步调用需要排空"和"无 pending 直接关闭"
 // 两种情况（含超时兜底），这里调用一次即可，不需要在外层轮询 Idle。
@@ -200,11 +208,12 @@ func (s *Skeleton) close() {
 	s.client.Close()
 }
 
-// scheduleDumpTimer 计算下一个触发时刻并创建一次性定时器，错峰 30s到60s 随机抖动
+// scheduleDumpTimer 计算下一个整点触发时刻并创建一次性定时器，
+// 附加 30s~60s 的随机抖动以错峰，避免大量模块在同一时刻集中 dump 造成日志/CPU 尖峰。
 func (s *Skeleton) scheduleDumpTimer() {
-	// 每整点执行
+	// 每整点执行：以当天 0 点为基准，累加整点直到超过当前时刻
 	now := time.Now()
-	next := s.dayStart(now)
+	next := s.startOfDay(now)
 	for !next.After(now) {
 		next = next.Add(time.Hour)
 	}
@@ -213,7 +222,11 @@ func (s *Skeleton) scheduleDumpTimer() {
 	s.NewTimer(timerKindDumpStat, next.Sub(now)+jitter)
 }
 
-func (s *Skeleton) dayStart(now time.Time) time.Time {
+// startOfDay 返回给定时刻所在自然日的零点（00:00:00），
+// 作为 scheduleDumpTimer 逐小时推算下一个整点触发时刻的基准。
+// 命名从原先的 dayStart 调整为 startOfDay，更符合 Go 命名习惯（动词在前），
+// 且与其"返回一天起始时刻"的语义保持一致，避免与"某种起始日"产生歧义。
+func (s *Skeleton) startOfDay(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 }
 
@@ -307,6 +320,17 @@ func (s *Skeleton) Cast(mod string, req any, opts ...chanrpc.CallOption) {
 func (s *Skeleton) Call(mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo {
 	server := defaultApp.ChanRPC(mod)
 	return s.client.Call(server, req, opts...)
+}
+
+// CallWithContext 向指定模块发起同步 RPC 调用，语义与 Call 相同，
+// 但允许通过 ctx（如 context.WithTimeout）主动放弃等待：
+// ctx 被取消时立即返回携带 ctx.Err() 的 RetInfo，而不必依赖 Call 固定的
+// "无限等待 + 周期告警"策略。适合调用方明确需要超时兜底的场景。
+//
+// 危险提示同 Call：会阻塞本模块对其他消息的处理，仅在确认无循环调用时使用。
+func (s *Skeleton) CallWithContext(ctx context.Context, mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo {
+	server := defaultApp.ChanRPC(mod)
+	return s.client.CallWithContext(ctx, server, req, opts...)
 }
 
 // DumpStat 获取前 n 个处理耗时最长的消息。
