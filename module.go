@@ -105,7 +105,6 @@ type app struct {
 	dynamicModules  sync.Map         // 动态模块集合，key 为模块名，支持运行时热加载
 	modules         []*moduleWrapper // 静态模块列表，按优先级排序，启动后不允许修改
 	shutdownTimeout time.Duration    // 单个模块优雅关闭的最大等待时间，可通过 WithShutdownTimeout 自定义
-	sync.RWMutex                     // 保护 modules 切片与 state 字段的读写
 	state           atomic.Int32     // 应用全局状态，读写均在持锁状态下进行，Stats/State 对外仍以原子读保证快照一致
 }
 
@@ -147,9 +146,6 @@ func (a *app) State() int32 {
 // rpc_queue_length 反映模块消息积压程度，是性能瓶颈和消息处理速率的重要观测指标。
 // N/A 表示该模块未配置 ChanRPC 服务端（如纯定时器模块）。
 func (a *app) Stats() string {
-	a.RLock()
-	defer a.RUnlock()
-
 	var builder strings.Builder
 
 	// 遍历静态模块
@@ -190,14 +186,11 @@ func (a *app) appendModuleStats(builder *strings.Builder, moduleType string, wra
 // 两步查找分开处理的原因：静态模块列表需要锁，而 sync.Map 无需锁，
 // 分开可以在找到静态模块时尽早释放读锁，减少锁持有时间。
 func (a *app) ChanRPC(name string) *chanrpc.Server {
-	a.RLock()
 	for _, wrapper := range a.modules {
 		if wrapper.Name() == name {
-			a.RUnlock()
 			return wrapper.ChanRPC()
 		}
 	}
-	a.RUnlock()
 
 	return a.getChanRPCDynamic(name)
 }
@@ -221,9 +214,6 @@ func (a *app) getChanRPCDynamic(name string) *chanrpc.Server {
 // 避免 Register 与 Run 并发调用时，两个 goroutine 都读到 AppStateNone
 // 后同时进入各自的追加/启动流程，产生 TOCTOU 竞态。
 func (a *app) Register(mods ...IModule) error {
-	a.Lock()
-	defer a.Unlock()
-
 	if a.state.Load() != AppStateNone {
 		return fmt.Errorf("application is already running")
 	}
@@ -290,10 +280,8 @@ func (a *app) start(mods ...IModule) bool {
 		}
 	}()
 
-	a.Lock()
 	currentState := a.state.Load()
 	if currentState != AppStateNone {
-		a.Unlock()
 		slog.Error("application cannot start twice", "current_state", currentState)
 		return false
 	}
@@ -306,12 +294,10 @@ func (a *app) start(mods ...IModule) bool {
 	}
 	moduleCount := len(a.modules)
 	if moduleCount == 0 {
-		a.Unlock()
 		slog.Warn("no modules provided to start")
 		return false
 	}
 	a.setState(AppStateInit)
-	a.Unlock()
 
 	slog.Info("application starting", "module_count", moduleCount)
 	for _, wrapper := range a.modules {
@@ -332,9 +318,7 @@ func (a *app) start(mods ...IModule) bool {
 		go a.serveModule(wrapper, false)
 	}
 
-	a.Lock()
 	a.setState(AppStateRun)
-	a.Unlock()
 	slog.Info("application started successfully")
 	return true
 }
@@ -375,20 +359,16 @@ func (a *app) serveModule(wrapper *moduleWrapper, dynamic bool) {
 // 逆序关闭保证了"被依赖模块（先启动）在依赖它的模块（后启动）完全停止后才销毁"的时序，
 // 避免在销毁时访问已销毁模块的资源。
 func (a *app) stop() {
-	a.Lock()
 	currentState := a.state.Load()
 	if currentState == AppStateStop {
-		a.Unlock()
 		slog.Warn("application already stopping")
 		return
 	}
 	if currentState == AppStateNone {
-		a.Unlock()
 		slog.Warn("application is not running")
 		return
 	}
 	a.setState(AppStateStop)
-	a.Unlock()
 
 	slog.Info("application shutdown initiated")
 
@@ -396,17 +376,12 @@ func (a *app) stop() {
 	a.removeAllDynamicModules()
 
 	// 按逆序关闭静态模块，保证依赖关系正确解除（后启动的先关闭）
-	a.RLock()
 	moduleCount := len(a.modules)
-	a.RUnlock()
-
 	for i := moduleCount - 1; i >= 0; i-- {
 		a.shutdownModule(a.modules[i])
 	}
 
-	a.Lock()
 	a.setState(AppStateNone)
-	a.Unlock()
 	slog.Info("application shutdown complete")
 }
 
