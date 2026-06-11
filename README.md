@@ -118,6 +118,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/xmapst/xhive"
 	"github.com/xmapst/xhive/chanrpc"
@@ -172,10 +173,10 @@ func (m *Pinger) OnInit() error {
 			slog.Info("pinger got pong", "seq", ack.Seq)
 		})
 		// 周期触发：1 秒后再次创建定时器
-		m.NewTimer("tick", 1000)
+		m.NewTimer("tick", time.Second)
 	})
 	// 启动首个定时器
-	m.NewTimer("tick", 1000)
+	m.NewTimer("tick", time.Second)
 	return nil
 }
 
@@ -188,12 +189,12 @@ func main() {
 	// Run 会阻塞，直到收到 SIGINT / SIGTERM 后优雅关闭
 }
 
-var _ = timer.WithTicker // 也可用 m.NewTimer("tick", 1000, timer.WithTicker()) 实现自动续期
+var _ = timer.WithTicker // 也可用 m.NewTimer("tick", time.Second, timer.WithTicker()) 实现自动续期
 ```
 
 运行后按 `Ctrl+C` 即触发优雅关闭，框架会按逆序停止所有模块。
 
-> 提示：周期任务除手动在回调里重建定时器外，也可直接用 `m.NewTimer("tick", 1000, timer.WithTicker())` 让框架自动续期。
+> 提示：周期任务除手动在回调里重建定时器外，也可直接用 `m.NewTimer("tick", time.Second, timer.WithTicker())` 让框架自动续期。
 
 ---
 
@@ -225,7 +226,7 @@ type IModule interface {
 | --- | --- |
 | RPC 注册 | `RegisterChanRPC(msg, handler)` |
 | RPC 调用 | `Cast` / `AsyncCall` / `Call` |
-| 定时器 | `RegisterTimer` / `NewTimer` / `AccTimer` / `DelayTimer` / `UpdateTimer` / `CancelTimer` |
+| 定时器 | `RegisterTimer` / `NewTimer` / `AccAbsTimer` / `AccPctTimer` / `DelayAbsTimer` / `DelayPctTimer` / `UpdateTimer` / `CancelTimer` |
 | 统计 | `DumpStat(n)` |
 
 > 内部各组件缓冲区默认为 **100000**，适合高并发场景。若单模块消息量远超此值，需在 `NewSkeleton` 处自行调整以避免背压。
@@ -261,19 +262,21 @@ ri := m.Call("config", &GetReq{Key: "max"})
 
 ```go
 // 一次性定时器：5 秒后触发
-id := m.NewTimer("reborn", 5000, timer.WithMetadata(map[string]string{"uid": "1001"}))
+id := m.NewTimer("reborn", 5*time.Second, timer.WithMetadata(map[string]string{"uid": "1001"}))
 
 // 周期 Ticker：每 1 秒触发，自动续期（消除累积漂移）
-m.NewTimer("heartbeat", 1000, timer.WithTicker())
+m.NewTimer("heartbeat", time.Second, timer.WithTicker())
 
 // 加速 / 延迟 / 精确设置 / 取消
-m.AccTimer(id, timer.AccAbs, 1000)        // 提前 1000ms
-m.DelayTimer(id, timer.AccPct, 2000)      // 延迟 20%（万分比，PctBase=10000）
-m.UpdateTimer(id, endTsMillis)            // 直接设置绝对到期时间戳
+m.AccAbsTimer(id, time.Second)            // 提前 1 秒
+m.DelayPctTimer(id, 2000)                 // 延迟 20%（万分比，PctBase=10000）
+m.UpdateTimer(id, time.Now().Add(time.Minute)) // 直接设置绝对到期时刻
 m.CancelTimer(id)                         // 取消（幂等）
 ```
 
-时间单位常量：`timer.SecMs` / `timer.MinMs` / `timer.HourMs` / `timer.DayMs`。
+时间相关参数统一使用 Go 内置类型：时长用 `time.Duration`（如 `5*time.Second`），绝对时刻用 `time.Time`。
+加速 / 延迟提供两组方法：`AccAbsTimer` / `DelayAbsTimer` 按绝对时长（`time.Duration`）调整，
+`AccPctTimer` / `DelayPctTimer` 按万分比（`int64`，`PctBase=10000`）调整。
 
 ### 信号管理
 
@@ -387,9 +390,8 @@ xhive/
 │   ├── server.go   #   RPC 服务端：路由表 + 消息执行
 │   └── client.go   #   RPC 客户端：三种调用语义 + 优雅关闭
 ├── timer/          # 多级时间轮定时器
-│   ├── def.go      #   时间单位常量
 │   ├── dispatcher.go #  时间轮调度核心（28 级，4ms 精度）
-│   └── manager.go  #   业务层定时器 API（New/Acc/Delay/Cancel/Ticker）
+│   └── manager.go  #   业务层定时器 API（New/AccAbs/AccPct/DelayAbs/DelayPct/Cancel/Ticker）
 └── stat/
     └── tpstat.go   # 消息耗时 TP 分位统计
 ```

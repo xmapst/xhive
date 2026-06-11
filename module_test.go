@@ -304,8 +304,8 @@ func TestSkeletonBasicHelpers(t *testing.T) {
 	if s.ChanRPC() == nil {
 		t.Fatal("ChanRPC() = nil")
 	}
-	if ts := s.dayStartTs(time.Date(2026, 6, 10, 12, 34, 56, 0, time.Local).UnixMilli()); ts > time.Now().Add(24*time.Hour).UnixMilli() {
-		t.Fatalf("dayStartTs() unexpected value %d", ts)
+	if ts := s.dayStart(time.Date(2026, 6, 10, 12, 34, 56, 0, time.Local)); ts.After(time.Now().Add(24 * time.Hour)) {
+		t.Fatalf("dayStart() unexpected value %v", ts)
 	}
 
 	s.recordStat("rpc", 10)
@@ -327,7 +327,7 @@ func TestSkeletonTimerOperations(t *testing.T) {
 	s.timer.Run()
 	defer s.timer.Stop()
 
-	id := s.NewTimer("once", 20, chanrpcOptionAdapter()...)
+	id := s.NewTimer("once", 20*time.Millisecond, chanrpcOptionAdapter()...)
 	if id == 0 {
 		t.Fatal("NewTimer() returned 0")
 	}
