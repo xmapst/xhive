@@ -337,7 +337,7 @@ func TestSkeletonTimerOperations(t *testing.T) {
 
 	select {
 	case ev := <-s.timer.Event():
-		ev.Cb()
+		ev.Callback()
 	case <-time.After(2 * time.Second):
 		t.Fatal("timer event timeout")
 	}
