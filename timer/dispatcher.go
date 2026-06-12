@@ -165,10 +165,7 @@ func (disp *dispatcher) run() {
 	for {
 		var wait <-chan time.Time
 		if len(disp.heap) > 0 {
-			d := time.Until(disp.heap[0].deadline)
-			if d < 0 {
-				d = 0
-			}
+			d := max(time.Until(disp.heap[0].deadline), 0)
 			timer.Reset(d) // Go 1.23+ 的 Reset/Stop 不再需要 drain channel
 			wait = timer.C
 		}
