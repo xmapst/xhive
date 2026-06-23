@@ -66,17 +66,79 @@ type Skeleton struct {
 
 const timerKindDumpStat = "TimerKindDumpStat"
 
+// SkeletonOption 用于自定义 Skeleton 内部各组件的缓冲区长度。
+type SkeletonOption func(*skeletonOptions)
+
+type skeletonOptions struct {
+	timerChanLen  int
+	serverChanLen int
+	clientChanLen int
+	statCap       int
+}
+
+func defaultSkeletonOptions() skeletonOptions {
+	return skeletonOptions{
+		timerChanLen:  1024,
+		serverChanLen: 1024,
+		clientChanLen: 1024,
+		statCap:       1024,
+	}
+}
+
+// WithTimerChanLen 自定义定时器事件通道长度。
+func WithTimerChanLen(n int) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if n > 0 {
+			opts.timerChanLen = n
+		}
+	}
+}
+
+// WithServerChanLen 自定义 ChanRPC 服务端通道长度。
+func WithServerChanLen(n int) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if n > 0 {
+			opts.serverChanLen = n
+		}
+	}
+}
+
+// WithClientChanLen 自定义 ChanRPC 客户端异步返回通道长度。
+func WithClientChanLen(n int) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if n > 0 {
+			opts.clientChanLen = n
+		}
+	}
+}
+
+// WithStatCap 自定义耗时统计容量。
+func WithStatCap(n int) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if n > 0 {
+			opts.statCap = n
+		}
+	}
+}
+
 // NewSkeleton 创建模块骨架，初始化 ChanRPC 和定时器组件。
 //
-// 各组件缓冲区均为 10000，适合高并发游戏服务器场景下的消息吞吐需求。
-// 若某模块的消息量远超此值，需根据业务峰值流量调整，过小会导致背压和调用方超时。
-func NewSkeleton(name string) *Skeleton {
+// 默认各组件缓冲区均为 100000，适合高并发游戏服务器场景下的消息吞吐需求。
+// 可通过 WithXXX 选项按模块特征自定义不同组件容量，避免统一配置带来的浪费或背压。
+func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
+	cfg := defaultSkeletonOptions()
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
 	s := &Skeleton{
 		name:   name,
-		timer:  timer.NewManager(100000),
-		server: chanrpc.NewServer(100000),
-		client: chanrpc.NewClient(100000),
-		stat:   stat.NewTPStats(100000),
+		timer:  timer.NewManager(cfg.timerChanLen),
+		server: chanrpc.NewServer(cfg.serverChanLen),
+		client: chanrpc.NewClient(cfg.clientChanLen),
+		stat:   stat.NewTPStats(cfg.statCap),
 	}
 	return s
 }
