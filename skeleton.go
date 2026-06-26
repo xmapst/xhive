@@ -79,9 +79,9 @@ type skeletonOptions struct {
 func defaultSkeletonOptions() skeletonOptions {
 	return skeletonOptions{
 		timerChanLen:  1024,
-		serverChanLen: 1024,
-		clientChanLen: 1024,
-		statCap:       1024,
+		serverChanLen: 4096,
+		clientChanLen: 4096,
+		statCap:       8192,
 	}
 }
 
