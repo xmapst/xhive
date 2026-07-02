@@ -18,11 +18,12 @@ func Register(mods ...IModule) error {
 	return defaultApp.Register(mods...)
 }
 
-// Run 向全局默认应用实例注册模块并启动，同时监听系统退出信号（SIGINT/SIGKILL/SIGTERM）。
+// Run 向全局默认应用实例注册模块并启动，同时监听系统退出信号（SIGINT/SIGTERM）。
 //
 // 函数会阻塞当前 goroutine 直至收到退出信号，收到后执行优雅关闭流程。
 // 适合在 main 函数中直接调用，是应用的主入口点。
 // SIGHUP 信号不会触发关闭，可用于通知应用重新加载配置（业务层自行监听处理）。
+// SIGKILL 不可被进程捕获，仅作为框架保留信号禁止业务注册。
 func Run(mods ...IModule) {
 	defaultApp.Run(mods...)
 }
@@ -67,14 +68,14 @@ func AddDynamicModules(mods ...IModule) error {
 
 // RemoveDynamicModule 从全局默认应用实例中同步移除并销毁指定名称的动态模块。
 //
-// 操作为同步阻塞：cancel（发停止信号）→ wg.Wait（等待 goroutine 退出）→ OnDestroy（清理资源）→ 从 map 移除。
+// 操作为同步阻塞：OnDestroy（清理资源）→ cancel（发停止信号）→ wg.Wait（等待 goroutine 退出）→ 从 map 移除。
 // 调用方会等待模块完全停止后才返回，确保所有资源在函数返回前已被完整清理。
 func RemoveDynamicModule(name string) bool {
 	return defaultApp.RemoveDynamicModule(name)
 }
 
 // RegisterSignal 向全局默认应用实例追加信号处理器，可在 Run 调用前后的任意时刻安全调用。
-// 同一信号的多个处理器并发执行；SIGINT/SIGKILL/SIGTERM 为框架保留，传入时返回错误。
+// 同一信号的多个处理器会并发执行；SIGINT/SIGTERM 为可捕获的框架保留信号；SIGKILL 不可捕获，也作为保留信号禁止业务注册。
 func RegisterSignal(trap SignalTrap, sigs ...os.Signal) error {
 	return defaultApp.RegisterSignal(trap, sigs...)
 }

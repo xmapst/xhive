@@ -17,7 +17,7 @@ type SignalTrap func()
 // SignalManager 管理进程信号的注册与分发。
 //
 // 同一信号支持注册多个处理器，收到信号时并发调用、等待全部完成。
-// SIGINT/SIGKILL/SIGTERM 由框架独占（固定触发优雅关闭），不允许外部注册。
+// SIGINT/SIGTERM 由框架固定用于优雅关闭；SIGKILL 不可捕获，仅作为保留信号禁止外部注册。
 type SignalManager struct {
 	sync.RWMutex
 	signals         map[os.Signal][]SignalTrap
@@ -25,7 +25,8 @@ type SignalManager struct {
 	reservedSignals map[os.Signal]struct{}
 }
 
-// NewSignalManager 创建 SignalManager，预置 SIGINT/SIGKILL/SIGTERM 为框架保留信号。
+// NewSignalManager 创建 SignalManager，预置框架保留信号。
+// SIGINT/SIGTERM 可被捕获并用于优雅关闭；SIGKILL 不可捕获，仅用于禁止业务注册。
 func NewSignalManager() *SignalManager {
 	return &SignalManager{
 		signals: make(map[os.Signal][]SignalTrap),
@@ -38,8 +39,8 @@ func NewSignalManager() *SignalManager {
 }
 
 // Register 追加信号处理器，并发安全。
-// 同一信号可多次注册，处理器按注册顺序并发执行。
-// SIGINT/SIGKILL/SIGTERM 为框架保留信号，传入时返回错误。
+// 同一信号可多次注册；收到信号时会为每个处理器启动 goroutine 并等待全部完成，不保证完成顺序。
+// SIGINT/SIGTERM 为可捕获的框架保留信号；SIGKILL 不可捕获，也作为保留信号禁止业务注册。
 func (sm *SignalManager) Register(trap SignalTrap, sigs ...os.Signal) error {
 	sm.Lock()
 	defer sm.Unlock()
@@ -62,7 +63,7 @@ func (sm *SignalManager) Register(trap SignalTrap, sigs ...os.Signal) error {
 
 // Start 注册框架默认信号处理器并启动信号分发 goroutine，只在 app.Run 内调用一次。
 //
-// SIGINT/SIGKILL/SIGTERM 固定绑定到 stopFn 触发优雅关闭；
+// SIGINT/SIGTERM 固定绑定到 stopFn 触发优雅关闭；SIGKILL 不可捕获，虽保留在内部表中但不会触发处理器。
 // SIGHUP 仅在业务层未注册处理器时才追加默认行为（记录日志继续运行）。
 // sigCh 在锁内赋值后，后续 Register 调用可安全追加新信号到同一 channel。
 func (sm *SignalManager) Start(stopFn func()) {

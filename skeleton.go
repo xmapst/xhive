@@ -51,11 +51,11 @@ type ITimer interface {
 // Skeleton 模块骨架，将 ChanRPC（服务端/客户端）和定时器管理器整合为统一的事件驱动框架。
 //
 // 核心设计思想（Actor 模型）：
-// 所有事件（RPC 调用、异步回调、定时器）在单一 goroutine（OnStart）中串行处理，
+// 所有事件（RPC 调用、异步回调、定时器）在单一 goroutine（OnRun）中串行处理，
 // 彻底消除模块内部的并发竞争，开发者无需为访问模块状态加任何锁，极大降低了复杂度。
 //
 // 使用方式：业务模块内嵌 Skeleton，重写 OnInit 注册处理函数，重写 OnDestroy 清理资源，
-// 无需重写 OnStart 和 ChanRPC（Skeleton 已提供默认实现）。
+// 无需重写 OnRun 和 ChanRPC（Skeleton 已提供默认实现）。
 type Skeleton struct {
 	name   string
 	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
@@ -123,8 +123,10 @@ func WithStatCap(n int) SkeletonOption {
 
 // NewSkeleton 创建模块骨架，初始化 ChanRPC 和定时器组件。
 //
-// 默认各组件缓冲区均为 100000，适合高并发游戏服务器场景下的消息吞吐需求。
-// 可通过 WithXXX 选项按模块特征自定义不同组件容量，避免统一配置带来的浪费或背压。
+// 默认配置为：定时器事件通道 1024、ChanRPC 服务端队列初始容量 4096、
+// 客户端异步返回队列初始容量 4096、统计采样容量 8192。
+// ChanRPC 队列容量是无界队列的初始容量提示，不是硬性上限。
+// 可通过 WithXXX 选项按模块特征自定义不同组件容量，避免统一配置带来的浪费。
 func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 	cfg := defaultSkeletonOptions()
 	for _, opt := range opts {
@@ -150,11 +152,11 @@ func (s *Skeleton) Name() string {
 
 // OnRun 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
 //
-// 事件循环采用 select 多路复用以下三类事件，保证在单一 goroutine 内串行处理：
+// 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
 //  1. ctx.Done()：接收框架的停止信号，触发模块关闭流程
-//  2. ChanAsyncRet：处理本模块发起的异步 RPC 调用的返回结果（执行注册的 Callback）
-//  3. ChanCall：处理其他模块发来的 RPC 调用请求（查找并执行已注册的 Handler）
-//  4. ChanTimer：处理到期的定时器事件（执行注册的 TimerHandler，并自动续期 Ticker）
+//  2. timer.Event()：处理到期的定时器事件（执行注册的 TimerHandler，并自动续期 Ticker）
+//  3. client.Event()：处理本模块发起的异步 RPC 调用返回结果（执行注册的 Callback）
+//  4. server.Event()：处理其他模块发来的 RPC 调用请求（查找并执行已注册的 Handler）
 //
 // 单 goroutine 串行处理是性能与正确性权衡的结果：
 // 牺牲了 CPU 并行利用率，换取了零锁开销和极低的编程复杂度。
@@ -175,11 +177,11 @@ func (s *Skeleton) OnRun(ctx context.Context) {
 			startUs := time.Now().UnixMicro()
 			t.Callback()
 			s.recordStat(t.Name(), time.Now().UnixMicro()-startUs)
-		case ri := <-s.client.ChanAsyncRet:
+		case ri := <-s.client.Event():
 			startUs := time.Now().UnixMicro()
 			s.client.AsyncCallback(ri)
 			s.recordStat(ri.ID(), time.Now().UnixMicro()-startUs)
-		case ci := <-s.server.ChanCall:
+		case ci := <-s.server.Event():
 			startUs := time.Now().UnixMicro()
 			s.server.Exec(ci)
 			s.recordStat(ci.ID(), time.Now().UnixMicro()-startUs)
@@ -191,7 +193,7 @@ func (s *Skeleton) OnRun(ctx context.Context) {
 //
 // 轮询等待异步回调（!Idle）：直到所有发出的异步调用都收到响应并执行完回调，
 // 防止未处理的回调在模块销毁后被执行时访问已释放的资源。
-// 每次调用 client.Close 会处理当前 ChanAsyncRet 中的回调，Idle 检查保证全部处理完毕才退出。
+// 每次调用 client.Close 会处理当前 client.Event() 中的回调，Idle 检查保证全部处理完毕才退出。
 func (s *Skeleton) close() {
 	s.dumpStat(false)
 	s.timer.Stop()
@@ -289,7 +291,7 @@ func (s *Skeleton) RegisterChanRPC(msg any, f chanrpc.Handler) error {
 
 // AsyncCall 向指定模块发起异步 RPC 调用，结果通过 cb 回调在本模块事件循环中执行。
 //
-// 回调在 OnStart 的 select 循环中消费 ChanAsyncRet 时执行，
+// 回调在 OnRun 的 select 循环中消费 client.Event() 时执行，
 // 与模块其他事件处理串行，无并发问题，可安全访问模块内部状态。
 func (s *Skeleton) AsyncCall(mod string, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error {
 	server := defaultApp.ChanRPC(mod)

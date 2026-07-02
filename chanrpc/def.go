@@ -9,7 +9,8 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"github.com/xmapst/xhive/chanx"
 )
 
 // BKDRBytesHash 使用 BKDR 哈希算法计算字节序列的哈希值。
@@ -78,15 +79,17 @@ func ID(m any) uint32 {
 	return id
 }
 
-// ChanRPC 相关预定义错误，覆盖客户端/服务端关闭、参数非法、超时等各种异常场景。
+// ChanRPC 相关预定义错误，覆盖客户端/服务端关闭、参数非法、响应投递失败等异常场景。
 // 使用具名变量而非 fmt.Errorf 字面量，便于调用方通过 errors.Is 精确判断错误类型。
+// ErrCallTimeout 为兼容旧调用方保留；当前同步 Call 采用无限等待加周期告警策略，不主动返回该错误。
 var (
 	ErrServerClosed       = errors.New("chanrpc: server closed")
 	ErrClientClosed       = errors.New("chanrpc: client closed")
 	ErrServerNil          = errors.New("chanrpc: server cannot be nil")
 	ErrCallbackNil        = errors.New("chanrpc: callback cannot be nil")
 	ErrInvalidMsgType     = errors.New("chanrpc: invalid message type")
-	ErrRetTimeout         = errors.New("chanrpc: ret timeout")
+	ErrCallTimeout        = errors.New("chanrpc: call timeout waiting for response")
+	ErrRetDropped         = errors.New("chanrpc: ret dropped, caller already gone")
 	ErrRegisterMsgNil     = errors.New("chanrpc: register message cannot be nil")
 	ErrRegisterHandlerNil = errors.New("chanrpc: register handler cannot be nil")
 	ErrCallChannelNil     = errors.New("chanrpc: call channel is nil")
@@ -131,18 +134,59 @@ type Handler func(ci *CallInfo) (ri *RetInfo)
 // 回调与业务逻辑运行在同一 goroutine，无需为访问模块状态加锁，简化了并发编程模型。
 type Callback func(ri *RetInfo)
 
+// retSink 是 CallInfo 投递响应结果的目的地，屏蔽同步调用与异步调用在
+// 底层通道上的差异，使 CallInfo.ret 无需关心自己面对的是哪一种。
+//
+// send 返回 false 表示响应未能投递（例如同步 Call 的一次性响应槽已满，
+// 或调用方不再有能力消费该响应），调用方应将其视为“已丢弃”而非“需要重试”。
+type retSink interface {
+	send(ri *RetInfo) bool
+}
+
+// syncRet 是同步 Call 使用的一次性响应槽：容量为 1，写一次读一次即弃，
+// 无需 goroutine，天然被 GC 回收。
+//
+// send 非阻塞：若响应槽已满，直接返回 false，不重试、不阻塞，
+// 防止服务端回包路径被调用方状态反向拖住。
+type syncRet chan *RetInfo
+
+func newSyncRet() syncRet { return make(syncRet, 1) }
+
+func (r syncRet) send(ri *RetInfo) bool {
+	select {
+	case r <- ri:
+		return true
+	default:
+		return false
+	}
+}
+
+// asyncRet 包装 Client 的异步返回队列，用于异步调用（AsyncCall）的响应投递。
+//
+// send 直接写入 chanx.Unbounded.In()：该操作按设计永不阻塞，唯一的失败
+// 模式是目标队列已被 Client.Close 关闭，此时会 panic，交由调用方
+// （CallInfo.ret）的 recover 统一处理，因此这里总是返回 true。
+type asyncRet struct {
+	u *chanx.Unbounded[*RetInfo]
+}
+
+func (r asyncRet) send(ri *RetInfo) bool {
+	r.u.In() <- ri
+	return true
+}
+
 // CallInfo 封装一次 RPC 调用的完整上下文信息。
 //
-// chanRet 和 callback 配合使用：同步调用时 chanRet 为独立单元素 channel，callback 为 nil；
-// 异步调用时 chanRet 为 Client.ChanAsyncRet，callback 为调用方注册的回调；
-// Cast 时两者均为 nil，Server 处理后不做任何响应。
+// chanRet 和 callback 配合使用：同步调用时 chanRet 为 syncRet（一次性响应槽），
+// callback 为 nil；异步调用时 chanRet 包装 Client 的异步返回队列，callback 为
+// 调用方注册的回调；Cast 时两者均为 nil，Server 处理后不做任何响应。
 //
 // hasRet 通过 atomic.Bool 的 CAS 语义实现防重复响应：
 // 正常路径和 panic 恢复路径都会尝试响应，CAS 保证只有第一次成功。
 type CallInfo struct {
 	Request  any            `json:"request"` // 请求数据，业务 handler 的输入
 	id       uint32         // 消息类型全限定ID，用于路由到对应的 Handler
-	chanRet  chan *RetInfo  // 响应通道：同步调用时为独立 channel，异步调用时为 Client.ChanAsyncRet
+	chanRet  retSink        // 响应投递目的地：同步为 syncRet，异步为 asyncRet，Cast 时为 nil
 	callback Callback       // 异步调用的回调函数，同步调用时为 nil
 	hasRet   atomic.Bool    // 防重复响应标志，通过 CAS 操作保证并发安全
 	metadata map[string]any // 元数据
@@ -150,9 +194,10 @@ type CallInfo struct {
 
 // ret 向调用方发送响应结果，通过 hasRet CAS 防止同一次调用被重复响应。
 //
-// 采用 5 秒超时的有缓冲发送策略：
-//   - 正常情况：调用方的 chanRet 容量为 1，发送立即成功
-//   - 异常情况：调用方已超时离开，超时后记录错误并返回，避免 goroutine 永久挂起
+// 投递本身不会阻塞（retSink 的两种实现都不阻塞）：
+//   - syncRet 满/无人接收时返回 false，转化为 ErrRetDropped；
+//   - asyncRet 只有在目标队列已被 Client.Close 关闭时才会失败，
+//     表现为 panic，由下面的 recover 捕获并转化为 error。
 //
 // 若 chanRet 为 nil（Cast 调用），直接返回 nil，不做任何操作。
 func (ci *CallInfo) ret(ri *RetInfo) (err error) {
@@ -166,7 +211,8 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 		return
 	}
 
-	// 捕获向已关闭 channel 发送时可能触发的 panic（Server.Close 后仍有调用在处理中）
+	// 捕获向已关闭队列发送时触发的 panic
+	// （Server.Close 或 Client.Close 已回收对应队列后，仍有调用在处理中）
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
@@ -189,15 +235,10 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	// 拷贝元数据
 	maps.Copy(ri.Metadata, ci.metadata)
 
-	// 带超时的非阻塞发送，防止调用方已超时离开导致 goroutine 永久阻塞
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case ci.chanRet <- ri:
-		return nil
-	case <-timer.C:
-		return fmt.Errorf("%w %d", ErrRetTimeout, ci.ID())
+	if !ci.chanRet.send(ri) {
+		return fmt.Errorf("%w: id=%d", ErrRetDropped, ci.ID())
 	}
+	return nil
 }
 
 // ID 返回本次调用的消息类型全限定ID。
