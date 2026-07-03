@@ -216,7 +216,7 @@ func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 }
 
 // adjustAbs 按绝对时长调整剩余时间。acc=true 为加速（缩短，不允许早于当前时刻），acc=false 为延迟（延长）。
-func adjustAbs(remain, d time.Duration, acc bool) (time.Duration, error) {
+func (tm *Manager) adjustAbs(remain, d time.Duration, acc bool) (time.Duration, error) {
 	if d <= 0 {
 		return 0, fmt.Errorf("invalid duration %v", d)
 	}
@@ -228,7 +228,7 @@ func adjustAbs(remain, d time.Duration, acc bool) (time.Duration, error) {
 
 // adjustPct 按万分比调整剩余时间。pct 必须在 (0, PctBase] 范围内。
 // acc=true 时新剩余 = remain × (PctBase-pct)/PctBase；acc=false 时 = remain × (PctBase+pct)/PctBase。
-func adjustPct(remain time.Duration, pct int64, acc bool) (time.Duration, error) {
+func (tm *Manager) adjustPct(remain time.Duration, pct int64, acc bool) (time.Duration, error) {
 	if pct <= 0 || pct > PctBase {
 		return 0, fmt.Errorf("invalid pct value %d", pct)
 	}
@@ -239,6 +239,14 @@ func adjustPct(remain time.Duration, pct int64, acc bool) (time.Duration, error)
 }
 
 // reschedule 按 newRemain 重设定时器到期时刻，统一供四个加速/延迟方法复用。
+//
+// 同步平移 startAt：若只改 deadline 不改 startAt，会污染 commonCallback 中
+// interval = deadline - startAt 的计算，导致 Ticker 后续每次续期的周期都
+// 永久带上这次调整量（而不是仅这一次触发提前/延迟）。将 startAt 平移相同的
+// delta，可以让 interval 保持数值不变，只有这一次触发的绝对时刻发生偏移，
+// 后续周期恢复原有间隔——这才是"加速/延迟一次"应有的效果。
+// 仅对 Ticker 生效：一次性定时器的 startAt 语义是"创建时刻"，不应被此操作
+// 改写；startAt 本身也只在 Ticker 的续期计算中被读取，对一次性定时器无影响。
 func (tm *Manager) reschedule(id int64, calc func(remain time.Duration) (time.Duration, error), what string) error {
 	now := time.Now()
 	t := tm.timers[id]
@@ -250,6 +258,10 @@ func (tm *Manager) reschedule(id int64, calc func(remain time.Duration) (time.Du
 		return fmt.Errorf("%s timer failed, %w", what, err)
 	}
 	newDeadline := now.Add(newRemain)
+	if t.isTicker {
+		delta := newDeadline.Sub(t.deadline)
+		t.startAt = t.startAt.Add(delta)
+	}
 	t.deadline = newDeadline
 	tm.dispatcher.Update(id, newDeadline)
 	return nil
@@ -258,36 +270,41 @@ func (tm *Manager) reschedule(id int64, calc func(remain time.Duration) (time.Du
 // AccAbs 按绝对时长加速定时器，使其提前触发。新剩余 = max(0, 原剩余 - d)，d 必须大于 0。
 func (tm *Manager) AccAbs(id int64, d time.Duration) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return adjustAbs(remain, d, true)
+		return tm.adjustAbs(remain, d, true)
 	}, "acc")
 }
 
 // DelayAbs 按绝对时长延迟定时器，使其推迟触发。新剩余 = 原剩余 + d，d 必须大于 0。
 func (tm *Manager) DelayAbs(id int64, d time.Duration) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return adjustAbs(remain, d, false)
+		return tm.adjustAbs(remain, d, false)
 	}, "delay")
 }
 
 // AccPct 按万分比加速定时器。新剩余 = 原剩余 × (PctBase - pct) / PctBase，pct 必须在 (0, PctBase] 范围内。
 func (tm *Manager) AccPct(id int64, pct int64) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return adjustPct(remain, pct, true)
+		return tm.adjustPct(remain, pct, true)
 	}, "acc")
 }
 
 // DelayPct 按万分比延迟定时器。新剩余 = 原剩余 × (PctBase + pct) / PctBase，pct 必须在 (0, PctBase] 范围内。
 func (tm *Manager) DelayPct(id int64, pct int64) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return adjustPct(remain, pct, false)
+		return tm.adjustPct(remain, pct, false)
 	}, "delay")
 }
 
 // Update 直接设置定时器的绝对到期时刻，用于需要精确控制触发时刻的场景。
+// 对 Ticker 同步平移 startAt，理由与 reschedule 一致：避免污染续期周期。
 func (tm *Manager) Update(id int64, deadline time.Time) {
 	t := tm.timers[id]
 	if t == nil {
 		return
+	}
+	if t.isTicker {
+		delta := deadline.Sub(t.deadline)
+		t.startAt = t.startAt.Add(delta)
 	}
 	t.deadline = deadline
 	tm.dispatcher.Update(id, deadline)
