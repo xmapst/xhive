@@ -42,7 +42,7 @@ func (s *Server) Event() <-chan *CallInfo {
 	return s.chanCall.Out()
 }
 
-func (s *Server) Len() int {
+func (s *Server) Len() int64 {
 	return s.chanCall.Len()
 }
 
