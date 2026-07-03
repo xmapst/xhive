@@ -24,12 +24,12 @@ type Handler func(timerID int64, metadata map[string]string)
 // 业务层通过 Manager 的 API 操作定时器，底层 dispatcher 只负责最小堆调度，
 // 两层通过 timerID 解耦，使业务逻辑与调度算法互不依赖。
 type Timer struct {
-	id       int64             // 定时器唯一 ID，与 dispatcher 层共享同一 ID
-	name     string            // 定时器业务类型，用于路由到对应的 Handler
 	startAt  time.Time         // 当前周期的起始时刻，Ticker 续期时更新为上次触发时刻
 	deadline time.Time         // 当前周期的期望触发时刻
-	isTicker bool              // true 表示周期性 Ticker，false 表示一次性 Timer
 	metadata map[string]string // 业务元数据，创建时传入，每次回调时透传给 Handler
+	name     string            // 定时器业务类型，用于路由到对应的 Handler
+	id       int64             // 定时器唯一 ID，与 dispatcher 层共享同一 ID
+	isTicker bool              // true 表示周期性 Ticker，false 表示一次性 Timer
 }
 
 // ID 返回定时器 ID。
@@ -162,8 +162,8 @@ func (tm *Manager) commonCallback(timerID int64) {
 
 // timerOptions New 可选参数集合。
 type timerOptions struct {
-	id       int64
 	metadata map[string]string
+	id       int64
 	isTicker bool
 }
 

@@ -185,11 +185,11 @@ func (r asyncRet) send(ri *RetInfo) bool {
 // 正常路径和 panic 恢复路径都会尝试响应，CAS 保证只有第一次成功。
 type CallInfo struct {
 	Request  any            `json:"request"` // 请求数据，业务 handler 的输入
-	id       uint32         // 消息类型全限定ID，用于路由到对应的 Handler
 	chanRet  retSink        // 响应投递目的地：同步为 syncRet，异步为 asyncRet，Cast 时为 nil
 	callback Callback       // 异步调用的回调函数，同步调用时为 nil
-	hasRet   atomic.Bool    // 防重复响应标志，通过 CAS 操作保证并发安全
 	metadata map[string]any // 元数据
+	id       uint32         // 消息类型全限定ID，用于路由到对应的 Handler
+	hasRet   atomic.Bool    // 防重复响应标志，通过 CAS 操作保证并发安全
 }
 
 // ret 向调用方发送响应结果，通过 hasRet CAS 防止同一次调用被重复响应。

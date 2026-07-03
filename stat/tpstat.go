@@ -11,10 +11,10 @@ import (
 
 // TPStats 统计消息执行时间 Top Percentile，goroutine safe
 type TPStats struct {
-	sync.Mutex
-	maxCnt     int
 	globalStat *tpStat
 	stats      map[any]*tpStat
+	maxCnt     int
+	sync.Mutex
 }
 
 // NewTPStats 创建实例，maxCnt 控制每个 key 最多保留的采样数
@@ -27,10 +27,10 @@ func NewTPStats(maxCnt int) *TPStats {
 }
 
 type tpStat struct {
-	sync.Mutex
 	records []int64
 	count   int64
 	total   int64
+	sync.Mutex
 }
 
 func (s *tpStat) add(cost int64, maxCnt int) {

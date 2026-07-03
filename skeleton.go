@@ -57,11 +57,11 @@ type ITimer interface {
 // 使用方式：业务模块内嵌 Skeleton，重写 OnInit 注册处理函数，重写 OnDestroy 清理资源，
 // 无需重写 OnRun 和 ChanRPC（Skeleton 已提供默认实现）。
 type Skeleton struct {
-	name   string
 	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
 	server *chanrpc.Server // ChanRPC 服务端，接收并路由来自其他模块的 RPC 调用
 	client *chanrpc.Client // ChanRPC 客户端，向其他模块发起 RPC 调用
 	stat   *stat.TPStats   // 消息耗时统计
+	name   string
 }
 
 const timerKindDumpStat = "TimerKindDumpStat"
