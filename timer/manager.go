@@ -80,7 +80,7 @@ type Manager struct {
 	dispatcher *dispatcher        // 底层最小堆分发器
 }
 
-// NewManager 创建定时器管理器，参数 l 为底层分发器的通道容量。
+// NewManager 创建定时器管理器，参数 l 为底层分发器内部各无界队列的初始容量提示。
 func NewManager(l int) *Manager {
 	return &Manager{
 		timers:     make(map[int64]*Timer),
@@ -99,14 +99,15 @@ func (tm *Manager) Run() {
 	tm.dispatcher.Run()
 }
 
-// Stop 停止底层分发器，发送停止信号后分发器主循环退出。
+// Stop 停止底层分发器，发送停止信号后分发器主循环退出，
+// 并在退出前统一关闭内部各无界队列（见 dispatcher.run）。
 func (tm *Manager) Stop() {
 	tm.dispatcher.Stop()
 }
 
 // Event 返回定时器触发通知通道，供模块事件循环（Skeleton.OnRun）通过 select 监听。
 func (tm *Manager) Event() <-chan Event {
-	return tm.dispatcher.chanFired
+	return tm.dispatcher.Event()
 }
 
 // Find 通过 ID 查询定时器业务层元数据，不存在时返回 nil。
@@ -186,6 +187,10 @@ func WithTicker() Option {
 }
 
 // New 创建并启动一个定时器，d 为相对当前时刻的延迟时长，返回定时器 ID。
+//
+// 返回 0 表示创建失败：handler 未注册、指定 ID 已存在，或底层 dispatcher
+// 已经 Stop（此时不再存储业务层元数据，避免 timers map 里残留一条 id=0 的
+// 无效记录——0 在整个 API 中统一用作失败哨兵值，业务层不会真正拥有 id=0 的定时器）。
 func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 	o := &timerOptions{}
 	for _, opt := range opts {
@@ -204,6 +209,9 @@ func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 	startAt := time.Now()
 	deadline := startAt.Add(d)
 	id := tm.dispatcher.New(name, o.id, deadline, tm.commonCallback)
+	if id == 0 {
+		return 0
+	}
 	tm.timers[id] = &Timer{
 		id:       id,
 		name:     name,
@@ -313,7 +321,7 @@ func (tm *Manager) Update(id int64, deadline time.Time) {
 // Cancel 取消定时器并同步清理业务层元数据。
 //
 // ID 为 0 的取消操作视为异常并记录错误日志后返回，
-// 因为 ID=0 是 dispatcher 的内置停止信号，业务层不应使用该 ID。
+// 因为 ID=0 是整个 API 统一使用的失败哨兵值，业务层不应持有该 ID 的定时器。
 // 先调用 dispatcher.Cancel（双重取消：立即标记 + 异步删除），
 // 再清理 timers map，保证内存不因无效的定时器元数据而持续增长。
 func (tm *Manager) Cancel(id int64) {
