@@ -37,12 +37,12 @@ func assertClosed[T any](t *testing.T, ch <-chan T, timeout time.Duration) {
 // Close 后不会丢弃已缓冲数据，而是在全部读尽后关闭 Out。
 func TestUnboundedFIFOAndCloseDrains(t *testing.T) {
 	u := NewUnbounded[int](context.Background(), WithInitialCapacity(2))
-	for i := 0; i < 128; i++ {
+	for i := range 128 {
 		u.In() <- i
 	}
 	u.Close()
 
-	for i := 0; i < 128; i++ {
+	for i := range 128 {
 		recvValue(t, u.Out(), i, time.Second)
 	}
 	assertClosed(t, u.Out(), time.Second)
@@ -63,13 +63,13 @@ func TestUnboundedBufferedChannelsAndApproxLen(t *testing.T) {
 	u := NewUnbounded[int](context.Background(), WithInitialCapacity(1), WithChanCapacity(4, 4))
 	defer u.Close()
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		u.In() <- i
 	}
 	if got := u.Len(); got < 0 {
 		t.Fatalf("Len should never be negative: %d", got)
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		recvValue(t, u.Out(), i, time.Second)
 	}
 }
@@ -78,7 +78,7 @@ func TestUnboundedBufferedChannelsAndApproxLen(t *testing.T) {
 // 且收缩不能低于创建时的最小容量，避免频繁抖动。
 func TestRingGrowShrinkAndOrder(t *testing.T) {
 	r := newRing[int](2)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		r.push(i)
 	}
 	if r.len() != 100 {
@@ -88,7 +88,7 @@ func TestRingGrowShrinkAndOrder(t *testing.T) {
 		t.Fatalf("ring did not grow, cap=%d", len(r.buf))
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if got := r.front(); got != i {
 			t.Fatalf("front at %d = %d", i, got)
 		}
@@ -109,7 +109,7 @@ func TestRingGrowShrinkAndOrder(t *testing.T) {
 // 都满足收缩条件才会真正收缩容量。
 func TestRingShrinkHysteresis(t *testing.T) {
 	r := newRing[int](2)
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		r.push(i)
 	}
 	grownCap := len(r.buf) // count=40, cap=64
@@ -119,7 +119,7 @@ func TestRingShrinkHysteresis(t *testing.T) {
 
 	// 从 40 降到 16（cap 的 25%）需要 pop 24 次；从这次 pop 起才开始
 	// 满足收缩条件，计数器从 0 累加到 1。
-	for i := 0; i < 24; i++ {
+	for range 24 {
 		r.pop()
 	}
 	if len(r.buf) != grownCap {
@@ -132,7 +132,7 @@ func TestRingShrinkHysteresis(t *testing.T) {
 	// 继续 pop 到累计计数为 shrinkStreakThreshold-1（还差最后一次未收缩）。
 	// count 从 16 降到 16-(shrinkStreakThreshold-2)，占用率进一步降低，
 	// 始终满足收缩条件。
-	for i := 0; i < shrinkStreakThreshold-2; i++ {
+	for range shrinkStreakThreshold - 2 {
 		r.pop()
 	}
 	if r.shrinkStreak != shrinkStreakThreshold-1 {

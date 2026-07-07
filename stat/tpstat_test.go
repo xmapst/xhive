@@ -99,10 +99,10 @@ func TestTPStatsReset(t *testing.T) {
 func TestTPStatsConcurrentAddAndDump(t *testing.T) {
 	s := NewTPStats(1000)
 	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
+	for g := range 8 {
 		name := g + 1
 		wg.Go(func() {
-			for i := 0; i < 200; i++ {
+			for i := range 200 {
 				s.Add(name, int64(i+1))
 				_ = s.Dump(5)
 			}
