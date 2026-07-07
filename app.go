@@ -1,3 +1,5 @@
+// Package xhive provides an actor-style application framework with module lifecycle,
+// ChanRPC messaging, timers, and signal handling.
 package xhive
 
 import (

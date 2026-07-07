@@ -21,19 +21,27 @@ import (
 // 拥有独立的 goroutine、RPC 服务端和定时器管理器。
 // 模块之间通过 ChanRPC 通信，天然隔离内部状态，无需跨模块加锁。
 type IModule interface {
-	Name() string              // 模块唯一名称，用于日志标识和跨模块 RPC 寻址
-	OnInit() error             // 模块初始化，任一模块失败则终止整个应用启动流程
-	OnRun(ctx context.Context) // 模块主循环，应监听 ctx.Done() 并在收到取消信号时退出
-	OnDestroy()                // 模块销毁，在 goroutine 完全退出前调用，负责释放所有资源
-	ChanRPC() *chanrpc.Server  // 返回模块的 ChanRPC 服务端，nil 表示该模块不接受外部 RPC 调用
+	// Name 返回模块唯一名称，用于日志标识和跨模块 RPC 寻址。
+	Name() string
+	// OnInit 执行模块初始化，任一模块失败则终止整个应用启动流程。
+	OnInit() error
+	// OnRun 执行模块主循环，应监听 ctx.Done() 并在收到取消信号时退出。
+	OnRun(ctx context.Context)
+	// OnDestroy 执行模块销毁，在 goroutine 完全退出前调用，负责释放所有资源。
+	OnDestroy()
+	// ChanRPC 返回模块的 ChanRPC 服务端，nil 表示该模块不接受外部 RPC 调用。
+	ChanRPC() *chanrpc.Server
 }
 
-// 应用全局状态常量，表示应用生命周期的各个阶段。
 const (
-	AppStateNone = iota // 应用未启动或已完全停止，可安全重新启动
-	AppStateInit        // 应用正在初始化，所有模块的 OnInit 正在按序执行
-	AppStateRun         // 应用运行中，所有模块已成功启动并处于活跃状态
-	AppStateStop        // 应用正在优雅关闭，模块正按逆序依次停止
+	// AppStateNone 表示应用未启动或已完全停止，可安全重新启动。
+	AppStateNone = iota
+	// AppStateInit 表示应用正在初始化，所有模块的 OnInit 正在按序执行。
+	AppStateInit
+	// AppStateRun 表示应用运行中，所有模块已成功启动并处于活跃状态。
+	AppStateRun
+	// AppStateStop 表示应用正在优雅关闭，模块正按逆序依次停止。
+	AppStateStop
 )
 
 const (
@@ -166,6 +174,9 @@ func (a *app) Register(mods ...IModule) error {
 	}
 
 	for _, mod := range mods {
+		if mod == nil {
+			continue
+		}
 		a.Lock()
 		wrapper := &moduleWrapper{
 			IModule: mod,
@@ -314,8 +325,13 @@ func (a *app) onRunModule(wrapper *moduleWrapper, dynamic bool) {
 // 逆序关闭保证了"被依赖模块（先启动）在依赖它的模块（后启动）完全停止后才销毁"的时序，
 // 避免在销毁时访问已销毁模块的资源。
 func (a *app) stop() {
-	if a.State() == AppStateStop {
+	currentState := a.State()
+	if currentState == AppStateStop {
 		slog.Warn("application already stopping")
+		return
+	}
+	if currentState == AppStateNone {
+		slog.Warn("application is not running")
 		return
 	}
 

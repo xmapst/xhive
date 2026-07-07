@@ -37,10 +37,12 @@ func NewClient(initCap int) *Client {
 	return c
 }
 
+// Event 返回异步调用响应队列的只读接收端，供调用方事件循环消费。
 func (c *Client) Event() <-chan *RetInfo {
 	return c.chanAsyncRet.Out()
 }
 
+// Len 返回异步调用响应队列的近似积压数量，用于监控和告警。
 func (c *Client) Len() int64 {
 	return c.chanAsyncRet.Len()
 }

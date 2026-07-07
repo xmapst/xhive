@@ -1,3 +1,4 @@
+// Package chanrpc provides channel-based RPC primitives for actor-style modules.
 package chanrpc
 
 import (
@@ -40,6 +41,7 @@ func BKDRHashStr(s string) uint32 {
 //  1. 同一结构体在不同上下文中表示不同语义（复用结构体降低内存分配）
 //  2. 需要与外部协议名对齐
 type IMessage interface {
+	// ID 返回消息结构体自定义的全局唯一消息 ID。
 	ID() uint32
 }
 
@@ -79,21 +81,29 @@ func ID(m any) uint32 {
 	return id
 }
 
-// ChanRPC 相关预定义错误，覆盖客户端/服务端关闭、参数非法、响应投递失败等异常场景。
-// 使用具名变量而非 fmt.Errorf 字面量，便于调用方通过 errors.Is 精确判断错误类型。
-// ErrCallTimeout 为兼容旧调用方保留；当前同步 Call 采用无限等待加周期告警策略，不主动返回该错误。
 var (
-	ErrServerClosed       = errors.New("chanrpc: server closed")
-	ErrClientClosed       = errors.New("chanrpc: client closed")
-	ErrServerNil          = errors.New("chanrpc: server cannot be nil")
-	ErrCallbackNil        = errors.New("chanrpc: callback cannot be nil")
-	ErrInvalidMsgType     = errors.New("chanrpc: invalid message type")
-	ErrCallTimeout        = errors.New("chanrpc: call timeout waiting for response")
-	ErrRetDropped         = errors.New("chanrpc: ret dropped, caller already gone")
-	ErrRegisterMsgNil     = errors.New("chanrpc: register message cannot be nil")
+	// ErrServerClosed 表示 ChanRPC 服务端已关闭。
+	ErrServerClosed = errors.New("chanrpc: server closed")
+	// ErrClientClosed 表示 ChanRPC 客户端已关闭。
+	ErrClientClosed = errors.New("chanrpc: client closed")
+	// ErrServerNil 表示调用目标服务端为空。
+	ErrServerNil = errors.New("chanrpc: server cannot be nil")
+	// ErrCallbackNil 表示异步调用未提供回调函数。
+	ErrCallbackNil = errors.New("chanrpc: callback cannot be nil")
+	// ErrInvalidMsgType 表示请求消息类型无法生成有效消息 ID。
+	ErrInvalidMsgType = errors.New("chanrpc: invalid message type")
+	// ErrCallTimeout 为兼容旧调用方保留；当前同步 Call 采用无限等待加周期告警策略，不主动返回该错误。
+	ErrCallTimeout = errors.New("chanrpc: call timeout waiting for response")
+	// ErrRetDropped 表示响应未能投递给调用方。
+	ErrRetDropped = errors.New("chanrpc: ret dropped, caller already gone")
+	// ErrRegisterMsgNil 表示注册 RPC 处理器时消息样例为空。
+	ErrRegisterMsgNil = errors.New("chanrpc: register message cannot be nil")
+	// ErrRegisterHandlerNil 表示注册 RPC 处理器时处理函数为空。
 	ErrRegisterHandlerNil = errors.New("chanrpc: register handler cannot be nil")
-	ErrCallChannelNil     = errors.New("chanrpc: call channel is nil")
-	ErrCallInfoNil        = errors.New("chanrpc: call CallInfo is nil")
+	// ErrCallChannelNil 表示 RPC 调用队列为空。
+	ErrCallChannelNil = errors.New("chanrpc: call channel is nil")
+	// ErrCallInfoNil 表示 RPC 调用上下文为空。
+	ErrCallInfoNil = errors.New("chanrpc: call CallInfo is nil")
 )
 
 // CallOption 配置单次调用的可选参数。

@@ -38,10 +38,12 @@ func NewServer(initCap int) *Server {
 	return s
 }
 
+// Event 返回 RPC 调用队列的只读接收端，供模块事件循环消费。
 func (s *Server) Event() <-chan *CallInfo {
 	return s.chanCall.Out()
 }
 
+// Len 返回 RPC 调用队列的近似积压数量，用于监控和告警。
 func (s *Server) Len() int64 {
 	return s.chanCall.Len()
 }

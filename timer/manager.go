@@ -21,15 +21,15 @@ type Handler func(timerID int64, metadata map[string]string)
 // Timer 业务层定时器的完整元数据。
 //
 // 设计上将业务语义（name、metadata）与调度数据（startAt、deadline、isTicker）分开存储，
-// 业务层通过 Manager 的 API 操作定时器，底层 dispatcher 只负责最小堆调度，
+// 业务层通过 Manager 的 API 操作定时器，底层 dispatcher 只负责时间轮调度，
 // 两层通过 timerID 解耦，使业务逻辑与调度算法互不依赖。
 type Timer struct {
+	id       int64             // 定时器唯一 ID，与 dispatcher 层共享同一 ID
+	name     string            // 定时器业务类型，用于路由到对应的 Handler
 	startAt  time.Time         // 当前周期的起始时刻，Ticker 续期时更新为上次触发时刻
 	deadline time.Time         // 当前周期的期望触发时刻
-	metadata map[string]string // 业务元数据，创建时传入，每次回调时透传给 Handler
-	name     string            // 定时器业务类型，用于路由到对应的 Handler
-	id       int64             // 定时器唯一 ID，与 dispatcher 层共享同一 ID
 	isTicker bool              // true 表示周期性 Ticker，false 表示一次性 Timer
+	metadata map[string]string // 业务元数据，创建时传入，每次回调时透传给 Handler
 }
 
 // ID 返回定时器 ID。
@@ -67,20 +67,20 @@ func (t *Timer) RangeMetadata(f func(string, string) bool) {
 	}
 }
 
-// Manager 业务层定时器管理器，封装底层最小堆分发器，提供类型化的定时器 API。
+// Manager 业务层定时器管理器，封装底层时间轮分发器，提供类型化的定时器 API。
 //
 // 设计特点：
 //   - timers map 存储所有活跃定时器的业务元数据，handlers map 按 name 存储回调函数
 //   - 所有方法均在调用方的单一 goroutine 中执行（Skeleton 事件循环），无并发竞争，无需加锁
-//   - Ticker 的自动续期逻辑封装在 commonCallback 内，对业务代码完全透明
+//   - Ticker 的自动续期逻辑封装在 commonCb 内，对业务代码完全透明
 //   - 取消操作同步清理 timers map，防止元数据内存无限累积
 type Manager struct {
 	timers     map[int64]*Timer   // timerID → 业务层定时器元数据
 	handlers   map[string]Handler // name → 触发回调函数
-	dispatcher *dispatcher        // 底层最小堆分发器
+	dispatcher *dispatcher        // 底层多级时间轮分发器
 }
 
-// NewManager 创建定时器管理器，参数 l 为底层分发器内部各无界队列的初始容量提示。
+// NewManager 创建定时器管理器，参数 l 为底层分发器的通道容量。
 func NewManager(l int) *Manager {
 	return &Manager{
 		timers:     make(map[int64]*Timer),
@@ -94,20 +94,19 @@ func (tm *Manager) Register(name string, handler Handler) {
 	tm.handlers[name] = handler
 }
 
-// Run 启动底层分发器的后台 goroutine，必须在创建定时器之前调用。
+// Run 启动底层时间轮分发器的后台 goroutine，必须在创建定时器之前调用。
 func (tm *Manager) Run() {
 	tm.dispatcher.Run()
 }
 
-// Stop 停止底层分发器，发送停止信号后分发器主循环退出，
-// 并在退出前统一关闭内部各无界队列（见 dispatcher.run）。
+// Stop 停止底层时间轮分发器，发送停止信号后分发器主循环退出。
 func (tm *Manager) Stop() {
 	tm.dispatcher.Stop()
 }
 
 // Event 返回定时器触发通知通道，供模块事件循环（Skeleton.OnRun）通过 select 监听。
 func (tm *Manager) Event() <-chan Event {
-	return tm.dispatcher.Event()
+	return tm.dispatcher.chanFired.Out()
 }
 
 // Find 通过 ID 查询定时器业务层元数据，不存在时返回 nil。
@@ -125,13 +124,13 @@ func (tm *Manager) FindByName(name string) *Timer {
 	return nil
 }
 
-// commonCallback 所有定时器的统一回调入口：查找对应的 Handler 并执行，Ticker 在执行后自动续期。
+// commonCb 所有定时器的统一回调入口：查找对应的 Handler 并执行，Ticker 在执行后自动续期。
 //
 // Ticker 续期算法：以上次触发时刻（oldDeadline）作为新周期的起始点，
 // 计算与当前周期相同的时间间隔（deadline - startAt）作为下次触发的延迟，
 // 而非以"当前时间 + 间隔"计算，这样可以消除因回调处理耗时导致的周期漂移，
 // 保证长期运行时 Ticker 的触发频率稳定。
-func (tm *Manager) commonCallback(timerID int64) {
+func (tm *Manager) commonCb(timerID int64) {
 	t := tm.timers[timerID]
 	if t == nil {
 		slog.Warn("delay timer not found", "timer_id", timerID)
@@ -147,12 +146,16 @@ func (tm *Manager) commonCallback(timerID int64) {
 	}
 	defer func() {
 		if t.isTicker {
+			// Handler 可能在回调内取消 ticker；取消后不再续期，避免被重新放回 dispatcher。
+			if tm.timers[timerID] != t {
+				return
+			}
 			// 以上次触发时刻为基准续期，消除累积漂移：interval = deadline - startAt
 			oldDeadline := t.deadline
 			interval := t.deadline.Sub(t.startAt)
 			t.startAt = oldDeadline                // 更新起始时刻为上次触发时刻，下次续期时继续使用稳定间隔
 			t.deadline = oldDeadline.Add(interval) // 下次触发 = 上次触发 + 稳定间隔
-			tm.dispatcher.New(t.name, t.id, t.deadline, tm.commonCallback)
+			tm.dispatcher.New(t.name, t.id, t.deadline, tm.commonCb)
 		} else {
 			// 一次性定时器触发后自动清理，防止元数据泄漏
 			tm.Cancel(timerID)
@@ -163,8 +166,8 @@ func (tm *Manager) commonCallback(timerID int64) {
 
 // timerOptions New 可选参数集合。
 type timerOptions struct {
-	metadata map[string]string
 	id       int64
+	metadata map[string]string
 	isTicker bool
 }
 
@@ -187,10 +190,6 @@ func WithTicker() Option {
 }
 
 // New 创建并启动一个定时器，d 为相对当前时刻的延迟时长，返回定时器 ID。
-//
-// 返回 0 表示创建失败：handler 未注册、指定 ID 已存在，或底层 dispatcher
-// 已经 Stop（此时不再存储业务层元数据，避免 timers map 里残留一条 id=0 的
-// 无效记录——0 在整个 API 中统一用作失败哨兵值，业务层不会真正拥有 id=0 的定时器）。
 func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 	o := &timerOptions{}
 	for _, opt := range opts {
@@ -208,10 +207,7 @@ func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 	}
 	startAt := time.Now()
 	deadline := startAt.Add(d)
-	id := tm.dispatcher.New(name, o.id, deadline, tm.commonCallback)
-	if id == 0 {
-		return 0
-	}
+	id := tm.dispatcher.New(name, o.id, deadline, tm.commonCb)
 	tm.timers[id] = &Timer{
 		id:       id,
 		name:     name,
@@ -224,7 +220,7 @@ func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 }
 
 // adjustAbs 按绝对时长调整剩余时间。acc=true 为加速（缩短，不允许早于当前时刻），acc=false 为延迟（延长）。
-func (tm *Manager) adjustAbs(remain, d time.Duration, acc bool) (time.Duration, error) {
+func adjustAbs(remain, d time.Duration, acc bool) (time.Duration, error) {
 	if d <= 0 {
 		return 0, fmt.Errorf("invalid duration %v", d)
 	}
@@ -236,7 +232,7 @@ func (tm *Manager) adjustAbs(remain, d time.Duration, acc bool) (time.Duration, 
 
 // adjustPct 按万分比调整剩余时间。pct 必须在 (0, PctBase] 范围内。
 // acc=true 时新剩余 = remain × (PctBase-pct)/PctBase；acc=false 时 = remain × (PctBase+pct)/PctBase。
-func (tm *Manager) adjustPct(remain time.Duration, pct int64, acc bool) (time.Duration, error) {
+func adjustPct(remain time.Duration, pct int64, acc bool) (time.Duration, error) {
 	if pct <= 0 || pct > PctBase {
 		return 0, fmt.Errorf("invalid pct value %d", pct)
 	}
@@ -247,14 +243,6 @@ func (tm *Manager) adjustPct(remain time.Duration, pct int64, acc bool) (time.Du
 }
 
 // reschedule 按 newRemain 重设定时器到期时刻，统一供四个加速/延迟方法复用。
-//
-// 同步平移 startAt：若只改 deadline 不改 startAt，会污染 commonCallback 中
-// interval = deadline - startAt 的计算，导致 Ticker 后续每次续期的周期都
-// 永久带上这次调整量（而不是仅这一次触发提前/延迟）。将 startAt 平移相同的
-// delta，可以让 interval 保持数值不变，只有这一次触发的绝对时刻发生偏移，
-// 后续周期恢复原有间隔——这才是"加速/延迟一次"应有的效果。
-// 仅对 Ticker 生效：一次性定时器的 startAt 语义是"创建时刻"，不应被此操作
-// 改写；startAt 本身也只在 Ticker 的续期计算中被读取，对一次性定时器无影响。
 func (tm *Manager) reschedule(id int64, calc func(remain time.Duration) (time.Duration, error), what string) error {
 	now := time.Now()
 	t := tm.timers[id]
@@ -266,62 +254,53 @@ func (tm *Manager) reschedule(id int64, calc func(remain time.Duration) (time.Du
 		return fmt.Errorf("%s timer failed, %w", what, err)
 	}
 	newDeadline := now.Add(newRemain)
-	if t.isTicker {
-		delta := newDeadline.Sub(t.deadline)
-		t.startAt = t.startAt.Add(delta)
-	}
 	t.deadline = newDeadline
-	tm.dispatcher.Update(id, newDeadline)
+	tm.dispatcher.Update(t.name, id, newDeadline)
 	return nil
 }
 
 // AccAbs 按绝对时长加速定时器，使其提前触发。新剩余 = max(0, 原剩余 - d)，d 必须大于 0。
 func (tm *Manager) AccAbs(id int64, d time.Duration) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return tm.adjustAbs(remain, d, true)
+		return adjustAbs(remain, d, true)
 	}, "acc")
 }
 
 // DelayAbs 按绝对时长延迟定时器，使其推迟触发。新剩余 = 原剩余 + d，d 必须大于 0。
 func (tm *Manager) DelayAbs(id int64, d time.Duration) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return tm.adjustAbs(remain, d, false)
+		return adjustAbs(remain, d, false)
 	}, "delay")
 }
 
 // AccPct 按万分比加速定时器。新剩余 = 原剩余 × (PctBase - pct) / PctBase，pct 必须在 (0, PctBase] 范围内。
 func (tm *Manager) AccPct(id int64, pct int64) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return tm.adjustPct(remain, pct, true)
+		return adjustPct(remain, pct, true)
 	}, "acc")
 }
 
 // DelayPct 按万分比延迟定时器。新剩余 = 原剩余 × (PctBase + pct) / PctBase，pct 必须在 (0, PctBase] 范围内。
 func (tm *Manager) DelayPct(id int64, pct int64) error {
 	return tm.reschedule(id, func(remain time.Duration) (time.Duration, error) {
-		return tm.adjustPct(remain, pct, false)
+		return adjustPct(remain, pct, false)
 	}, "delay")
 }
 
 // Update 直接设置定时器的绝对到期时刻，用于需要精确控制触发时刻的场景。
-// 对 Ticker 同步平移 startAt，理由与 reschedule 一致：避免污染续期周期。
 func (tm *Manager) Update(id int64, deadline time.Time) {
 	t := tm.timers[id]
 	if t == nil {
 		return
 	}
-	if t.isTicker {
-		delta := deadline.Sub(t.deadline)
-		t.startAt = t.startAt.Add(delta)
-	}
 	t.deadline = deadline
-	tm.dispatcher.Update(id, deadline)
+	tm.dispatcher.Update(t.name, id, deadline)
 }
 
 // Cancel 取消定时器并同步清理业务层元数据。
 //
 // ID 为 0 的取消操作视为异常并记录错误日志后返回，
-// 因为 ID=0 是整个 API 统一使用的失败哨兵值，业务层不应持有该 ID 的定时器。
+// 因为 ID=0 是 dispatcher 的内置停止信号，业务层不应使用该 ID。
 // 先调用 dispatcher.Cancel（双重取消：立即标记 + 异步删除），
 // 再清理 timers map，保证内存不因无效的定时器元数据而持续增长。
 func (tm *Manager) Cancel(id int64) {
@@ -333,6 +312,6 @@ func (tm *Manager) Cancel(id int64) {
 	if t == nil {
 		return
 	}
-	tm.dispatcher.Cancel(id)
+	tm.dispatcher.Cancel(t.name, id)
 	delete(tm.timers, id) // 同步清理业务层元数据，防止 map 内存泄漏
 }
