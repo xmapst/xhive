@@ -150,12 +150,24 @@ func (u *Unbounded[T]) run(ctx context.Context, initialCap int) {
 // ring 是 Unbounded 内部使用的可伸缩环形缓冲区：写满时扩容，占用率
 // 过低时收缩，因此一次突发流量不会永久拉高内存占用。ring 本身不是
 // 并发安全的，Unbounded 只在其转发 goroutine 中访问它。
+//
+// shrinkStreak 为收缩迟滞计数器：当队列长度在收缩阈值附近反复抖动时
+// （例如稳定在容量 25% 上下浮动），若每次 pop 满足条件就立即收缩，会
+// 导致连续的 grow/resize 相互抵消、造成不必要的内存分配抖动。引入
+// "连续 shrinkStreakThreshold 次都满足收缩条件才真正收缩"的迟滞策略后，
+// 只有当低占用率状态持续一段时间才会触发一次收缩，短暂抖动会被过滤掉。
 type ring[T any] struct {
-	buf    []T
-	head   int
-	count  int
-	minCap int // 容量收缩的下限
+	buf          []T
+	head         int
+	count        int
+	minCap       int // 容量收缩的下限
+	shrinkStreak int // 连续满足收缩条件的次数，用于收缩迟滞判断
 }
+
+// shrinkStreakThreshold 收缩迟滞阈值：只有连续这么多次 pop 后仍满足
+// "占用率 <= 25%" 的收缩条件，才会真正执行一次容量减半，用来吸收
+// 队列长度在阈值附近短暂抖动带来的反复扩缩容。
+const shrinkStreakThreshold = 8
 
 // growThreshold 是切换扩容策略的容量阈值：低于该值时翻倍扩容，
 // 达到或超过该值后改为按 1.25 倍扩容，以减少大缓冲区场景下的
@@ -179,9 +191,13 @@ func (r *ring[T]) len() int { return r.count }
 func (r *ring[T]) front() T { return r.buf[r.head] }
 
 // push 追加一个值；若缓冲区已满，先扩容再写入。
+//
+// 扩容会重置 shrinkStreak：容量刚增长后立即进入收缩判断没有意义，
+// 避免 grow 之后紧跟着又被上一次遗留的收缩计数误触发。
 func (r *ring[T]) push(v T) {
 	if r.count == len(r.buf) {
 		r.grow()
+		r.shrinkStreak = 0
 	}
 	idx := (r.head + r.count) % len(r.buf)
 	r.buf[idx] = v
@@ -203,8 +219,10 @@ func (r *ring[T]) grow() {
 }
 
 // pop 移除并返回最早存入的值。若移除后占用率降至容量的四分之一
-// 或更低，则将容量减半，但不会低于 minCap。调用方需自行保证
-// len() > 0。
+// 或更低，则记录一次"满足收缩条件"；只有连续 shrinkStreakThreshold 次
+// pop 都满足该条件时，才真正将容量减半（不会低于 minCap），否则仅仅
+// 累计计数而不立即收缩，用于过滤占用率在阈值附近抖动造成的反复扩缩容。
+// 调用方需自行保证 len() > 0。
 func (r *ring[T]) pop() T {
 	var zero T
 	v := r.buf[r.head]
@@ -212,8 +230,15 @@ func (r *ring[T]) pop() T {
 	r.head = (r.head + 1) % len(r.buf)
 	r.count--
 
-	if half := len(r.buf) / 2; half >= r.minCap && r.count*4 <= len(r.buf) {
-		r.resize(half)
+	half := len(r.buf) / 2
+	if half >= r.minCap && r.count*4 <= len(r.buf) {
+		r.shrinkStreak++
+		if r.shrinkStreak >= shrinkStreakThreshold {
+			r.resize(half)
+			r.shrinkStreak = 0
+		}
+	} else {
+		r.shrinkStreak = 0
 	}
 	return v
 }

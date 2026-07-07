@@ -64,7 +64,11 @@ func DynamicModules() []string {
 //
 // 动态模块支持热加载，模块在 OnInit 成功后立即启动，无需重启整个应用。
 // 动态模块的 panic 不会导致进程退出，且可通过 RemoveDynamicModule 单独卸载。
-func AddDynamicModules(mods ...IModule) error {
+//
+// 返回值 results 记录每个模块的处理结果（成功或失败原因），调用方可据此
+// 精确判断哪些模块成功、哪些失败，而不必因为 err 非 nil 就误以为全部失败；
+// err 非 nil 时仅表示至少有一个模块初始化失败，具体失败列表见 results。
+func AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err error) {
 	return defaultApp.AddDynamicModules(mods...)
 }
 

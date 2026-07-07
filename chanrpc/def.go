@@ -233,17 +233,18 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	if ri == nil {
 		ri = new(RetInfo)
 	}
-	if ci.metadata == nil {
-		ci.metadata = make(map[string]any)
-	}
-	if ri.Metadata == nil {
-		ri.Metadata = make(map[string]any)
-	}
 
 	// 将回调函数附加到响应对象，由 Client.AsyncCallback 在调用方 goroutine 中执行
 	ri.callback = ci.callback
-	// 拷贝元数据
-	maps.Copy(ri.Metadata, ci.metadata)
+	// 仅在确实存在元数据时才创建/拷贝目标 map：Cast/AsyncCall/Call 的高频路径中
+	// 大多数调用并未使用 WithMeta，此前无条件 make+Copy 会为每次调用产生两次
+	// 不必要的空 map 分配，这里按需创建可以避免该开销。
+	if len(ci.metadata) > 0 {
+		if ri.Metadata == nil {
+			ri.Metadata = make(map[string]any, len(ci.metadata))
+		}
+		maps.Copy(ri.Metadata, ci.metadata)
+	}
 
 	if !ci.chanRet.send(ri) {
 		return fmt.Errorf("%w: id=%d", ErrRetDropped, ci.ID())
