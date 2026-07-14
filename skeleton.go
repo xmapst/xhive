@@ -215,7 +215,7 @@ func (s *Skeleton) scheduleDumpTimer() {
 	now := time.Now()
 	next := s.startOfDay(now)
 	for !next.After(now) {
-		next = next.Add(time.Hour)
+		next = next.Add(15 * time.Minute)
 	}
 	// 增加一个随机30s到60s之间的随机变量来错峰
 	jitter := time.Duration(rand.Int64N(int64(30*time.Second))) + 30*time.Second
