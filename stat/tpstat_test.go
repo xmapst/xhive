@@ -101,14 +101,12 @@ func TestTPStatsConcurrentAddAndDump(t *testing.T) {
 	var wg sync.WaitGroup
 	for g := range 8 {
 		name := g + 1
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range 200 {
 				s.Add(name, int64(i+1))
 				_ = s.Dump(5)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

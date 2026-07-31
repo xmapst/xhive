@@ -98,16 +98,14 @@ func (sm *SignalManager) Start(stopFn func()) {
 			sm.RUnlock()
 			var wg sync.WaitGroup
 			for _, trap := range traps {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					defer func() {
 						if r := recover(); r != nil {
 							slog.Error("signal handler panicked", "signal", sig, "panic", r, "stack", string(debug.Stack()))
 						}
 					}()
 					trap()
-				}()
+				})
 			}
 			wg.Wait()
 		}

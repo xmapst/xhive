@@ -245,9 +245,7 @@ func (c *Client) Close() {
 
 	if pending > 0 {
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			timer := time.NewTimer(5 * time.Second)
 			defer timer.Stop()
 
@@ -267,7 +265,7 @@ func (c *Client) Close() {
 					return
 				}
 			}
-		}()
+		})
 
 		wg.Wait()
 		slog.Info("chanrpc client closed successfully")
