@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/xmapst/xhive/chanx"
+	"github.com/xmapst/xhive/xtime"
 )
 
 // 时间轮配置常量。
@@ -27,7 +28,10 @@ const (
 	timerTick = 64 * time.Millisecond
 
 	// timerLevel 时间轮分级数，当前共有 20 层，槽位索引范围为 0 到 19。
-	// place 最高只会放入第 19 层，因此单个定时器最大可调度时长约为 2^19*64ms ≈ 9.3 小时。
+	//
+	// 第 19 层每 2^19 个 tick（约 9.32 小时）扫描一次。**这不是可调度时长的上限**：
+	// 更长的定时器同样落在第 19 层，只是要多等几轮扫描，等剩余时间掉到 2^19 个 tick
+	// 以下后逐层级联下来，最终仍然精确触发。
 	timerLevel = 20
 )
 
@@ -135,7 +139,7 @@ func (disp *dispatcher) run() {
 		}
 	}()
 
-	lastTick := time.Now().UnixNano() / int64(timerTick)
+	lastTick := xtime.Now().UnixNano() / int64(timerTick)
 	tickTimer := time.NewTimer(timerTick)
 	for {
 		select {
@@ -145,7 +149,7 @@ func (disp *dispatcher) run() {
 			}
 		case <-tickTimer.C:
 			tickTimer.Reset(timerTick)
-			lastTick = disp.doTick(time.Now(), lastTick)
+			lastTick = disp.doTick(xtime.Now(), lastTick)
 		}
 	}
 }
@@ -219,12 +223,15 @@ func (disp *dispatcher) delete(timerID int64) *dispatcherTimer {
 // 它先计算剩余时间 diff，再找到满足 diff <= 2^i*timerTick 的最小层级 i。
 // 已到期的定时器会直接投递到触发队列；剩余时间小于 timerTick 的定时器按 timerTick 处理，
 // 避免因精度舍入导致在最低层级反复检查但无法触发。
+//
+// 选层规则见函数体内的说明——它与 trigger 的降层条件是同一个不变式的两半，
+// 改任何一边都必须同时改另一边。
 func (disp *dispatcher) place(t *dispatcherTimer) {
 	if _, canceled := disp.canceledTimers.Load(t.id); canceled {
 		return
 	}
 
-	diff := t.deadline.Sub(time.Now())
+	diff := t.deadline.Sub(xtime.Now())
 	if diff <= 0 {
 		// 已到期，直接投递到触发队列。
 		disp.chanFired.In() <- t
@@ -233,9 +240,26 @@ func (disp *dispatcher) place(t *dispatcherTimer) {
 	if diff < timerTick {
 		diff = timerTick // 保底最小粒度，防止极短超时导致在最低层级反复检查但不触发
 	}
-	// 从低层级向高层级查找第一个能容纳 diff 的槽位
-	for i := range timerLevel {
-		if diff <= (timerTick << uint(i)) {
+	// 从高层级向低层级找**最大**的 i 使 diff >= 2^i 个 tick。
+	//
+	// 必须是「>= 且取最大」，不能写成「<= 且取最小」。第 i 层每 2^i 个 tick 才被
+	// doTick 扫一次，因此只有剩余时间 >= 2^i 个 tick 的定时器才保证在到期之前
+	// 至少被扫到一次；否则它会在自己那层安静地过期，一直等到下一次该层扫描
+	// 才被发现。trigger 的降层条件（remaining < 2^level 个 tick 就降一层）
+	// 维持的正是「第 i 层持有 remaining ∈ [2^i, 2^(i+1))」这个不变式，
+	// place 必须与之一致。
+	//
+	// 写反的后果不是偶尔抖动，而是长定时器稳定迟到最多一倍：
+	// 例如 15 分钟（14062.5 个 tick）会被放进第 14 层，而第 14 层每 16384 个 tick
+	// （约 17 分 28 秒）才扫一次，于是周期永久变成 17 分 28 秒；
+	// 若回调里立刻续期（自调度 ticker），新定时器又从该边界起算，再也回不去。
+	//
+	// 降序还顺带消除了一个静默丢弃：升序写法在 diff 超过 2^19 个 tick（约 9.32 小时）
+	// 时一个分支都不命中，定时器既不入层也不投触发队列，永远不会响；
+	// 而降序在 diff 再大时也会命中高层，多等几轮后级联触发。
+	// 上面的 diff < timerTick 保底保证了 i=0 一定命中，循环不会落空。
+	for i := timerLevel - 1; i >= 0; i-- {
+		if diff >= (timerTick << uint(i)) {
 			disp.timerSlots[i][t.id] = t
 			break
 		}
@@ -244,14 +268,24 @@ func (disp *dispatcher) place(t *dispatcherTimer) {
 
 // doTick 根据当前时间与 lastTick 的差值推进时间轮。
 //
-// 当 nowTick <= lastTick 时，doTick 会保持 lastTick 不回退，避免服务器时间被手动前移后，
-// 后续恢复到原时间时重复扫描已经推进过的 tick 区间，导致定时器重复触发。
-// 当时钟跳到未来时，doTick 会从 lastTick 逐步推进到 nowTick，并在每一步执行层级扫描；
-// 推进到当前 nowTick 后停止，确保中间层级的定时器降级操作不被跳过。
+// 时钟跳到未来时，doTick 从 lastTick 逐格推进到 nowTick，并在每一格执行层级扫描；
+// 逐格而不是一步跨过去，是为了不跳过中间层级的降级操作。代价与跳变量成正比
+// （实测约 20ns × Δt/timerTick：前跳一天约 27ms，前跳 30 天约 820ms），
+// 这段时间 dispatcher 不消费 chanOp，新建/取消定时器只会排队不会丢。
+//
+// 时钟回退时**基准跟着回退**（返回 nowTick 而不是 lastTick）。
+//
+// 这里曾经保持 lastTick 不动，理由是「避免重复扫描已推进过的 tick 区间导致定时器重复触发」。
+// 那个担心不成立：trigger 在把定时器投进 chanFired 的同时就 delete 出槽位，
+// 已触发的定时器不在槽里，重扫扫不到它；ticker 则是回调里重新 place 一个新 deadline。
+// 也就是说重扫是幂等的，只多花 CPU。
+//
+// 而保持不动的代价是致命的：基准一旦停在未来，后续每次 doTick 都因 nowTick <= lastTick
+// 直接返回，一层都不扫——**全进程定时器停摆**，直到时钟重新走满这段差值。
 func (disp *dispatcher) doTick(now time.Time, lastTick int64) int64 {
 	nowTick := now.UnixNano() / int64(timerTick)
 	if nowTick <= lastTick {
-		return lastTick
+		return nowTick
 	}
 
 	for {

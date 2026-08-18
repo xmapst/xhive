@@ -9,6 +9,7 @@ import (
 	"github.com/xmapst/xhive/chanrpc"
 	"github.com/xmapst/xhive/stat"
 	"github.com/xmapst/xhive/timer"
+	"github.com/xmapst/xhive/xtime"
 )
 
 // IRPC 定义跨模块 RPC 调用的接口，提供三种调用语义覆盖不同并发场景。
@@ -78,6 +79,13 @@ type skeletonOptions struct {
 	serverChanLen int
 	clientChanLen int
 	statCap       int
+	// closeDrainTimeout/clientCloseTimeout 零值表示未显式设置：分别透传给
+	// chanrpc.WithCloseDrainTimeout/WithClientCloseTimeout 时对零值不生效
+	// （两者内部都是 d > 0 才覆盖），沿用 chanrpc 包自己的默认值（分别是
+	// chanrpc.defaultCloseDrainTimeout、defaultClientCloseTimeout），不需要
+	// 在这里重复一份默认值。
+	closeDrainTimeout  time.Duration
+	clientCloseTimeout time.Duration
 }
 
 func defaultSkeletonOptions() skeletonOptions {
@@ -125,6 +133,31 @@ func WithStatCap(n int) SkeletonOption {
 	}
 }
 
+// WithCloseDrainTimeout 自定义模块停机时 ChanRPC Server 排空自投递链条
+// （分帧处理 handler 在 Close 期间自己 Cast 回本模块继续处理剩余批次）
+// 的超时上限，见 chanrpc.Server.Close 的说明。超时后放弃剩余部分、直接
+// 完成关闭，避免某个 handler 的自投递没有收敛条件导致停机永远卡住。
+// d <= 0 时该选项不生效，沿用 chanrpc 包自己的默认值（30 秒）。
+func WithCloseDrainTimeout(d time.Duration) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if d > 0 {
+			opts.closeDrainTimeout = d
+		}
+	}
+}
+
+// WithClientCloseTimeout 自定义模块停机时 ChanRPC Client 等待待处理异步
+// 回调排空的超时上限，见 chanrpc.Client.Close 的说明。超时后强制清零、
+// 放弃剩余回调，避免某个回调永久阻塞导致停机永远卡住。d <= 0 时该选项
+// 不生效，沿用 chanrpc 包自己的默认值（5 秒）。
+func WithClientCloseTimeout(d time.Duration) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if d > 0 {
+			opts.clientCloseTimeout = d
+		}
+	}
+}
+
 // NewSkeleton 创建模块骨架，初始化 ChanRPC 和定时器组件。
 //
 // 默认配置为：定时器事件通道 1024、ChanRPC 服务端队列初始容量 4096、
@@ -142,8 +175,14 @@ func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 	s := &Skeleton{
 		name:   name,
 		timer:  timer.NewManager(cfg.timerChanLen),
-		server: chanrpc.NewServer(cfg.serverChanLen),
-		client: chanrpc.NewClient(cfg.clientChanLen),
+		server: chanrpc.NewServer(
+			chanrpc.WithInitialCapacity(cfg.serverChanLen),
+			chanrpc.WithCloseDrainTimeout(cfg.closeDrainTimeout),
+		),
+		client: chanrpc.NewClient(
+			chanrpc.WithClientInitialCapacity(cfg.clientChanLen),
+			chanrpc.WithClientCloseTimeout(cfg.clientCloseTimeout),
+		),
 		stat:   stat.NewTPStats(cfg.statCap),
 	}
 	return s
@@ -174,26 +213,39 @@ func (s *Skeleton) Serve(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.close()
+			// 只停定时器、关服务端（server.Close 会把队列里的积压请求真正
+			// 执行完，见其注释）——**不关 client**：OnDestroy 通常要用 client
+			// 把停机前的最后一批状态投给别的模块（例如转交给专门负责收尾
+			// 处理的模块），提前关掉 client 会让这些投递全部失败。
+			// client 的释放交给框架在 OnDestroy 返回后调用 Close 完成。
+			s.timer.Stop()
+			s.server.Close()
 			slog.Info("skeleton stopped", "name", s.name)
 			return
 		case t := <-s.timer.Event():
-			startUs := time.Now().UnixMicro()
+			startUs := xtime.Now().UnixMicro()
 			t.Callback()
-			s.recordStat(t.Name(), time.Now().UnixMicro()-startUs)
+			s.recordStat(t.Name(), xtime.Now().UnixMicro()-startUs)
 		case ri := <-s.client.Event():
-			startUs := time.Now().UnixMicro()
+			startUs := xtime.Now().UnixMicro()
 			s.client.AsyncCallback(ri)
-			s.recordStat(ri.ID(), time.Now().UnixMicro()-startUs)
+			s.recordStat(ri.ID(), xtime.Now().UnixMicro()-startUs)
 		case ci := <-s.server.Event():
-			startUs := time.Now().UnixMicro()
+			startUs := xtime.Now().UnixMicro()
 			s.server.Exec(ci)
-			s.recordStat(ci.ID(), time.Now().UnixMicro()-startUs)
+			s.recordStat(ci.ID(), xtime.Now().UnixMicro()-startUs)
 		}
 	}
 }
 
-// close 在模块退出前有序清理资源：dump 最后一次统计 → 停止定时器 → 关闭 RPC 服务端 → 关闭 RPC 客户端。
+// Close 释放模块的 client 资源，**由框架在 OnDestroy 返回之后调用**。
+//
+// 与 Serve 退出分成两步是刻意的：Serve 的 ctx.Done 分支只关 server（inbound
+// 队列需要在那一刻就排空执行完），client 留到 OnDestroy 之后再关——
+// OnDestroy 通常还要用 client 把停机前的最后一批状态投给别的模块（例如
+// 转交给专门负责收尾处理的模块），提前关掉 client 会让这些投递
+// 全部失败。这个顺序对应的正是"模块 goroutine 已停 → OnDestroy 可以安全
+// 访问业务状态且仍能对外投递 → 最后才收掉 client"这条时序。
 //
 // dumpStat(false) 中 reset 传 false：整个 s.stat 实例即将随 Skeleton 一起被丢弃，
 // 没有必要再执行一次 Reset 清空样本（与 commonCb 中周期性 dump 后需要 reset=true
@@ -201,18 +253,17 @@ func (s *Skeleton) Serve(ctx context.Context) {
 //
 // s.client.Close 内部已经处理了"有 pending 异步调用需要排空"和"无 pending 直接关闭"
 // 两种情况（含超时兜底），这里调用一次即可，不需要在外层轮询 Idle。
-func (s *Skeleton) close() {
-	s.dumpStat(false)
-	s.timer.Stop()
-	s.server.Close()
+func (s *Skeleton) Close() error {
 	s.client.Close()
+	s.dumpStat(false)
+	return nil
 }
 
 // scheduleDumpTimer 计算下一个整点触发时刻并创建一次性定时器，
 // 附加 30s~60s 的随机抖动以错峰，避免大量模块在同一时刻集中 dump 造成日志/CPU 尖峰。
 func (s *Skeleton) scheduleDumpTimer() {
 	// 每整点执行：以当天 0 点为基准，累加整点直到超过当前时刻
-	now := time.Now()
+	now := xtime.Now()
 	next := s.startOfDay(now)
 	for !next.After(now) {
 		next = next.Add(15 * time.Minute)

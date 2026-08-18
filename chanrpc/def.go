@@ -96,6 +96,12 @@ var (
 	ErrCallTimeout = errors.New("chanrpc: call timeout waiting for response")
 	// ErrRetDropped 表示响应未能投递给调用方。
 	ErrRetDropped = errors.New("chanrpc: ret dropped, caller already gone")
+	// ErrAlreadyRet 表示该次调用此前已经回过包，本次回包被丢弃。
+	//
+	// 之所以要把它暴露成错误而不是静默返回 nil：延迟响应场景下回包发生在
+	// handler 之外的 goroutine，静默丢弃会让业务连"我的响应没送出去"都无从得知，
+	// 问题最终以"对端一直收不到结果"的形式在别处暴露，极难定位。
+	ErrAlreadyRet = errors.New("chanrpc: already returned")
 	// ErrRegisterMsgNil 表示注册 RPC 处理器时消息样例为空。
 	ErrRegisterMsgNil = errors.New("chanrpc: register message cannot be nil")
 	// ErrRegisterHandlerNil 表示注册 RPC 处理器时处理函数为空。
@@ -145,7 +151,7 @@ type Handler func(ci *CallInfo) (ri *RetInfo)
 type Callback func(ri *RetInfo)
 
 // retSink 是 CallInfo 投递响应结果的目的地，屏蔽同步调用与异步调用在
-// 底层通道上的差异，使 CallInfo.ret 无需关心自己面对的是哪一种。
+// 底层通道上的差异，使 CallInfo.Ret 无需关心自己面对的是哪一种。
 //
 // send 返回 false 表示响应未能投递（例如同步 Call 的一次性响应槽已满，
 // 或调用方不再有能力消费该响应），调用方应将其视为“已丢弃”而非“需要重试”。
@@ -175,7 +181,7 @@ func (r syncRet) send(ri *RetInfo) bool {
 //
 // send 直接写入 chanx.Unbounded.In()：该操作按设计永不阻塞，唯一的失败
 // 模式是目标队列已被 Client.Close 关闭，此时会 panic，交由调用方
-// （CallInfo.ret）的 recover 统一处理，因此这里总是返回 true。
+// （CallInfo.Ret）的 recover 统一处理，因此这里总是返回 true。
 type asyncRet struct {
 	u *chanx.Unbounded[*RetInfo]
 }
@@ -200,9 +206,66 @@ type CallInfo struct {
 	metadata map[string]any // 元数据
 	id       uint32         // 消息类型全限定ID，用于路由到对应的 Handler
 	hasRet   atomic.Bool    // 防重复响应标志，通过 CAS 操作保证并发安全
+	held     atomic.Bool    // 延迟响应标志，见 Hold
+}
+
+// Hold 声明本次调用采用**延迟响应**：handler 返回后框架不再自动回包，
+// 由业务在稍后（通常是另一个 goroutine 完成阻塞 IO 之后）通过返回的 Replier 回包。
+//
+// 必须在 handler 返回**之前**调用。典型写法：
+//
+//	func onQuery(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
+//	    reply := ci.Hold()
+//	    go func() {
+//	        row, err := db.Query(...)                           // 阻塞 IO，不占事件循环
+//	        _ = reply.Ret(&chanrpc.RetInfo{Ack: row, Err: err}) // 稍后回包
+//	    }()
+//	    return nil
+//	}
+//
+// 为什么需要显式声明：handler 返回 nil 天然有两种语义——「本次无需响应」与
+// 「稍后再回」。框架无法从返回值区分，默认必须按前者兜底补一个空包，
+// 否则同步 Call 的调用方会挂死。Hold 就是把后一种意图讲清楚。
+//
+// 为什么回包能力由 Hold 返出、而不是 CallInfo 上的一个公开方法：拿到 Replier
+// 的唯一途径就是先 Hold，「忘了 Hold 就直接回包」这条错误路径在类型上即不存在。
+//
+// 两个约束：
+//   - Hold 之后**必须**保证 Replier.Ret 最终被调用，否则同步 Call 的调用方会一直
+//     等下去（只会每 5s 打一条告警）。需要超时兜底请让调用方改用 CallWithContext。
+//   - handler 内 panic 时框架仍会回包，即便已经 Hold —— 否则调用方必然挂死。
+//
+// 对 Cast（无回包通道）调用 Hold 是无害的空操作，其 Replier.Ret 同样是空操作。
+func (ci *CallInfo) Hold() *Replier {
+	ci.held.Store(true)
+	return &Replier{ci: ci}
+}
+
+// Replier 是延迟响应的回包句柄，由 Hold 返回，可在任意 goroutine 中使用。
+//
+// 值类型，仅一个指针宽；同一次调用最多只有一次 Ret 能真正把响应送出去。
+type Replier struct {
+	ci *CallInfo
+}
+
+// Ret 向调用方发送响应结果，同一次调用重复回包返回 ErrAlreadyRet。
+//
+// 零值 Replier（并非经 Hold 得来）不持有任何调用上下文，返回 ErrCallInfoNil。
+func (r Replier) Ret(ri *RetInfo) error {
+	if r.ci == nil {
+		return ErrCallInfoNil
+	}
+	return r.ci.ret(ri)
+}
+
+// IsHeld 报告本次调用是否已声明延迟响应。
+func (ci *CallInfo) IsHeld() bool {
+	return ci.held.Load()
 }
 
 // ret 向调用方发送响应结果，通过 hasRet CAS 防止同一次调用被重复响应。
+//
+// 不导出：对外的回包入口只有两个——handler 的返回值，以及 Hold 返回的 Replier。
 //
 // 投递本身不会阻塞（retSink 的两种实现都不阻塞）：
 //   - syncRet 满/无人接收时返回 false，转化为 ErrRetDropped；
@@ -215,10 +278,12 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 		return nil
 	}
 
-	// CompareAndSwap(false → true) 保证只有第一次 ret 调用成功，后续调用均被忽略
+	// CompareAndSwap(false → true) 保证只有第一次 ret 调用成功，后续调用均被忽略。
+	// 返回 ErrAlreadyRet 而非静默 nil：延迟响应下回包在别的 goroutine 里发生，
+	// 调用方需要有办法知道自己这次回包没送出去。
 	if !ci.hasRet.CompareAndSwap(false, true) {
 		slog.Warn("chanrpc can not ret twice", "id", ci.ID(), "stack", string(debug.Stack()))
-		return
+		return ErrAlreadyRet
 	}
 
 	// 捕获向已关闭队列发送时触发的 panic

@@ -32,7 +32,7 @@ type testModule struct {
 func newTestModule(name string) *testModule {
 	return &testModule{
 		name:       name,
-		server:     chanrpc.NewServer(4),
+		server:     chanrpc.NewServer(chanrpc.WithInitialCapacity(4)),
 		runStarted: make(chan struct{}),
 		runStopped: make(chan struct{}),
 	}
@@ -63,6 +63,11 @@ func (m *testModule) OnDestroy() {
 }
 
 func (m *testModule) ChanRPC() *chanrpc.Server { return m.server }
+
+// Close 是 IModule 的第二段关闭钩子，由框架在 OnDestroy 之后调用。
+// testModule 没有独立的 client 资源（真实模块的 client 由内嵌的
+// *Skeleton 持有），这里无事可做。
+func (m *testModule) Close() error { return nil }
 
 func waitClosed(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
 	t.Helper()

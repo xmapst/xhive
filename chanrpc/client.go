@@ -14,6 +14,11 @@ import (
 	"github.com/xmapst/xhive/chanx"
 )
 
+// defaultClientCloseTimeout 是 Close 等待待处理异步回调排空的默认硬
+// 上限，见 Client.Close 的说明。可通过 WithClientCloseTimeout 按 Client
+// 覆盖。
+const defaultClientCloseTimeout = 5 * time.Second
+
 // Client ChanRPC 客户端，向其他模块的 Server 发起 RPC 调用。
 //
 // 通过 pendingAsyncCall 原子计数器追踪所有未处理完毕的异步调用，
@@ -23,16 +28,61 @@ type Client struct {
 	chanAsyncRet     *chanx.Unbounded[*RetInfo] // 异步调用结果队列，发送方永不阻塞、永不失败
 	pendingAsyncCall atomic.Int64               // 当前尚未处理完毕的异步调用数量，原子操作保证并发安全
 	closed           atomic.Bool                // 关闭标志，防止关闭后继续发起新的调用
+	closeTimeout     time.Duration              // Close 排空 pending 异步回调的超时上限，见 WithClientCloseTimeout
 }
 
-// NewClient 创建 ChanRPC 客户端。
-//
-// initCap 是内部环形缓冲区的初始容量提示，语义与 Server.chanCall 一致：
-// 用于减少反复扩容，不是硬性上限。
-func NewClient(initCap int) *Client {
+// clientOptions 保存 NewClient 的可选配置项。
+type clientOptions struct {
+	initCap      int // 0 表示未显式设置，透传给 chanx.WithInitialCapacity 时对 0 不生效，沿用 chanx 自己的默认值
+	closeTimeout time.Duration
+}
+
+func defaultClientOptions() clientOptions {
+	return clientOptions{closeTimeout: defaultClientCloseTimeout}
+}
+
+// ClientOption 用于自定义 Client 的可选行为。
+type ClientOption func(*clientOptions)
+
+// WithClientInitialCapacity 自定义内部环形缓冲区的初始容量提示，语义与
+// Server 的 WithInitialCapacity 一致：用于减少高频场景下的反复扩容，
+// 不是硬性上限。命名带 Client 前缀是为了跟 ServerOption 的同名选项在
+// 包级别不冲突——两者分别只用于 NewClient/NewServer，各自的调用点上
+// 语义都是清楚的。n <= 0 时该选项不生效，沿用 chanx 包自己的默认值（16）。
+func WithClientInitialCapacity(n int) ClientOption {
+	return func(opts *clientOptions) {
+		if n > 0 {
+			opts.initCap = n
+		}
+	}
+}
+
+// WithClientCloseTimeout 自定义 Close 等待待处理异步回调排空的超时
+// 上限，见 Client.Close 的说明。d <= 0 时该选项不生效，沿用
+// defaultClientCloseTimeout（5 秒）。命名带 Client 前缀的原因与
+// WithClientInitialCapacity 相同：跟 Server 侧的 WithCloseDrainTimeout
+// 是两个不同的 Option 类型，包级别不能同名。
+func WithClientCloseTimeout(d time.Duration) ClientOption {
+	return func(opts *clientOptions) {
+		if d > 0 {
+			opts.closeTimeout = d
+		}
+	}
+}
+
+// NewClient 创建 ChanRPC 客户端，所有配置均可选，见各 WithClientXxx 选项。
+func NewClient(opts ...ClientOption) *Client {
+	cfg := defaultClientOptions()
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
 	c := &Client{
 		chanAsyncRet: chanx.NewUnbounded[*RetInfo](context.Background(),
-			chanx.WithInitialCapacity(initCap)),
+			chanx.WithInitialCapacity(cfg.initCap)),
+		closeTimeout: cfg.closeTimeout,
 	}
 	return c
 }
@@ -111,7 +161,7 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 	o := c.applyOpts(opts...)
 
 	chanRet := newSyncRet()
-	err = c.call(s.chanCall, &CallInfo{
+	err = c.call(s, &CallInfo{
 		id:       id,
 		Request:  request,
 		chanRet:  chanRet,
@@ -154,7 +204,7 @@ func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...Ca
 	}
 	o := c.applyOpts(opts...)
 
-	err = c.call(s.chanCall, &CallInfo{
+	err = c.call(s, &CallInfo{
 		id:       id,
 		Request:  request,
 		chanRet:  asyncRet{c.chanAsyncRet}, // 共享异步回调队列，回调由事件循环统一消费
@@ -186,7 +236,7 @@ func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
 	}
 	o := c.applyOpts(opts...)
 
-	err = c.call(s.chanCall, &CallInfo{
+	err = c.call(s, &CallInfo{
 		id:       id,
 		Request:  request,
 		metadata: o.metadata,
@@ -226,8 +276,9 @@ func (c *Client) AsyncCallback(ri *RetInfo) {
 // 内部通过 sync.WaitGroup.Go 启动一个辅助 goroutine 消费 chanAsyncRet，
 // 原因是调用方此时已不再运行事件循环，需要专门的 goroutine 来消费剩余的异步结果。
 //
-// 超时保护（5 秒）：防止因某个回调永久阻塞或计数异常导致 Close 无法返回；
-// 超时后强制清零 pendingAsyncCall 并返回，可能丢失部分未执行的回调，会记录警告日志。
+// 超时保护（closeTimeout，默认 5 秒，见 WithClientCloseTimeout）：防止
+// 因某个回调永久阻塞或计数异常导致 Close 无法返回；超时后强制清零
+// pendingAsyncCall 并返回，可能丢失部分未执行的回调，会记录警告日志。
 //
 // 最后无条件关闭 chanAsyncRet：这一步是必须的——chanAsyncRet 内部有一个
 // 常驻转发 goroutine，只有显式 Close 才会让它退出，否则即使 Client 本身
@@ -246,7 +297,7 @@ func (c *Client) Close() {
 	if pending > 0 {
 		var wg sync.WaitGroup
 		wg.Go(func() {
-			timer := time.NewTimer(5 * time.Second)
+			timer := time.NewTimer(c.closeTimeout)
 			defer timer.Stop()
 
 			for {
@@ -288,16 +339,27 @@ func (c *Client) PendingCount() int64 {
 
 // call 将 CallInfo 投递到 Server 的调用队列。
 //
-// chanCall 是无界队列，In() 按设计永不阻塞、永不因队列满而失败；
-// 因此不再区分“阻塞模式”和“非阻塞模式”两条路径。
+// 入队成功后立即给 s.pending 加一：这是 Server.Close 判断排空是否真正
+// 见底的唯一依据，见 Server.Close 的说明。之所以传 *Server 而不是像早前
+// 那样直接传 chanCall，就是为了能在这里摸到 pending 这个计数——两者本
+// 该是同一件事的一体两面（“投给这个 Server 的队列”和“这个 Server 记一笔
+// 待办”），拆成两个参数反而会把这份配对关系暴露给调用方，让人误以为
+// 可以只做其中一半。
 //
-// panic 恢复：唯一的失败模式是向已关闭的队列投递（Server.Close 之后），
-// 通过 recover 捕获并转化为 error 返回；若 chanRet 非空，还会尝试向调用方
-// 回包错误，确保 Call 调用方不会永久阻塞在等待响应上。回包本身也用内层
-// recover 包裹，防止 retSink.send 自身 panic（例如 asyncRet 对应的
-// chanAsyncRet 也恰好已被关闭）导致这里发生二次 panic 而无法恢复。
-func (c *Client) call(chanCall *chanx.Unbounded[*CallInfo], ci *CallInfo) (err error) {
-	if chanCall == nil {
+// chanCall 是无界队列，In() 按设计永不阻塞、永不因队列满而失败；
+// 因此不再区分"阻塞模式"和"非阻塞模式"两条路径。
+//
+// panic 恢复：唯一的失败模式是向已关闭的队列投递（Server.Close 排空
+// 完成之后），通过 recover 捕获并转化为 error 返回；若 chanRet 非空，
+// 还会尝试向调用方回包错误，确保 Call 调用方不会永久阻塞在等待响应上。
+// 回包本身也用内层 recover 包裹，防止 retSink.send 自身 panic（例如
+// asyncRet 对应的 chanAsyncRet 也恰好已被关闭）导致这里发生二次 panic
+// 而无法恢复。
+func (c *Client) call(s *Server, ci *CallInfo) (err error) {
+	if s == nil {
+		return ErrServerNil
+	}
+	if s.chanCall == nil {
 		return ErrCallChannelNil
 	}
 	if ci == nil {
@@ -322,6 +384,7 @@ func (c *Client) call(chanCall *chanx.Unbounded[*CallInfo], ci *CallInfo) (err e
 		}
 	}()
 
-	chanCall.In() <- ci
+	s.chanCall.In() <- ci
+	s.pending.Add(1)
 	return nil
 }

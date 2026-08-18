@@ -222,6 +222,14 @@ type IModule interface {
 | `AsyncCall` | 否，结果走回调 | 推荐方式。回调在发起方模块事件循环中执行。 |
 | `Call` | 是 | 同步阻塞调用。调用链成环会死锁，应谨慎使用。 |
 
+Handler 响应语义：
+
+- 返回非 nil `*RetInfo`：框架自动回包，适合同步处理场景。
+- 调用 `ci.Hold()` 后返回 `nil`：框架不回包，由 `Hold` 返回的 `Replier` 句柄在稍后回包（延迟响应）。
+- 直接返回 `nil` 且未调用 `Hold`：框架补一个空包，避免同步 `Call` 挂死。
+- `hasRet` CAS 保证同一调用最多只发送一次响应；重复调用 `Replier.Ret` 会返回 `ErrAlreadyRet`。
+- handler panic 时框架仍会回包错误，即便已经调用 `Hold`。
+
 消息 ID 生成规则：
 
 - 消息实现 `chanrpc.IMessage` 时，使用自定义 `ID() uint32`。
@@ -507,6 +515,29 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 ### 动态模块和静态模块有什么区别？
 
 静态模块随应用启停，不支持运行时卸载，panic 会退出进程。动态模块支持运行时加载和卸载，panic 只记录日志。
+
+### 延迟响应如何使用？
+
+handler 内调用 `ci.Hold()` 拿到 `Replier` 句柄后返回 nil，框架不会自动回包。业务在其他 goroutine 完成阻塞 IO 后，用该句柄回包：
+
+```go
+func onQuery(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
+    reply := ci.Hold()
+    go func() {
+        row, err := db.Query(...)                           // 阻塞 IO，不占事件循环
+        _ = reply.Ret(&chanrpc.RetInfo{Ack: row, Err: err}) // 稍后回包
+    }()
+    return nil
+}
+```
+
+回包能力由 `Hold` 返出而不是挂在 `CallInfo` 上，是为了让「忘了 Hold 就直接回包」这条错误路径在类型上不存在——拿到 `Replier` 的唯一途径就是先 `Hold`。
+
+`Hold` 后必须保证最终调用 `Replier.Ret`，否则同步 `Call` 会挂死（只会每 5s 打一条告警），需要超时兜底请让调用方改用 `CallWithContext`。handler panic 时框架仍会回包错误。
+
+### 重复回包会怎样？
+
+第二次及以后的 `Replier.Ret` 会返回 `ErrAlreadyRet`，不会静默丢弃。延迟响应场景下回包发生在 handler 之外的 goroutine，这能帮助业务发现响应未成功投递。
 
 ---
 

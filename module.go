@@ -32,6 +32,9 @@ type IModule interface {
 	OnDestroy()
 	// ChanRPC 返回模块的 ChanRPC 服务端，nil 表示该模块不接受外部 RPC 调用。
 	ChanRPC() *chanrpc.Server
+	// Close 释放模块的出站 client 资源，由框架在 OnDestroy 返回之后调用；
+	// 见 Skeleton.Close 的说明。
+	Close() error
 }
 
 const (
@@ -407,16 +410,32 @@ func (a *app) stop() {
 	slog.Info("application shutdown complete")
 }
 
-// shutdownModule 优雅关闭单个静态模块，完整流程为：调用 OnDestroy → 发送停止信号 → 等待 goroutine 退出（含超时保护）。
+// shutdownModule 优雅关闭单个静态模块，顺序为：
+// 发送停止信号 → 等待 goroutine 退出（含超时保护）→ 调用 OnDestroy → 释放 client。
+//
+// **OnDestroy 必须排在 goroutine 退出之后。** 模块是单 goroutine actor，
+// 业务内存全靠「只在 Serve 这条 goroutine 上访问」来免锁。
+// 若在 Serve 仍在消费消息时就调 OnDestroy（它跑在本关闭 goroutine 上），
+// OnDestroy 里任何遍历业务容器的动作都会与事件循环并发读写同一批 map——
+// Go 运行时对此直接 fatal 且不可 recover，destroyModule 的 recover 拦不住，
+// 进程当场 abort，排在后面的模块（通常是持久化模块）连关闭的机会都没有。
+//
+// server 的释放（排空并真正执行积压请求）收在 Serve 自己的 ctx.Done 分支里，
+// 与"停事件循环"是同一步（见 Skeleton.Serve / chanrpc.Server.Close）。
+// **client 的释放不能收在那里**：OnDestroy 通常要用 client 把停机前的
+// 最后一批状态投递给其它模块（例如汇总数据后转交给专门负责收尾处理的
+// 模块），提前关掉 client 会让这些投递全部失败。因此 client 由这里在 OnDestroy
+// 返回之后单独关闭（见 Skeleton.Close）。
+// OnDestroy 若想给别的模块投递最后一批数据，对方模块必须还没轮到自己
+// 关闭——这正是本函数外层 LIFO 停机顺序要保证的前提。
 //
 // 超时保护通过独立 goroutine + done channel 实现，而非直接阻塞，
 // 原因是 wg.Wait 本身不支持超时，需要借助 select 和 timer 组合。
 // 超时后不强制退出，仅记录错误，因为强制终止可能导致数据损坏（如正在写数据库）。
 func (a *app) shutdownModule(wrapper *moduleWrapper) {
-	slog.Info("destroying module", "module", wrapper.Name())
-	a.destroyModule(wrapper)
+	slog.Info("stopping module", "module", wrapper.Name())
 
-	// 通过 context 取消向模块的 OnRun 发送停止信号
+	// 通过 context 取消向模块的 Serve 发送停止信号
 	wrapper.cancel()
 	// 在辅助 goroutine 中等待模块退出，配合 select + timer 实现超时保护
 	done := make(chan struct{})
@@ -431,9 +450,19 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 	case <-done:
 		slog.Info("module goroutine exited", "module", wrapper.Name())
 	case <-timer.C:
-		slog.Error("module shutdown timeout", "module", wrapper.Name())
+		// 超时说明 Serve 还没退出，此时调 OnDestroy 就回到了并发读写的老问题上，
+		// 因此直接放弃本模块的销毁：宁可漏掉一次落地，也不要 fatal。
+		slog.Error("module shutdown timeout, OnDestroy skipped", "module", wrapper.Name())
 		return
 	}
+
+	// 事件循环已停，业务内存此刻只有本 goroutine 访问，OnDestroy 可以安全遍历，
+	// client 仍然打开，OnDestroy 里的 Cast/Call/AsyncCall 仍然可以正常投递。
+	slog.Info("destroying module", "module", wrapper.Name())
+	a.destroyModule(wrapper)
+
+	// 最后释放 client：OnDestroy 里的投递到此已全部发出
+	_ = wrapper.Close()
 	slog.Info("module shutdown complete", "module", wrapper.Name())
 }
 
@@ -568,9 +597,9 @@ func (a *app) removeAllDynamicModules() {
 //
 // SIGINT / SIGTERM 为可捕获的框架保留信号；SIGKILL 不可被进程捕获，也作为保留信号禁止业务注册。
 //
-// 示例（在游戏模块 OnInit 中注册 SIGHUP 热重载）：
+// 示例（在某个模块的 OnInit 中注册 SIGHUP 热重载）：
 //
-//	if err := core.RegisterSignal(func() {
+//	if err := xhive.RegisterSignal(func() {
 //	    slog.Info("收到 SIGHUP，重新加载配置")
 //	    reloadConfig()
 //	}, syscall.SIGHUP); err != nil {

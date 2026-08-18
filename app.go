@@ -9,7 +9,7 @@ import (
 )
 
 // defaultApp 全局默认应用实例（包级单例），供包级函数直接使用。
-// 单例模式避免调用方持有实例引用，简化了典型场景下的使用方式（main 函数直接调用 core.Run）。
+// 单例模式避免调用方持有实例引用，简化了典型场景下的使用方式（main 函数直接调用 xhive.Run）。
 var defaultApp = newApp()
 
 // Register 向全局默认应用实例注册静态模块。

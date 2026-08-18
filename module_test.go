@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xmapst/xhive/chanrpc"
 )
 
 func TestAppRegisterNilStatsNoRPCAndStopIdempotent(t *testing.T) {
@@ -66,6 +68,48 @@ func TestAppStartCannotStartTwiceAndStopOrder(t *testing.T) {
 	a.stop()
 	if a.State() != AppStateStop {
 		t.Fatalf("stop while stopping state = %d, want stop", a.State())
+	}
+}
+
+// TestOnDestroyCanCastToModuleShuttingDownLater 是"client 要在 OnDestroy 之后
+// 才关闭"这条约束的直接回归测试：LIFO 停机顺序下，先关闭的模块在自己的
+// OnDestroy 里必须仍然能把最后一批数据 Cast 给还没轮到关闭的模块——典型
+// 场景是某个模块停机时要把汇总状态转投给专门负责收尾处理的模块（这类
+// 收尾模块通常注册在最前面，因此按 LIFO 顺序最后关闭）。若 Skeleton.Close
+// 提前关掉了 client，这次 Cast 会静默失败，sink 永远收不到消息。
+func TestOnDestroyCanCastToModuleShuttingDownLater(t *testing.T) {
+	oldDefault := defaultApp
+	defaultApp = newApp()
+	defer func() { defaultApp = oldDefault }()
+
+	received := make(chan string, 1)
+	sink := newSkeletonTestModule("sink")
+	sink.onInit = func(m *skeletonTestModule) error {
+		return m.RegisterChanRPC(skeletonRPCReq{}, func(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
+			received <- ci.Request.(skeletonRPCReq).Value
+			return nil
+		})
+	}
+
+	// sink 注册在前，按 LIFO 停机顺序最后关闭；source 的 OnDestroy 执行时
+	// sink 应仍在正常运行。
+	source := newSkeletonTestModule("source")
+	source.onDestroy = func() {
+		source.Cast("sink", skeletonRPCReq{Value: "final flush"})
+	}
+
+	if !defaultApp.start(sink, source) {
+		t.Fatal("start should succeed")
+	}
+	defaultApp.stop()
+
+	select {
+	case got := <-received:
+		if got != "final flush" {
+			t.Fatalf("received = %q, want %q", got, "final flush")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sink did not receive the Cast sent from source's OnDestroy")
 	}
 }
 
