@@ -56,11 +56,11 @@ type ITimer interface {
 // Skeleton 模块骨架，将 ChanRPC（服务端/客户端）和定时器管理器整合为统一的事件驱动框架。
 //
 // 核心设计思想（Actor 模型）：
-// 所有事件（RPC 调用、异步回调、定时器）在单一 goroutine（OnRun）中串行处理，
+// 所有事件（RPC 调用、异步回调、定时器）在单一 goroutine（Serve）中串行处理，
 // 彻底消除模块内部的并发竞争，开发者无需为访问模块状态加任何锁，极大降低了复杂度。
 //
 // 使用方式：业务模块内嵌 Skeleton，重写 OnInit 注册处理函数，重写 OnDestroy 清理资源，
-// 无需重写 OnRun 和 ChanRPC（Skeleton 已提供默认实现）。
+// 无需重写 Serve 和 ChanRPC（Skeleton 已提供默认实现）。
 type Skeleton struct {
 	ready  chan struct{}   // 在 select 循环即将开始时关闭
 	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
@@ -358,7 +358,7 @@ func (s *Skeleton) RegisterChanRPC(msg any, f chanrpc.Handler) error {
 
 // AsyncCall 向指定模块发起异步 RPC 调用，结果通过 cb 回调在本模块事件循环中执行。
 //
-// 回调在 OnRun 的 select 循环中消费 client.Event() 时执行，
+// 回调在 Serve 的 select 循环中消费 client.Event() 时执行，
 // 与模块其他事件处理串行，无并发问题，可安全访问模块内部状态。
 func (s *Skeleton) AsyncCall(mod string, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error {
 	server := defaultApp.ChanRPC(mod)

@@ -60,7 +60,7 @@ func WithCloseDrainTimeout(d time.Duration) ServerOption {
 // Server ChanRPC 服务端，接收并处理来自 Client 的 RPC 调用。
 //
 // 每个模块持有一个 Server 实例，所有外部 RPC 调用通过无界队列排队，
-// 在模块的事件循环（Skeleton.OnRun）中通过 Server.Event() 串行出队处理，从而保证模块内部状态访问无并发竞争。
+// 在模块的事件循环（Skeleton.Serve）中通过 Server.Event() 串行出队处理，从而保证模块内部状态访问无并发竞争。
 //
 // 架构优势：消息路由通过 functions 哈希表实现 O(1) 查找，
 // 相比传统的 switch-case 分发，新增消息类型只需调用 Register 注册一次，扩展成本极低。
@@ -183,7 +183,7 @@ func (s *Server) exec(ci *CallInfo) (err error) {
 	return nil
 }
 
-// Exec 公开的消息执行入口，在模块的 OnRun 事件循环中逐一调用。
+// Exec 公开的消息执行入口，在模块的 Serve 事件循环中逐一调用。
 //
 // 执行前把 hasRet / held 一并重置，保证同一个 CallInfo 若被重复投递也从干净状态开始。
 // 延迟响应（handler 先 Hold、稍后由别的 goroutine 调 Ret）的语义见 CallInfo.Hold。

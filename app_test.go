@@ -16,7 +16,7 @@ import (
 )
 
 // testModule 是用于 app/skeleton/signal 集成测试的最小 IModule 实现。
-// 通过原子计数和 channel 显式观测 OnInit/OnRun/OnDestroy 的调用顺序，避免测试依赖 sleep 推断生命周期。
+// 通过原子计数和 channel 显式观测 OnInit/Serve/OnDestroy 的调用顺序，避免测试依赖 sleep 推断生命周期。
 type testModule struct {
 	name        string
 	server      *chanrpc.Server
@@ -83,7 +83,7 @@ func waitClosed(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
 }
 
 // TestAppRegisterStartStopStatsAndChanRPC 覆盖静态模块完整生命周期：注册、启动、状态切换、ChanRPC 查询、
-// Stats 输出以及停止时 OnDestroy/OnRun 退出是否都被执行。
+// Stats 输出以及停止时 OnDestroy/Serve 退出是否都被执行。
 func TestAppRegisterStartStopStatsAndChanRPC(t *testing.T) {
 	a := newApp()
 	m1 := newTestModule("m1")

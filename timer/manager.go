@@ -106,7 +106,7 @@ func (tm *Manager) Stop() {
 	tm.dispatcher.Stop()
 }
 
-// Event 返回定时器触发通知通道，供模块事件循环（Skeleton.OnRun）通过 select 监听。
+// Event 返回定时器触发通知通道，供模块事件循环（Skeleton.Serve）通过 select 监听。
 func (tm *Manager) Event() <-chan Event {
 	return tm.dispatcher.chanFired.Out()
 }

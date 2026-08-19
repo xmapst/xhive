@@ -88,7 +88,7 @@ func WithShutdownTimeout(d time.Duration) AppOption {
 
 // moduleWrapper 为 IModule 附加框架运行时所需的控制元数据。
 //
-// ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 OnRun 应退出主循环；
+// ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 Serve 应退出主循环；
 // wg 用于等待模块 goroutine 完全退出，保证关闭流程可同步等待完成。
 type moduleWrapper struct {
 	IModule
@@ -294,7 +294,7 @@ func (a *app) Run(mods ...IModule) {
 //  1. 状态检查 + 将 Run 参数中的模块追加到 modules 列表，两步在同一把写锁内完成，
 //     防止并发调用 Register/start 时出现 TOCTOU 竞态（支持 Register + Run 两种注册方式）
 //  2. 依次调用 OnInit，任一失败则中止启动并返回 false
-//  3. 为每个模块启动独立 goroutine 并运行 OnRun
+//  3. 为每个模块启动独立 goroutine 并运行 Serve
 //
 // 顶层 panic recover：捕获启动过程中的意外 panic，记录完整堆栈后以退出码 255 终止进程，
 // 防止进程在不确定状态下继续运行造成数据损坏。
@@ -348,8 +348,8 @@ func (a *app) start(mods ...IModule) bool {
 		go a.serveModule(wrapper, false)
 	}
 
-	// 等待所有模块的事件循环（OnRun）进入 select 就绪后，再并发调用 OnStart。
-	// 避免 OnRun 中跨模块 Call 时目标模块尚未监听 ChanCall 导致 message_id not registered。
+	// 等待所有模块的事件循环（Serve）进入 select 就绪后，再并发调用 OnStart。
+	// 避免 Serve 中跨模块 Call 时目标模块尚未监听 ChanCall 导致 message_id not registered。
 	for _, wrapper := range a.modules {
 		<-wrapper.Ready()
 	}
@@ -361,7 +361,7 @@ func (a *app) start(mods ...IModule) bool {
 	return true
 }
 
-// serveModule 在独立 goroutine 中运行模块的 OnRun 主循环。
+// serveModule 在独立 goroutine 中运行模块的 Serve 主循环。
 //
 // runtime.LockOSThread 将 goroutine 绑定到专用系统线程：
 //   - 保证某些依赖线程本地状态的库（如 OpenGL、部分 CGO 库）能正常工作
@@ -570,8 +570,8 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 //
 // 完整操作序列：
 //  1. OnDestroy：调用销毁钩子释放模块资源
-//  2. cancel：向模块发送停止信号，通知 OnRun 退出主循环
-//  3. wg.Wait：阻塞等待 OnRun goroutine 完全退出
+//  2. cancel：向模块发送停止信号，通知 Serve 退出主循环
+//  3. wg.Wait：阻塞等待 Serve goroutine 完全退出
 //  4. Delete：从 dynamicModules 移除，释放引用
 //
 // 该操作是同步阻塞的，调用方会等待模块完全停止后才返回，
@@ -589,8 +589,8 @@ func (a *app) RemoveDynamicModule(name string) bool {
 
 	a.destroyModule(wrapper)
 
-	wrapper.cancel()  // 发送停止信号，通知模块 OnRun 退出
-	wrapper.wg.Wait() // 等待 OnRun goroutine 完全退出后再继续
+	wrapper.cancel()  // 发送停止信号，通知模块 Serve 退出
+	wrapper.wg.Wait() // 等待 Serve goroutine 完全退出后再继续
 
 	a.dynamicModules.Delete(name)
 
