@@ -160,8 +160,10 @@ type IModule interface {
 	Name() string
 	OnInit() error
 	Serve(ctx context.Context)
+	Ready() <-chan struct{}
 	OnDestroy()
 	ChanRPC() *chanrpc.Server
+	Close() error
 }
 ```
 
@@ -171,8 +173,8 @@ type IModule interface {
 
 1. 静态模块按注册顺序执行 `OnInit`。
 2. 任一静态模块 `OnInit` 失败，应用启动失败。
-3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`。
-4. `OnDestroy` 用于释放业务资源。
+3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`；进入事件循环后 `Ready()` 返回的 channel 会被关闭，框架据此保证其它模块不会在这之前发起跨模块调用。
+4. `OnDestroy` 用于释放业务资源；此时事件循环已停，不能再对本模块自投递（见 `IModule.OnDestroy` 的说明）。`Close` 由框架在 `OnDestroy` 返回之后调用，释放出站 client 资源。
 5. 静态模块 panic 会导致进程退出；动态模块 panic 只记录日志。
 
 ### Skeleton

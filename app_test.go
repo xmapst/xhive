@@ -52,6 +52,10 @@ func (m *testModule) Serve(ctx context.Context) {
 	close(m.runStopped)
 }
 
+// Ready 复用 runStarted：Serve 一进入就关闭它，语义上等价于
+// Skeleton.ready 在进入 select 循环前关闭。
+func (m *testModule) Ready() <-chan struct{} { return m.runStarted }
+
 func (m *testModule) OnDestroy() {
 	m.destroyCnt.Add(1)
 	if m.destroyHook != nil {

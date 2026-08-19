@@ -28,7 +28,18 @@ type IModule interface {
 	OnInit() error
 	// Serve 执行模块主循环，应监听 ctx.Done() 并在收到取消信号时退出。
 	Serve(ctx context.Context)
+	// Ready 返回就绪信号 channel，框架在此 channel 关闭后才允许其他模块向本模块发起调用。
+	Ready() <-chan struct{}
 	// OnDestroy 执行模块销毁，在 goroutine 完全退出前调用，负责释放所有资源。
+	//
+	// 注意：不能自投递。执行到这里时本模块自己的 Server 已经 Close，
+	// 对它的 Cast/Call/AsyncCall（包括 m.Call(m.Name(), ...) 这种自调用）
+	// 都会因为投递到已关闭队列而失败——同步 Call 会拿到错误响应，不会
+	// 挂起，但如果指望它能把处理逻辑重新投递回本模块的事件循环，这个
+	// 逻辑就悄悄失效了。OnDestroy 需要的收尾工作应该直接写成同步函数
+	// 调用/循环（例如遍历并落地业务数据），而不是通过消息投递给自己——
+	// 此刻事件循环已经不存在，没有人能消费这条自投递。
+	// 给别的、还没轮到关闭的模块投递数据不受影响，见 shutdownModule 的说明。
 	OnDestroy()
 	// ChanRPC 返回模块的 ChanRPC 服务端，nil 表示该模块不接受外部 RPC 调用。
 	ChanRPC() *chanrpc.Server
@@ -337,6 +348,12 @@ func (a *app) start(mods ...IModule) bool {
 		go a.serveModule(wrapper, false)
 	}
 
+	// 等待所有模块的事件循环（OnRun）进入 select 就绪后，再并发调用 OnStart。
+	// 避免 OnRun 中跨模块 Call 时目标模块尚未监听 ChanCall 导致 message_id not registered。
+	for _, wrapper := range a.modules {
+		<-wrapper.Ready()
+	}
+
 	a.Lock()
 	a.setState(AppStateRun)
 	a.Unlock()
@@ -428,6 +445,13 @@ func (a *app) stop() {
 // 返回之后单独关闭（见 Skeleton.Close）。
 // OnDestroy 若想给别的模块投递最后一批数据，对方模块必须还没轮到自己
 // 关闭——这正是本函数外层 LIFO 停机顺序要保证的前提。
+//
+// **但不能给自己投递。** OnDestroy 执行到这一步时，本模块自己的 Server
+// 已经在上面 wg.Wait 等到的那次 Serve 退出里 Close 过了，Cast/Call/AsyncCall
+// 到自己（包括 m.Call(m.Name(), ...) 这种自调用）都会因为投递到已关闭
+// 队列而失败。OnDestroy 需要的收尾工作应该直接写成同步函数调用/循环，
+// 不要指望能把处理逻辑重新投递回本模块的事件循环——此刻事件循环已经
+// 不存在，没有人能消费这条自投递（详见 IModule.OnDestroy 的说明）。
 //
 // 超时保护通过独立 goroutine + done channel 实现，而非直接阻塞，
 // 原因是 wg.Wait 本身不支持超时，需要借助 select 和 timer 组合。
@@ -531,6 +555,7 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 
 		wrapper.wg.Add(1)
 		go a.serveModule(wrapper, true) // dynamic=true：panic 不会退出进程
+		<-wrapper.Ready()               // 等待事件循环就绪后再存入，保证 ChanRPC 可接收
 		a.dynamicModules.Store(name, wrapper)
 		results = append(results, AddDynamicModuleResult{Name: name})
 	}

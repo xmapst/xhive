@@ -62,6 +62,7 @@ type ITimer interface {
 // 使用方式：业务模块内嵌 Skeleton，重写 OnInit 注册处理函数，重写 OnDestroy 清理资源，
 // 无需重写 OnRun 和 ChanRPC（Skeleton 已提供默认实现）。
 type Skeleton struct {
+	ready  chan struct{}   // 在 select 循环即将开始时关闭
 	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
 	server *chanrpc.Server // ChanRPC 服务端，接收并路由来自其他模块的 RPC 调用
 	client *chanrpc.Client // ChanRPC 客户端，向其他模块发起 RPC 调用
@@ -173,8 +174,9 @@ func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 	}
 
 	s := &Skeleton{
-		name:   name,
-		timer:  timer.NewManager(cfg.timerChanLen),
+		name:  name,
+		ready: make(chan struct{}),
+		timer: timer.NewManager(cfg.timerChanLen),
 		server: chanrpc.NewServer(
 			chanrpc.WithInitialCapacity(cfg.serverChanLen),
 			chanrpc.WithCloseDrainTimeout(cfg.closeDrainTimeout),
@@ -183,7 +185,7 @@ func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 			chanrpc.WithClientInitialCapacity(cfg.clientChanLen),
 			chanrpc.WithClientCloseTimeout(cfg.clientCloseTimeout),
 		),
-		stat:   stat.NewTPStats(cfg.statCap),
+		stat: stat.NewTPStats(cfg.statCap),
 	}
 	return s
 }
@@ -210,6 +212,7 @@ func (s *Skeleton) Serve(ctx context.Context) {
 		s.scheduleDumpTimer()
 	})
 	s.scheduleDumpTimer()
+	close(s.ready) // 通知框架：事件循环即将进入 select，ChanRPC 现在可以安全接收消息
 	for {
 		select {
 		case <-ctx.Done():
@@ -236,6 +239,11 @@ func (s *Skeleton) Serve(ctx context.Context) {
 			s.recordStat(ci.ID(), xtime.Now().UnixMicro()-startUs)
 		}
 	}
+}
+
+// Ready 返回就绪信号 channel，框架在此 channel 关闭后才允许其他模块向本模块发起调用。
+func (s *Skeleton) Ready() <-chan struct{} {
+	return s.ready
 }
 
 // Close 释放模块的 client 资源，**由框架在 OnDestroy 返回之后调用**。
