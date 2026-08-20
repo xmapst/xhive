@@ -119,6 +119,8 @@ func TestAppDynamicPartialFailureKeepsStartedModulesAndRemoveAll(t *testing.T) {
 	bad := newTestModule("bad-dyn")
 	bad.initErr = errors.New("bad init")
 
+	// good/bad 优先级相同（默认值 0），AddDynamicModules 对同优先级模块采用稳定排序，
+	// 保留传入顺序，因此处理顺序与结果顺序都与 AddDynamicModules(good, bad) 一致。
 	results, err := a.AddDynamicModules(good, bad)
 	if err == nil {
 		t.Fatal("AddDynamicModules should fail when later module init fails")
@@ -151,4 +153,46 @@ func TestAppDynamicPartialFailureKeepsStartedModulesAndRemoveAll(t *testing.T) {
 		t.Fatal("RemoveDynamicModule should return false for non-wrapper value")
 	}
 	a.dynamicModules.Delete("broken")
+}
+
+// TestRemoveAllDynamicModulesReversesPriorityOrder 验证 removeAllDynamicModules
+// 按优先级倒序关闭：初始化按优先级升序（同优先级按 AddDynamicModules 的传入顺序，
+// 即 moduleWrapper.seq 升序），关闭顺序应与之完全相反，后添加的模块先关闭，
+// 与静态模块的 LIFO 停机语义保持一致。
+//
+// mid1/mid2 故意使用与传入顺序相反的名称字典序（mid1="zzz-first" 先传入但字典序更大，
+// mid2="aaa-second" 后传入但字典序更小），用来区分"按添加顺序 tie-break"与
+// "按名称字典序 tie-break"两种实现——如果 removeAllDynamicModules 误用名称排序，
+// 这里的期望顺序会先失败。
+func TestRemoveAllDynamicModulesReversesPriorityOrder(t *testing.T) {
+	a := newApp()
+
+	low := newTestModule("low")
+	low.priority = 1
+	mid1 := newTestModule("zzz-first")
+	mid1.priority = 5
+	mid2 := newTestModule("aaa-second")
+	mid2.priority = 5
+	high := newTestModule("high")
+	high.priority = 10
+
+	var order []string
+	for _, m := range []*testModule{low, mid1, mid2, high} {
+		name := m.name
+		m.destroyHook = func() { order = append(order, name) }
+	}
+
+	// 传入顺序：high, low, mid1(zzz-first), mid2(aaa-second)。
+	if _, err := a.AddDynamicModules(high, low, mid1, mid2); err != nil {
+		t.Fatalf("AddDynamicModules failed: %v", err)
+	}
+
+	a.removeAllDynamicModules()
+
+	// 初始化顺序（优先级升序，同优先级按传入顺序）为 low, zzz-first, aaa-second, high；
+	// 倒序关闭顺序应为 high, aaa-second, zzz-first, low。
+	want := []string{"high", "aaa-second", "zzz-first", "low"}
+	if !slices.Equal(order, want) {
+		t.Fatalf("destroy order = %v, want %v", order, want)
+	}
 }

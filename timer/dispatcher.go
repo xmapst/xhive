@@ -86,7 +86,7 @@ func (t *dispatcherTimer) Callback() {
 	defer func() {
 		t.cb = nil // 主动断开引用，允许 GC 回收回调捕获的外部资源（如模块的大对象）
 		if r := recover(); r != nil {
-			slog.Error("timer callback panic", "panic", r, "stack", string(debug.Stack()))
+			slog.Error("timer callback panic", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 		}
 	}()
 	if t.canceled != nil {
@@ -135,7 +135,7 @@ func (disp *dispatcher) Run() {
 func (disp *dispatcher) run() {
 	defer func() {
 		if x := recover(); x != nil {
-			slog.Error("timer dispatcher crashed", "panic", x, "stack", string(debug.Stack()))
+			slog.Error("timer dispatcher crashed", slog.Any("panic", x), slog.String("stack", string(debug.Stack())))
 		}
 	}()
 
@@ -193,7 +193,7 @@ func (disp *dispatcher) doOp(t *dispatcherTimer) bool {
 			oldt.canceled = &disp.canceledTimers
 			disp.place(oldt)
 		} else {
-			slog.Error("delay timer get old timer fail", "timer_id", t.id)
+			slog.Error("delay timer get old timer fail", slog.Int64("timer_id", t.id))
 		}
 		return true
 

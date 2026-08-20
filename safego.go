@@ -12,7 +12,7 @@ func SafeGo(fn func()) {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("skeleton goroutine panic recovered",
-					"panic", r, "stack", string(debug.Stack()))
+					slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 			}
 		}()
 		fn()
@@ -27,7 +27,7 @@ func SafeGoContext(ctx context.Context, fn func(ctx context.Context)) {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("skeleton goroutine panic recovered",
-					"panic", r, "stack", string(debug.Stack()))
+					slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 			}
 		}()
 
@@ -35,7 +35,7 @@ func SafeGoContext(ctx context.Context, fn func(ctx context.Context)) {
 		select {
 		case <-ctx.Done():
 			slog.WarnContext(ctx, "goroutine skipped: context already canceled",
-				"err", ctx.Err())
+				slog.Any("error", ctx.Err()))
 			return
 		default:
 			fn(ctx)

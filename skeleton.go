@@ -195,6 +195,11 @@ func (s *Skeleton) Name() string {
 	return s.name
 }
 
+// Priority 返回模块优先级，默认值 0 表示最高优先级，最早被初始化。
+func (s *Skeleton) Priority() uint {
+	return 0
+}
+
 // Serve 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
 //
 // 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
@@ -223,7 +228,7 @@ func (s *Skeleton) Serve(ctx context.Context) {
 			// client 的释放交给框架在 OnDestroy 返回后调用 Close 完成。
 			s.timer.Stop()
 			s.server.Close()
-			slog.Info("skeleton stopped", "name", s.name)
+			slog.Info("skeleton stopped", slog.String("name", s.name))
 			return
 		case t := <-s.timer.Event():
 			startUs := xtime.Now().UnixMicro()
@@ -291,7 +296,7 @@ func (s *Skeleton) startOfDay(now time.Time) time.Time {
 
 // dumpStat dump 并可选重置统计
 func (s *Skeleton) dumpStat(reset bool) {
-	slog.Info("dump stat", "name", s.name, "stat", s.stat.Dump(100))
+	slog.Info("dump stat", slog.String("name", s.name), slog.String("stat", s.stat.Dump(100)))
 	if reset {
 		s.stat.Reset()
 	}

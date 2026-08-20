@@ -19,6 +19,7 @@ import (
 // 通过原子计数和 channel 显式观测 OnInit/Serve/OnDestroy 的调用顺序，避免测试依赖 sleep 推断生命周期。
 type testModule struct {
 	name        string
+	priority    uint
 	server      *chanrpc.Server
 	initErr     error
 	initCount   atomic.Int32
@@ -39,6 +40,10 @@ func newTestModule(name string) *testModule {
 }
 
 func (m *testModule) Name() string { return m.name }
+
+// Priority 默认返回 0，与 Skeleton 的默认优先级一致；测试模块本身不依赖启动/关闭顺序，
+// 通过设置 priority 字段可在需要验证排序行为的用例中覆盖。
+func (m *testModule) Priority() uint { return m.priority }
 
 func (m *testModule) OnInit() error {
 	m.initCount.Add(1)

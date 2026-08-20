@@ -135,7 +135,7 @@ func (tm *Manager) FindByName(name string) *Timer {
 func (tm *Manager) commonCb(timerID int64) {
 	t := tm.timers[timerID]
 	if t == nil {
-		slog.Warn("delay timer not found", "timer_id", timerID)
+		slog.Warn("delay timer not found", slog.Int64("timer_id", timerID))
 		return
 	}
 	if xtime.Now().Before(t.deadline) {
@@ -143,7 +143,7 @@ func (tm *Manager) commonCb(timerID int64) {
 	}
 	f, ok := tm.handlers[t.name]
 	if !ok {
-		slog.Error("delay timer handler not found", "name", t.name)
+		slog.Error("delay timer handler not found", slog.String("name", t.name))
 		return
 	}
 	defer func() {
@@ -200,11 +200,11 @@ func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 
 	_, ok := tm.handlers[name]
 	if !ok {
-		slog.Error("new timer handler not found", "name", name)
+		slog.Error("new timer handler not found", slog.String("name", name))
 		return 0
 	}
 	if o.id != 0 && tm.timers[o.id] != nil {
-		slog.Error("new timer id already exists", "timer_id", o.id)
+		slog.Error("new timer id already exists", slog.Int64("timer_id", o.id))
 		return 0
 	}
 	startAt := xtime.Now()

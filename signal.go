@@ -92,7 +92,7 @@ func (sm *SignalManager) Start(stopFn func()) {
 	// 每个信号的处理器并发执行，取读锁后立即释放，避免在 channel 阻塞期间持锁与 Register 的写锁死锁。
 	go func() {
 		for sig := range sigCh {
-			slog.Info("signal received", "signal", sig)
+			slog.Info("signal received", slog.Any("signal", sig))
 			sm.RLock()
 			traps := sm.signals[sig]
 			sm.RUnlock()
@@ -101,7 +101,7 @@ func (sm *SignalManager) Start(stopFn func()) {
 				wg.Go(func() {
 					defer func() {
 						if r := recover(); r != nil {
-							slog.Error("signal handler panicked", "signal", sig, "panic", r, "stack", string(debug.Stack()))
+							slog.Error("signal handler panicked", slog.Any("signal", sig), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 						}
 					}()
 					trap()

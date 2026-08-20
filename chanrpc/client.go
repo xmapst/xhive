@@ -155,7 +155,7 @@ func (c *Client) Call(s *Server, request any, opts ...CallOption) *RetInfo {
 func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, opts ...CallOption) *RetInfo {
 	id, err := c.check(s, request)
 	if err != nil {
-		slog.Warn("chanrpc sync call failed", "id", id, "err", err)
+		slog.Warn("chanrpc sync call failed", slog.Any("id", id), slog.Any("error", err))
 		return &RetInfo{Err: err}
 	}
 	o := c.applyOpts(opts...)
@@ -168,7 +168,7 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 		metadata: o.metadata,
 	})
 	if err != nil {
-		slog.Warn("chanrpc sync call failed", "id", id, "err", err)
+		slog.Warn("chanrpc sync call failed", slog.Any("id", id), slog.Any("error", err))
 		return &RetInfo{Err: err}
 	}
 
@@ -179,10 +179,10 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 		case ri := <-chanRet:
 			return ri
 		case <-ctx.Done():
-			slog.Warn("chanrpc call canceled", "id", id, "err", ctx.Err())
+			slog.Warn("chanrpc call canceled", slog.Any("id", id), slog.Any("error", ctx.Err()))
 			return &RetInfo{Err: ctx.Err()}
 		case <-tick.C:
-			slog.Warn("chanrpc call timeout", "id", id)
+			slog.Warn("chanrpc call timeout", slog.Any("id", id))
 		}
 	}
 }
@@ -199,7 +199,7 @@ func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...Ca
 
 	id, err := c.check(s, request)
 	if err != nil {
-		slog.Warn("chanrpc async call failed", "id", id, "err", err)
+		slog.Warn("chanrpc async call failed", slog.Any("id", id), slog.Any("error", err))
 		return err
 	}
 	o := c.applyOpts(opts...)
@@ -212,7 +212,7 @@ func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...Ca
 		metadata: o.metadata,
 	})
 	if err != nil {
-		slog.Warn("chanrpc async call failed", "id", id, "err", err)
+		slog.Warn("chanrpc async call failed", slog.Any("id", id), slog.Any("error", err))
 		return err
 	}
 
@@ -230,7 +230,7 @@ func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
 	id, err := c.check(s, request)
 	if err != nil {
 		if !errors.Is(err, ErrServerNil) {
-			slog.Warn("chanrpc cast failed", "id", id, "err", err)
+			slog.Warn("chanrpc cast failed", slog.Any("id", id), slog.Any("error", err))
 		}
 		return
 	}
@@ -243,7 +243,7 @@ func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
 		// chanRet 和 callback 均为 nil，Server 端处理后不回包
 	})
 	if err != nil {
-		slog.Warn("chanrpc cast failed", "id", id, "err", err)
+		slog.Warn("chanrpc cast failed", slog.Any("id", id), slog.Any("error", err))
 	}
 }
 
@@ -253,7 +253,7 @@ func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
 func (c *Client) execCallback(ri *RetInfo) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("chanrpc callback panic", "panic", r, "stack", string(debug.Stack()))
+			slog.Error("chanrpc callback panic", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 		}
 	}()
 
@@ -292,7 +292,7 @@ func (c *Client) Close() {
 	}
 
 	pending := c.pendingAsyncCall.Load()
-	slog.Info("closing chanrpc client", "pending_calls", pending)
+	slog.Info("closing chanrpc client", slog.Int64("pending_calls", pending))
 
 	if pending > 0 {
 		var wg sync.WaitGroup
@@ -311,7 +311,7 @@ func (c *Client) Close() {
 				case <-timer.C:
 					// 超时后强制清零，避免 Close 永久阻塞，但可能丢失部分未处理的回调
 					remaining := c.pendingAsyncCall.Load()
-					slog.Warn("chanrpc client close timeout", "remaining_calls", remaining)
+					slog.Warn("chanrpc client close timeout", slog.Int64("remaining_calls", remaining))
 					c.pendingAsyncCall.Store(0)
 					return
 				}
@@ -374,7 +374,7 @@ func (c *Client) call(s *Server, ci *CallInfo) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v\n%s", r, string(debug.Stack()))
-			slog.Warn("chanrpc call panic", "req_type", reqType, "err", err)
+			slog.Warn("chanrpc call panic", slog.String("req_type", reqType), slog.Any("error", err))
 			if ci.chanRet != nil {
 				func() {
 					defer func() { _ = recover() }() // 防止 send 自身 panic 导致二次崩溃

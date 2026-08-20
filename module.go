@@ -1,6 +1,7 @@
 package xhive
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,10 @@ import (
 type IModule interface {
 	// Name 返回模块唯一名称，用于日志标识和跨模块 RPC 寻址。
 	Name() string
+	// Priority 返回模块启动优先级，值越小越早初始化；优先级相同时保留注册/添加顺序
+	// （静态模块为 Register/start 调用顺序，动态模块为 AddDynamicModules 传参顺序），
+	// 关闭顺序与之完全相反（LIFO）。
+	Priority() uint
 	// OnInit 执行模块初始化，任一模块失败则终止整个应用启动流程。
 	OnInit() error
 	// Serve 执行模块主循环，应监听 ctx.Done() 并在收到取消信号时退出。
@@ -90,11 +95,17 @@ func WithShutdownTimeout(d time.Duration) AppOption {
 //
 // ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 Serve 应退出主循环；
 // wg 用于等待模块 goroutine 完全退出，保证关闭流程可同步等待完成。
+//
+// seq 仅动态模块使用：sync.Map.Range 不保证遍历顺序，removeAllDynamicModules
+// 无法像静态模块那样直接依赖切片下标复原"同优先级按 Add 调用顺序"这一约定，
+// 因此在 AddDynamicModules 成功启动时记录一个单调递增序号，倒序关闭时以
+// (Priority, seq) 排序重建真实的添加顺序。静态模块始终为零值，未参与排序。
 type moduleWrapper struct {
 	IModule
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	seq    uint64
 }
 
 // newModuleWrapper 构造 moduleWrapper 并初始化其停止信号 context。
@@ -119,6 +130,7 @@ type app struct {
 	sm              *SignalManager
 	dynamicModules  sync.Map         // 动态模块集合，key 为模块名，支持运行时热加载
 	modules         []*moduleWrapper // 静态模块列表，按优先级排序，启动后不允许修改
+	dynSeq          atomic.Uint64    // 动态模块添加序号生成器，见 moduleWrapper.seq 的说明
 	shutdownTimeout time.Duration    // 单个模块优雅关闭的最大等待时间，可通过 WithShutdownTimeout 自定义
 	state           atomic.Int32     // 应用全局状态，读写均在持锁状态下进行，Stats/State 对外仍以原子读保证快照一致
 	sync.RWMutex                     // 保护 modules 切片，并使状态变更与 modules 写入保持原子性
@@ -301,7 +313,7 @@ func (a *app) Run(mods ...IModule) {
 func (a *app) start(mods ...IModule) bool {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("application panic recovered", "panic", r, "stack", string(debug.Stack()))
+			slog.Error("application panic recovered", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 			os.Exit(255)
 		}
 	}()
@@ -310,7 +322,7 @@ func (a *app) start(mods ...IModule) bool {
 	currentState := a.state.Load()
 	if currentState != AppStateNone {
 		a.Unlock()
-		slog.Error("application cannot start twice", "current_state", currentState)
+		slog.Error("application cannot start twice", slog.Int64("current_state", int64(currentState)))
 		return false
 	}
 
@@ -326,31 +338,60 @@ func (a *app) start(mods ...IModule) bool {
 		slog.Warn("no modules provided to start")
 		return false
 	}
+
+	// 按 Priority 稳定排序：优先级不同时按优先级升序；优先级相同时稳定排序
+	// 保留原始 append（即 Register/start 调用）顺序，使同优先级模块之间的
+	// 依赖关系仍可通过注册顺序表达——不能改用名称等其他字段作为 tie-break，
+	// 否则会与"被依赖模块先注册"这个既有约定脱节，详见 stop 中对称的 LIFO 关闭逻辑。
+	//
+	// 注意：这只保证同优先级组内部不被打乱，不代表整体维持 append 的线性顺序——
+	// 不同优先级之间该怎么排还是按 Priority 来，本就是 Priority 存在的意义。
+	// 例如按下面顺序依次 append（Priority 未标注的表示默认值 0）：
+	//
+	//	A(0) B(0) C(2) D(2) E(5) F(0) G(0) H(6) I(7) J(0)
+	//
+	// 排序后按优先级分组、组内保留 append 相对顺序：
+	//
+	//	priority=0: A B F G J
+	//	priority=2: C D
+	//	priority=5: E
+	//	priority=6: H
+	//	priority=7: I
+	//
+	// 最终 staticModules 顺序为 A B F G J C D E H I——F/G/J 虽然是在 C/D/E 之后
+	// 才 append 的，但优先级更低（0 < 2/5），排序后反而排到了 C/D/E 前面；
+	// 关闭时按此顺序整体倒序（LIFO），即 I H E D C J G F B A。
+	slices.SortStableFunc(a.modules, func(i, j *moduleWrapper) int {
+		return cmp.Compare(i.Priority(), j.Priority())
+	})
+	staticModules := slices.Clone(a.modules)
+
 	a.setState(AppStateInit)
 	a.Unlock()
 
-	slog.Info("application starting", "module_count", moduleCount)
-	for _, wrapper := range a.modules {
-		slog.Info("module startup order", "module", wrapper.Name())
+	slog.Info("application starting", slog.Int("module_count", moduleCount))
+	for _, wrapper := range staticModules {
+		slog.Info("module startup order", slog.String("module", wrapper.Name()))
 	}
 
-	// 按注册顺序依次初始化，保证模块间的启动依赖关系（被依赖模块先初始化）
-	for _, wrapper := range a.modules {
+	// 按上面排好序的 staticModules 顺序依次初始化，保证模块间的启动依赖关系
+	// （被依赖模块先初始化）；未显式设置 Priority 时即等价于注册顺序
+	for _, wrapper := range staticModules {
 		if err := wrapper.OnInit(); err != nil {
-			slog.Error("module initialization failed", "module", wrapper.Name(), "err", err)
+			slog.Error("module initialization failed", slog.String("module", wrapper.Name()), slog.Any("error", err))
 			return false
 		}
 	}
 
 	// 所有模块初始化完成后，并发启动各自的 goroutine
-	for _, wrapper := range a.modules {
+	for _, wrapper := range staticModules {
 		wrapper.wg.Add(1)
 		go a.serveModule(wrapper, false)
 	}
 
 	// 等待所有模块的事件循环（Serve）进入 select 就绪后，再并发调用 OnStart。
 	// 避免 Serve 中跨模块 Call 时目标模块尚未监听 ChanCall 导致 message_id not registered。
-	for _, wrapper := range a.modules {
+	for _, wrapper := range staticModules {
 		<-wrapper.Ready()
 	}
 
@@ -376,16 +417,16 @@ func (a *app) serveModule(wrapper *moduleWrapper, dynamic bool) {
 		runtime.UnlockOSThread()
 		wrapper.wg.Done()
 		if r := recover(); r != nil {
-			slog.Error("module panic recovered", "module", wrapper.Name(), "panic", r, "stack", string(debug.Stack()))
+			slog.Error("module panic recovered", slog.String("module", wrapper.Name()), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 			if !dynamic {
 				os.Exit(255)
 			}
 		}
 	}()
 
-	slog.Info("started module", "module", wrapper.Name())
+	slog.Info("started module", slog.String("module", wrapper.Name()))
 	wrapper.Serve(wrapper.ctx)
-	slog.Info("module stopped", "module", wrapper.Name())
+	slog.Info("module stopped", slog.String("module", wrapper.Name()))
 }
 
 // stop 按逆序优雅关闭所有模块，保证依赖关系正确解除。
@@ -410,17 +451,20 @@ func (a *app) stop() {
 		return
 	}
 	a.setState(AppStateStop)
+	staticModules := slices.Clone(a.modules)
 	a.Unlock()
+
 	slog.Info("application shutdown initiated")
 
 	// 先关闭动态模块，它们通常依赖静态模块提供的服务
 	a.removeAllDynamicModules()
 
 	// 按逆序关闭静态模块，保证依赖关系正确解除（后启动的先关闭）
-	moduleCount := len(a.modules)
+	moduleCount := len(staticModules)
 	for i := moduleCount - 1; i >= 0; i-- {
-		a.shutdownModule(a.modules[i])
+		a.shutdownModule(staticModules[i])
 	}
+
 	a.Lock()
 	a.setState(AppStateNone)
 	a.Unlock()
@@ -457,7 +501,7 @@ func (a *app) stop() {
 // 原因是 wg.Wait 本身不支持超时，需要借助 select 和 timer 组合。
 // 超时后不强制退出，仅记录错误，因为强制终止可能导致数据损坏（如正在写数据库）。
 func (a *app) shutdownModule(wrapper *moduleWrapper) {
-	slog.Info("stopping module", "module", wrapper.Name())
+	slog.Info("stopping module", slog.String("module", wrapper.Name()))
 
 	// 通过 context 取消向模块的 Serve 发送停止信号
 	wrapper.cancel()
@@ -472,22 +516,22 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 	defer timer.Stop()
 	select {
 	case <-done:
-		slog.Info("module goroutine exited", "module", wrapper.Name())
+		slog.Info("module goroutine exited", slog.String("module", wrapper.Name()))
 	case <-timer.C:
 		// 超时说明 Serve 还没退出，此时调 OnDestroy 就回到了并发读写的老问题上，
 		// 因此直接放弃本模块的销毁：宁可漏掉一次落地，也不要 fatal。
-		slog.Error("module shutdown timeout, OnDestroy skipped", "module", wrapper.Name())
+		slog.Error("module shutdown timeout, OnDestroy skipped", slog.String("module", wrapper.Name()))
 		return
 	}
 
 	// 事件循环已停，业务内存此刻只有本 goroutine 访问，OnDestroy 可以安全遍历，
 	// client 仍然打开，OnDestroy 里的 Cast/Call/AsyncCall 仍然可以正常投递。
-	slog.Info("destroying module", "module", wrapper.Name())
+	slog.Info("destroying module", slog.String("module", wrapper.Name()))
 	a.destroyModule(wrapper)
 
 	// 最后释放 client：OnDestroy 里的投递到此已全部发出
 	_ = wrapper.Close()
-	slog.Info("module shutdown complete", "module", wrapper.Name())
+	slog.Info("module shutdown complete", slog.String("module", wrapper.Name()))
 }
 
 // destroyModule 调用模块的 OnDestroy 并捕获其中可能发生的 panic。
@@ -498,7 +542,7 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 func (a *app) destroyModule(wrapper *moduleWrapper) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("module destroy panic recovered", "module", wrapper.Name(), "panic", r, "stack", string(debug.Stack()))
+			slog.Error("module destroy panic recovered", slog.String("module", wrapper.Name()), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 		}
 	}()
 
@@ -530,34 +574,47 @@ type AddDynamicModuleResult struct {
 // 与静态模块相比，动态模块的特殊之处：
 //   - panic 不会导致进程退出，仅记录日志（onStartModule 的 dynamic=true 参数控制）
 //   - 支持通过 RemoveDynamicModule 单独卸载，不影响其他模块
-//   - 模块按传入顺序依次初始化，任一失败不会中止后续模块的初始化尝试
-//     （已成功初始化的模块不会因后面某个模块失败而回滚）
+//   - 模块按 Priority 升序初始化，同优先级时保留传入 mods 的参数顺序（稳定排序），
+//     任一失败不会中止后续模块的初始化尝试（已成功初始化的模块不会因后面某个模块失败而回滚）
 //
 // 返回值为每个非 nil 模块的处理结果列表，调用方可据此精确判断哪些模块
 // 成功、哪些失败及失败原因；若全部成功，err 为 nil，否则 err 汇总了
 // 所有失败模块的名称，便于快速定位问题而无需遍历 results。
 func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err error) {
 	var failedNames []string
-
+	var wrappers []*moduleWrapper
 	for _, mod := range mods {
 		if mod == nil {
 			continue
 		}
-		wrapper := newModuleWrapper(mod)
-		name := wrapper.Name()
+		wrapper := &moduleWrapper{
+			IModule: mod,
+		}
+		wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
+		wrappers = append(wrappers, wrapper)
+	}
 
+	// 动态模块同样按 Priority 稳定排序：同优先级时保留传入顺序，
+	// 使调用方仍可通过参数顺序表达同优先级模块间的依赖关系（与 start 的排序规则一致，
+	// 不同优先级之间会重新排序，只有同优先级组内部不被打乱，示例见 start 中的注释）。
+	slices.SortStableFunc(wrappers, func(i, j *moduleWrapper) int {
+		return cmp.Compare(i.Priority(), j.Priority())
+	})
+	for _, wrapper := range wrappers {
 		if initErr := wrapper.OnInit(); initErr != nil {
-			slog.Error("module init error", "module", name, "err", initErr)
-			results = append(results, AddDynamicModuleResult{Name: name, Err: initErr})
-			failedNames = append(failedNames, name)
+			slog.Error("module init error", slog.String("module", wrapper.Name()), slog.Any("error", initErr))
+			results = append(results, AddDynamicModuleResult{Name: wrapper.Name(), Err: initErr})
+			failedNames = append(failedNames, wrapper.Name())
 			continue
 		}
-
 		wrapper.wg.Add(1)
-		go a.serveModule(wrapper, true) // dynamic=true：panic 不会退出进程
+		go a.serveModule(wrapper, true) // dynamic=true：panic 不退出进程
 		<-wrapper.Ready()               // 等待事件循环就绪后再存入，保证 ChanRPC 可接收
-		a.dynamicModules.Store(name, wrapper)
-		results = append(results, AddDynamicModuleResult{Name: name})
+		// 记录添加序号：sync.Map.Range 不保证遍历顺序，removeAllDynamicModules
+		// 靠这个单调递增序号在同优先级内重建真实的添加顺序，见 moduleWrapper.seq 的说明。
+		wrapper.seq = a.dynSeq.Add(1)
+		a.dynamicModules.Store(wrapper.Name(), wrapper)
+		results = append(results, AddDynamicModuleResult{Name: wrapper.Name()})
 	}
 
 	if len(failedNames) > 0 {
@@ -597,21 +654,38 @@ func (a *app) RemoveDynamicModule(name string) bool {
 	return true
 }
 
-// removeAllDynamicModules 收集所有动态模块名称后逐一移除。
+// removeAllDynamicModules 按优先级倒序关闭所有动态模块。
 //
-// 先收集名称快照再逐一移除，而非在 Range 回调中直接移除：
+// 先收集快照再逐一移除，而非在 Range 回调中直接移除：
 // sync.Map 的文档说明 Range 期间调用 Delete 是安全的，但先收集快照能使逻辑更清晰，
 // 且避免在 Range 内部嵌套 RemoveDynamicModule（其中包含 wg.Wait）可能引发的潜在问题。
+//
+// 排序规则与 AddDynamicModules 的初始化顺序保持一致：优先级升序，同优先级按
+// 添加序号（moduleWrapper.seq）升序——不能用 sync.Map.Range 收集到的切片顺序
+// 直接当作添加顺序，Range 明确不保证遍历顺序；也不能像静态模块那样退化为按
+// 名称排序，那样会与"同优先级按添加顺序表达依赖关系"的约定脱节。不同优先级
+// 之间同样会被重新排序，只有同优先级组内部保留添加顺序，示例见 start 中的注释。
+// 倒序遍历即得到与初始化相反的关闭顺序：后添加的模块先关闭，与静态模块的
+// LIFO 停机语义保持一致，避免动态模块间的依赖关系在关闭阶段被打破。
 func (a *app) removeAllDynamicModules() {
-	var moduleNames []string
+	var wrappers []*moduleWrapper
 
 	a.dynamicModules.Range(func(key, value any) bool {
-		moduleNames = append(moduleNames, key.(string))
+		if wrapper, ok := value.(*moduleWrapper); ok {
+			wrappers = append(wrappers, wrapper)
+		}
 		return true
 	})
 
-	for _, name := range moduleNames {
-		a.RemoveDynamicModule(name)
+	slices.SortStableFunc(wrappers, func(i, j *moduleWrapper) int {
+		if n := cmp.Compare(i.Priority(), j.Priority()); n != 0 {
+			return n
+		}
+		return cmp.Compare(i.seq, j.seq)
+	})
+
+	for i := len(wrappers) - 1; i >= 0; i-- {
+		a.RemoveDynamicModule(wrappers[i].Name())
 	}
 }
 

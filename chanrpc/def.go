@@ -282,7 +282,7 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	// 返回 ErrAlreadyRet 而非静默 nil：延迟响应下回包在别的 goroutine 里发生，
 	// 调用方需要有办法知道自己这次回包没送出去。
 	if !ci.hasRet.CompareAndSwap(false, true) {
-		slog.Warn("chanrpc can not ret twice", "id", ci.ID(), "stack", string(debug.Stack()))
+		slog.Warn("chanrpc can not ret twice", slog.Any("id", ci.ID()), slog.String("stack", string(debug.Stack())))
 		return ErrAlreadyRet
 	}
 
@@ -291,7 +291,7 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
-			slog.Error("chanrpc ret error", "id", ci.ID(), "err", err, "stack", string(debug.Stack()))
+			slog.Error("chanrpc ret error", slog.Any("id", ci.ID()), slog.Any("error", err), slog.String("stack", string(debug.Stack())))
 		}
 	}()
 

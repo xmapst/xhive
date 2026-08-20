@@ -91,7 +91,7 @@ func NewPonger() *Ponger {
 func (m *Ponger) OnInit() error {
 	return m.RegisterChanRPC(&PingReq{}, func(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
 		req := ci.Request.(*PingReq)
-		slog.Info("ponger received ping", "seq", req.Seq)
+		slog.Info("ponger received ping", slog.Int("seq", req.Seq))
 		return &chanrpc.RetInfo{Ack: &PongAck{Seq: req.Seq}}
 	})
 }
@@ -113,11 +113,11 @@ func (m *Pinger) OnInit() error {
 		seq := m.seq
 		_ = m.AsyncCall("ponger", &PingReq{Seq: seq}, func(ri *chanrpc.RetInfo) {
 			if ri.Err != nil {
-				slog.Error("ping failed", "err", ri.Err)
+				slog.Error("ping failed", slog.Any("error", ri.Err))
 				return
 			}
 			ack := ri.Ack.(*PongAck)
-			slog.Info("pinger received pong", "seq", ack.Seq)
+			slog.Info("pinger received pong", slog.Int("seq", ack.Seq))
 		})
 	})
 	m.NewTimer("tick", time.Second, timer.WithTicker())

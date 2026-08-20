@@ -125,10 +125,10 @@ func (s *Server) Register(message any, f Handler) error {
 	}
 
 	if _, ok := s.functions[id]; ok {
-		slog.Error("duplicate message", "id", id, "type", reflect.TypeOf(message))
+		slog.Error("duplicate message", slog.Any("id", id), slog.Any("type", reflect.TypeOf(message)))
 		return fmt.Errorf("chanrpc register: id=%d type=%v already registered", id, reflect.TypeOf(message))
 	}
-	slog.Info("chanrpc register", "id", id)
+	slog.Info("chanrpc register", slog.Any("id", id))
 	s.functions[id] = f
 	return nil
 }
@@ -163,7 +163,7 @@ func (s *Server) exec(ci *CallInfo) (err error) {
 			} else {
 				err = fmt.Errorf("panic: %v", r)
 			}
-			slog.Error("chanrpc exec panic", "id", ci.ID(), "err", err, "stack", string(debug.Stack()))
+			slog.Error("chanrpc exec panic", slog.Any("id", ci.ID()), slog.Any("error", err), slog.String("stack", string(debug.Stack())))
 		}
 		if (panicked || !ci.held.Load()) && !ci.hasRet.Load() {
 			_ = ci.ret(&RetInfo{Err: err})
@@ -199,7 +199,7 @@ func (s *Server) Exec(ci *CallInfo) {
 	ci.hasRet.Store(false)
 	ci.held.Store(false)
 	if err := s.exec(ci); err != nil {
-		slog.Warn("error", "err", err)
+		slog.Warn("chanrpc exec failed", slog.Any("error", err))
 	}
 }
 
@@ -266,7 +266,7 @@ drain:
 		return
 	}
 	slog.Error("chanrpc server close drain timeout, dropping remaining self-cast chain",
-		"remaining_pending", s.pending.Load())
+		slog.Int64("remaining_pending", s.pending.Load()))
 	// chanCall 内部的转发 goroutine 在 In() 关闭后，会尝试把环形缓冲区里
 	// 剩下的值全部送进 Out()；这里已经没人再读 Out() 了，若不主动接手，
 	// 那次 send 会因为没有接收方而永久阻塞，泄漏该 goroutine。起一个只管
