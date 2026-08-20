@@ -65,7 +65,7 @@ type dispatcher struct {
 	atomicID       atomic.Int64                           // 定时器唯一 ID 生成器
 	timerSlots     [timerLevel]map[int64]*dispatcherTimer // 分级时间轮槽位，每级对应不同的时间区间
 	chanOp         *chanx.Unbounded[*dispatcherTimer]     // 操作串行化通道，确保时间轮数据的单线程访问
-	chanFired      *chanx.Unbounded[Event]                // 定时器到期通知通道，由调用方（Mgr）消费
+	chanFired      *chanx.Unbounded[Event]                // 定时器到期通知通道，由调用方（Manager）消费
 	canceledTimers sync.Map                               // 已取消定时器的快速过滤集合，key 为 timerID
 }
 

@@ -12,7 +12,7 @@ import (
 	"github.com/xmapst/xhive/xtime"
 )
 
-// IRPC 定义跨模块 RPC 调用的接口，提供三种调用语义覆盖不同并发场景。
+// IRPC 定义跨模块 RPC 调用的接口，提供四种调用语义覆盖不同并发场景。
 //
 // 调用模式对比：
 //   - Cast：单向投递，无响应，吞吐最高，适合通知/事件
@@ -72,7 +72,7 @@ type Skeleton struct {
 
 const timerKindDumpStat = "TimerKindDumpStat"
 
-// SkeletonOption 用于自定义 Skeleton 内部各组件的缓冲区长度。
+// SkeletonOption 用于自定义 Skeleton 内部各组件的队列初始容量与停机超时。
 type SkeletonOption func(*skeletonOptions)
 
 type skeletonOptions struct {
@@ -204,7 +204,7 @@ func (s *Skeleton) Priority() uint {
 //
 // 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
 //  1. ctx.Done()：接收框架的停止信号，触发模块关闭流程
-//  2. timer.Event()：处理到期的定时器事件（执行注册的 TimerHandler，并自动续期 Ticker）
+//  2. timer.Event()：处理到期的定时器事件（执行注册的 timer.Handler，并自动续期 Ticker）
 //  3. client.Event()：处理本模块发起的异步 RPC 调用返回结果（执行注册的 Callback）
 //  4. server.Event()：处理其他模块发来的 RPC 调用请求（查找并执行已注册的 Handler）
 //
@@ -272,10 +272,10 @@ func (s *Skeleton) Close() error {
 	return nil
 }
 
-// scheduleDumpTimer 计算下一个整点触发时刻并创建一次性定时器，
+// scheduleDumpTimer 计算下一个 15 分钟刻度的触发时刻并创建一次性定时器，
 // 附加 30s~60s 的随机抖动以错峰，避免大量模块在同一时刻集中 dump 造成日志/CPU 尖峰。
 func (s *Skeleton) scheduleDumpTimer() {
-	// 每整点执行：以当天 0 点为基准，累加整点直到超过当前时刻
+	// 每 15 分钟执行：以当天 0 点为基准，累加 15 分钟直到超过当前时刻
 	now := xtime.Now()
 	next := s.startOfDay(now)
 	for !next.After(now) {
@@ -287,7 +287,7 @@ func (s *Skeleton) scheduleDumpTimer() {
 }
 
 // startOfDay 返回给定时刻所在自然日的零点（00:00:00），
-// 作为 scheduleDumpTimer 逐小时推算下一个整点触发时刻的基准。
+// 作为 scheduleDumpTimer 逐段推算下一个 15 分钟刻度的基准。
 // 命名从原先的 dayStart 调整为 startOfDay，更符合 Go 命名习惯（动词在前），
 // 且与其"返回一天起始时刻"的语义保持一致，避免与"某种起始日"产生歧义。
 func (s *Skeleton) startOfDay(now time.Time) time.Time {

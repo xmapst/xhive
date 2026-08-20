@@ -572,7 +572,7 @@ type AddDynamicModuleResult struct {
 // AddDynamicModules 在运行时动态添加并启动一批模块，支持热加载。
 //
 // 与静态模块相比，动态模块的特殊之处：
-//   - panic 不会导致进程退出，仅记录日志（onStartModule 的 dynamic=true 参数控制）
+//   - panic 不会导致进程退出，仅记录日志（serveModule 的 dynamic=true 参数控制）
 //   - 支持通过 RemoveDynamicModule 单独卸载，不影响其他模块
 //   - 模块按 Priority 升序初始化，同优先级时保留传入 mods 的参数顺序（稳定排序），
 //     任一失败不会中止后续模块的初始化尝试（已成功初始化的模块不会因后面某个模块失败而回滚）
