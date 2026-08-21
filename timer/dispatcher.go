@@ -17,9 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+	
 	"github.com/xmapst/xhive/chanx"
-	"github.com/xmapst/xhive/xtime"
 )
 
 // 时间轮配置常量。
@@ -139,7 +138,7 @@ func (disp *dispatcher) run() {
 		}
 	}()
 
-	lastTick := xtime.Now().UnixNano() / int64(timerTick)
+	lastTick := time.Now().UnixNano() / int64(timerTick)
 	tickTimer := time.NewTimer(timerTick)
 	for {
 		select {
@@ -149,7 +148,7 @@ func (disp *dispatcher) run() {
 			}
 		case <-tickTimer.C:
 			tickTimer.Reset(timerTick)
-			lastTick = disp.doTick(xtime.Now(), lastTick)
+			lastTick = disp.doTick(time.Now(), lastTick)
 		}
 	}
 }
@@ -231,7 +230,7 @@ func (disp *dispatcher) place(t *dispatcherTimer) {
 		return
 	}
 
-	diff := t.deadline.Sub(xtime.Now())
+	diff := t.deadline.Sub(time.Now())
 	if diff <= 0 {
 		// 已到期，直接投递到触发队列。
 		disp.chanFired.In() <- t

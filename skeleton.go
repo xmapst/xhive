@@ -5,11 +5,10 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"time"
-
+	
 	"github.com/xmapst/xhive/chanrpc"
 	"github.com/xmapst/xhive/stat"
 	"github.com/xmapst/xhive/timer"
-	"github.com/xmapst/xhive/xtime"
 )
 
 // IRPC 定义跨模块 RPC 调用的接口，提供四种调用语义覆盖不同并发场景。
@@ -231,17 +230,17 @@ func (s *Skeleton) Serve(ctx context.Context) {
 			slog.Info("skeleton stopped", slog.String("name", s.name))
 			return
 		case t := <-s.timer.Event():
-			startUs := xtime.Now().UnixMicro()
+			startUs := time.Now().UnixMicro()
 			t.Callback()
-			s.recordStat(t.Name(), xtime.Now().UnixMicro()-startUs)
+			s.recordStat(t.Name(), time.Now().UnixMicro()-startUs)
 		case ri := <-s.client.Event():
-			startUs := xtime.Now().UnixMicro()
+			startUs := time.Now().UnixMicro()
 			s.client.AsyncCallback(ri)
-			s.recordStat(ri.ID(), xtime.Now().UnixMicro()-startUs)
+			s.recordStat(ri.ID(), time.Now().UnixMicro()-startUs)
 		case ci := <-s.server.Event():
-			startUs := xtime.Now().UnixMicro()
+			startUs := time.Now().UnixMicro()
 			s.server.Exec(ci)
-			s.recordStat(ci.ID(), xtime.Now().UnixMicro()-startUs)
+			s.recordStat(ci.ID(), time.Now().UnixMicro()-startUs)
 		}
 	}
 }
@@ -276,7 +275,7 @@ func (s *Skeleton) Close() error {
 // 附加 30s~60s 的随机抖动以错峰，避免大量模块在同一时刻集中 dump 造成日志/CPU 尖峰。
 func (s *Skeleton) scheduleDumpTimer() {
 	// 每 15 分钟执行：以当天 0 点为基准，累加 15 分钟直到超过当前时刻
-	now := xtime.Now()
+	now := time.Now()
 	next := s.startOfDay(now)
 	for !next.After(now) {
 		next = next.Add(15 * time.Minute)

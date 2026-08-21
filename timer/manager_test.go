@@ -4,8 +4,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/xmapst/xhive/xtime"
 )
 
 func TestManagerNewValidationFindAndMetadataRange(t *testing.T) {
@@ -251,48 +249,4 @@ func TestManagerMissingTimerErrorsAndNoops(t *testing.T) {
 	}
 	tm.Update(123456, time.Now())
 	tm.Cancel(123456)
-}
-
-// TestManagerKeepsFiringAfterBusinessClockRewind 走完整链路复现时间平移的典型序列：
-// 把业务时间前跳一天验证跨天，再调回来。
-//
-// 时间轮的推进基准取自 xtime.Now()（业务时间），一旦基准停在未来不肯回退，
-// 调回来之后整个进程的定时器会停摆到墙上时钟走满一天为止。
-// 这条用例从 Manager 这一层把它钉死，比只测 doTick 更贴近真实故障。
-func TestManagerKeepsFiringAfterBusinessClockRewind(t *testing.T) {
-	xtime.SetShiftEnabled(true)
-	xtime.ClearShift()
-	t.Cleanup(func() { xtime.ClearShift(); xtime.SetShiftEnabled(false) })
-
-	var fired atomic.Int32
-	tm := NewManager(64)
-	tm.Register("probe", func(int64, map[string]string) { fired.Add(1) })
-	tm.Run()
-	t.Cleanup(tm.Stop)
-	go func() {
-		for e := range tm.Event() {
-			e.Callback()
-		}
-	}()
-
-	waitFire := func(what string) {
-		t.Helper()
-		fired.Store(0)
-		tm.New("probe", 100*time.Millisecond)
-		deadline := time.Now().Add(5 * time.Second)
-		for fired.Load() == 0 {
-			if time.Now().After(deadline) {
-				t.Fatalf("%s: timer did not fire within 5s — the wheel is stalled", what)
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
-	}
-
-	waitFire("baseline")
-
-	xtime.SetShift(24 * time.Hour) // 模拟手动时间平移：前跳一天
-	waitFire("after jumping one day forward")
-
-	xtime.ClearShift() // 模拟手动时间平移：调回来——旧实现从这里开始停摆整整一天
-	waitFire("after rewinding back to wall clock")
 }

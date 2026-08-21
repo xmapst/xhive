@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/xmapst/xhive/xtime"
 )
 
 const (
@@ -138,7 +136,7 @@ func (tm *Manager) commonCb(timerID int64) {
 		slog.Warn("delay timer not found", slog.Int64("timer_id", timerID))
 		return
 	}
-	if xtime.Now().Before(t.deadline) {
+	if time.Now().Before(t.deadline) {
 		slog.Error("delay timer deadline bigger than now")
 	}
 	f, ok := tm.handlers[t.name]
@@ -207,7 +205,7 @@ func (tm *Manager) New(name string, d time.Duration, opts ...Option) int64 {
 		slog.Error("new timer id already exists", slog.Int64("timer_id", o.id))
 		return 0
 	}
-	startAt := xtime.Now()
+	startAt := time.Now()
 	deadline := startAt.Add(d)
 	id := tm.dispatcher.New(name, o.id, deadline, tm.commonCb)
 	tm.timers[id] = &Timer{
@@ -246,7 +244,7 @@ func adjustPct(remain time.Duration, pct int64, acc bool) (time.Duration, error)
 
 // reschedule 按 newRemain 重设定时器到期时刻，统一供四个加速/延迟方法复用。
 func (tm *Manager) reschedule(id int64, calc func(remain time.Duration) (time.Duration, error), what string) error {
-	now := xtime.Now()
+	now := time.Now()
 	t := tm.timers[id]
 	if t == nil {
 		return fmt.Errorf("%s timer failed, timer %v not found", what, id)
