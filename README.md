@@ -289,13 +289,11 @@ id := m.NewTimer("reborn", 5*time.Second, timer.WithMetadata(map[string]string{"
 
 m.AccAbsTimer(id, time.Second)
 m.DelayPctTimer(id, 2000)
-m.UpdateTimer(id, xtime.Now().Add(time.Minute))
+m.UpdateTimer(id, time.Now().Add(time.Minute))
 m.CancelTimer(id)
 
 m.NewTimer("heartbeat", time.Second, timer.WithTicker())
 ```
-
-示例中的 `xtime.Now()` 不是笔误：`UpdateTimer` 收的是绝对业务时刻，而定时器判定到期用的是 `xtime` 这个全进程统一时间源，混用 `time.Now()` 在开启时间平移后会与时间轮跑在两根时间轴上。
 
 百分比调整使用万分比，`timer.PctBase` 为 `10000`：
 
@@ -457,11 +455,8 @@ xhive/
 ├── timer/
 │   ├── dispatcher.go   # 多级时间轮调度器
 │   └── manager.go      # 业务层 Timer API
-├── stat/
-│   └── tpstat.go       # TP 分位耗时统计
-└── xtime/
-    ├── clock.go        # 统一时间源，支持时间平移
-    └── calendar.go     # 自然日/周边界与毫秒时间戳换算
+└── stat/
+    └── tpstat.go       # TP 分位耗时统计
 ```
 
 ---
@@ -501,7 +496,6 @@ go test -race ./...
 - chanx：FIFO、关闭 drain、context cancel、ring 扩容收缩、Len 和 BufLen。
 - timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、Manager one-shot 和 ticker。
 - stat：分位统计、TopN、Reset、零值 key 忽略、并发 Add 和 Dump。
-- xtime：时间偏移开关、`Now` 与 `Wall` 的区别、UTC 保证、自然日/周边界和毫秒换算。
 
 ---
 
