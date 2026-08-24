@@ -684,8 +684,8 @@ func (a *app) removeAllDynamicModules() {
 		return cmp.Compare(i.seq, j.seq)
 	})
 
-	for i := len(wrappers) - 1; i >= 0; i-- {
-		a.RemoveDynamicModule(wrappers[i].Name())
+	for _, wrapper := range slices.Backward(wrappers) {
+		a.RemoveDynamicModule(wrapper.Name())
 	}
 }
 
