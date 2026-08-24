@@ -154,7 +154,7 @@ func TestSkeletonTimerWrappersAndStat(t *testing.T) {
 		waitClosed(t, done, time.Second)
 	}()
 
-	client := chanrpc.NewClient(chanrpc.WithClientInitialCapacity(4))
+	client := chanrpc.NewClient(chanrpc.WithClientChanLen(4))
 	run := func(fn func()) {
 		t.Helper()
 		if ret := client.Call(s.ChanRPC(), runReq{fn: fn}); ret.Err != nil {

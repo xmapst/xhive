@@ -20,7 +20,6 @@
   - [Skeleton](#skeleton)
   - [ChanRPC](#chanrpc)
   - [Timer](#timer)
-  - [chanx](#chanx)
   - [Signal](#signal)
   - [TPStats](#tpstats)
 - [应用生命周期](#应用生命周期)
@@ -40,7 +39,7 @@
 | Actor 模型 | 每个模块单 goroutine 串行处理事件，降低锁竞争和数据竞争风险。 |
 | 模块化生命周期 | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序），并严格逆序关闭；动态模块支持运行时加载和卸载。 |
 | ChanRPC | 进程内 RPC，支持 Cast、AsyncCall、Call、CallWithContext 四种调用语义。 |
-| 无界队列 | RPC、异步返回和定时器事件基于 FIFO 无界队列，支持自动扩容、收缩和积压观测。 |
+| 有界队列 | RPC、异步返回和定时器事件均使用有界的标准 channel：过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM。 |
 | 多级时间轮定时器 | 最小粒度 64ms，支持 Timer、Ticker、加速、延迟、改期和取消。 |
 | 时间跳变保护 | 系统时间回退时内部 tick 基准跟随回退，避免定时器停摆（重扫幂等，不会重复触发）；系统时间跳到未来时逐 tick 推进到当前时间，不跳过中间层级的降级。 |
 | 信号管理 | 默认处理 SIGINT/SIGTERM 优雅关闭；业务可注册 SIGHUP 等非保留信号。 |
@@ -209,14 +208,24 @@ type IModule interface {
 
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WithTimerChanLen(n)` | 1024 | 定时器事件队列初始容量。 |
-| `WithServerChanLen(n)` | 4096 | ChanRPC 服务端队列初始容量。 |
-| `WithClientChanLen(n)` | 4096 | ChanRPC 客户端异步返回队列初始容量。 |
+| `WithTimerChanLen(n)` | 1024 | 定时器操作队列与到期队列容量。 |
+| `WithServerChanLen(n)` | 4096 | ChanRPC 服务端队列容量。 |
+| `WithClientChanLen(n)` | 4096 | ChanRPC 客户端异步返回队列容量。 |
 | `WithStatCap(n)` | 8192 | 每类消息用于分位统计的最大采样数。 |
 | `WithCloseDrainTimeout(d)` | 30s | 停机时 ChanRPC 服务端排空自投递链条的超时上限，超时后放弃剩余部分直接完成关闭。 |
 | `WithClientCloseTimeout(d)` | 5s | 停机时 ChanRPC 客户端等待未处理异步回调排空的超时上限，超时后放弃剩余回调。 |
 
-前三项是无界队列的初始容量提示，不是硬性上限；`WithStatCap(n)` 是硬上限，单个 key 采样数达到 n 后新样本不再计入分位统计。
+前三项都是**硬性上限**。队列打满时的行为：
+
+| 队列 | 打满时 |
+| --- | --- |
+| 服务端调用队列 | `Cast` / `AsyncCall` 立即失败返回 `ErrChanFull`；`Call` / `CallWithContext` 阻塞等待空位（每 5s 打一条 warn，可由 `ctx` 取消）。 |
+| 客户端异步返回队列 | 服务端回包被丢弃并打 error 日志，对应回调不会执行，`pendingAsyncCall` 同步回滚。 |
+| 定时器到期队列 | 到期定时器留在时间轮第 0 层，后续 tick 持续重试投递，**不丢定时器**，只是通知延迟。 |
+
+`WithStatCap(n)` 同样是硬上限，单个 key 采样数达到 n 后新样本不再计入分位统计。
+
+配合 `ChanRPC(name).Len()` 与 `Cap()` 做水位告警，在真正打满之前就能发现问题。
 
 ### ChanRPC
 
@@ -299,19 +308,6 @@ m.NewTimer("heartbeat", time.Second, timer.WithTicker())
 
 - `AccPctTimer(id, 2000)` 表示剩余时间缩短 20%。
 - `DelayPctTimer(id, 2000)` 表示剩余时间延长 20%。
-
-### chanx
-
-`chanx.Unbounded[T]` 是 FIFO 无界队列。
-
-关键语义：
-
-- `In()` 返回发送端，正常运行期间发送不会因容量不足而阻塞。
-- `Out()` 返回接收端，按发送顺序读取。
-- 内部 ring buffer 会按积压自动扩容；连续 8 次 `pop` 后占用率仍不高于 25% 才会容量减半，且不会低于创建时的初始容量。
-- `Close()` 关闭输入端，已缓冲数据会继续 drain 到输出端。
-- context 取消会让转发 goroutine 立即退出并关闭输出端。
-- `BufLen()` 只统计内部 ring buffer 的积压，`Len()` 还加上 `In`、`Out` 两个 channel 自身队列中的值；两者都是近似快照，适合监控，不适合严格业务判断。
 
 ### Signal
 
@@ -450,8 +446,6 @@ xhive/
 │   ├── def.go          # 消息 ID、CallInfo、RetInfo、CallOption、Hold/Replier
 │   ├── server.go       # ChanRPC 服务端
 │   └── client.go       # ChanRPC 客户端
-├── chanx/
-│   └── chanx.go        # 无界 FIFO 队列
 ├── timer/
 │   ├── dispatcher.go   # 多级时间轮调度器
 │   └── manager.go      # 业务层 Timer API
@@ -492,9 +486,8 @@ go test -race ./...
 - app / module：静态与动态模块生命周期、状态流转、启动失败、优先级排序和 LIFO 逆序关闭。
 - skeleton：事件循环、RPC 包装、Timer 包装、统计记录和资源关闭。
 - signal：保留信号、自定义信号、并发分发和 panic 隔离。
-- chanrpc：消息 ID、注册校验、Cast、AsyncCall、Call、metadata、`Hold` 延迟响应、panic 恢复、关闭语义。
-- chanx：FIFO、关闭 drain、context cancel、ring 扩容收缩、Len 和 BufLen。
-- timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、Manager one-shot 和 ticker。
+- chanrpc：消息 ID、注册校验、Cast、AsyncCall、Call、metadata、`Hold` 延迟响应、panic 恢复、关闭语义、队列打满时的失败/阻塞/丢包与计数回滚。
+- timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、到期队列打满时的重试、Manager one-shot 和 ticker。
 - stat：分位统计、TopN、Reset、零值 key 忽略、并发 Add 和 Dump。
 
 ---
@@ -525,9 +518,13 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 时间被手动回退时，dispatcher 的内部基准 `lastTick` 跟着回退到当前 tick。重扫是幂等的：定时器在投递到期事件的同时就已从槽位删除，重扫扫不到已触发的定时器，只多花一点 CPU；反之若基准停在未来，后续每次 tick 都不会扫描任何层级，全进程定时器停摆。时间被手动后移到未来时，dispatcher 会从旧 tick 向当前 tick 逐步推进，到达当前时间后停止循环。
 
-### 无界队列是否意味着可以无限堆积？
+### 队列打满了会发生什么？
 
-不是。无界队列避免生产者被慢消费者卡死，但积压仍然会占用内存。生产环境应通过包级 `Stats()`（汇总各模块 RPC 服务端队列长度）或 `ChanRPC(name).Len()` 观测积压，并在业务层做限流、拆模块或告警；这些值都是近似快照，适合监控，不适合严格业务判断。
+队列全部有界，打满时的行为按调用语义区分（详见 [Skeleton](#skeleton) 一节的表格）：异步语义（`Cast`、`AsyncCall`）立即失败并返回 `ErrChanFull`，同步语义（`Call`、`CallWithContext`）阻塞等待空位形成背压，定时器到期事件则留在时间轮里下个 tick 重试、不丢失。
+
+这是刻意的取舍。早期版本使用无界队列，生产者永不阻塞、永不失败，代价是消费端一旦跟不上，积压只表现为内存一路上涨，最终以 OOM 的形式在离现场很远的地方崩掉，中途没有任何可告警的信号。有界队列把同一个问题在发生的那一刻就暴露成一个带消息类型和水位的错误。
+
+生产环境应通过包级 `Stats()`（汇总各模块 RPC 服务端队列长度）或 `ChanRPC(name).Len()` / `Cap()` 观测水位，在打满之前就限流、拆模块或告警。
 
 ### 模块的启动顺序怎么控制？
 

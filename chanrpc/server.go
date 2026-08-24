@@ -8,8 +8,6 @@ import (
 	"runtime/debug"
 	"sync/atomic"
 	"time"
-
-	"github.com/xmapst/xhive/chanx"
 )
 
 // defaultCloseDrainTimeout 是 Close 排空自投递链条的默认硬上限：防止
@@ -21,28 +19,38 @@ import (
 // 按 Server 覆盖。
 const defaultCloseDrainTimeout = 30 * time.Second
 
+// defaultChanLen 是 RPC 调用队列的默认容量，未显式指定 WithChanLen 时生效。
+//
+// 队列是**有界**的，这一点是刻意的：无界队列在消费端跟不上时只会一路把积压
+// 堆进内存，最终以 OOM 的形式在离现场很远的地方崩掉，且中途没有任何信号。
+// 有界队列把同一个问题在发生的那一刻就暴露出来——异步投递立刻失败（带消息
+// 类型和水位），同步调用阻塞等待空位形成背压。
+const defaultChanLen = 1024
+
 // serverOptions 保存 NewServer 的可选配置项。
 type serverOptions struct {
-	initCap           int // 0 表示未显式设置，透传给 chanx.WithInitialCapacity 时对 0 不生效，沿用 chanx 自己的默认值
+	chanLen           int
 	closeDrainTimeout time.Duration
 }
 
 func defaultServerOptions() serverOptions {
-	return serverOptions{closeDrainTimeout: defaultCloseDrainTimeout}
+	return serverOptions{chanLen: defaultChanLen, closeDrainTimeout: defaultCloseDrainTimeout}
 }
 
 // ServerOption 用于自定义 Server 的可选行为。
 type ServerOption func(*serverOptions)
 
-// WithInitialCapacity 自定义内部环形缓冲区的初始容量提示，用于减少高频
-// 场景下的反复扩容，不是硬性上限：队列会随积压自动增长，也会在消费
-// 跟上后自动收缩。如需对积压做主动告警或限流，请基于 Server.Len() 自行
-// 判断，不要依赖"发送失败"这个信号——它并不存在。n <= 0 时该选项不生效，
-// 沿用 chanx 包自己的默认值（16）。
-func WithInitialCapacity(n int) ServerOption {
+// WithChanLen 自定义 RPC 调用队列的容量，它是**硬性上限**而非容量提示：
+// 队列满之后 Cast/AsyncCall 立即返回 ErrChanFull，同步 Call 阻塞等待空位。
+//
+// 取值上的权衡：调得太小会让业务的正常突发被误判成过载，调得太大则推迟了
+// 过载的暴露时机、也占更多内存。建议按模块的稳态 QPS × 可容忍的排队时长
+// 估算，并配合 Len()/Cap() 做水位告警。n <= 0 时该选项不生效，沿用
+// defaultChanLen。
+func WithChanLen(n int) ServerOption {
 	return func(opts *serverOptions) {
 		if n > 0 {
-			opts.initCap = n
+			opts.chanLen = n
 		}
 	}
 }
@@ -59,18 +67,18 @@ func WithCloseDrainTimeout(d time.Duration) ServerOption {
 
 // Server ChanRPC 服务端，接收并处理来自 Client 的 RPC 调用。
 //
-// 每个模块持有一个 Server 实例，所有外部 RPC 调用通过无界队列排队，
+// 每个模块持有一个 Server 实例，所有外部 RPC 调用通过有界队列排队，
 // 在模块的事件循环（Skeleton.Serve）中通过 Server.Event() 串行出队处理，从而保证模块内部状态访问无并发竞争。
 //
 // 架构优势：消息路由通过 functions 哈希表实现 O(1) 查找，
 // 相比传统的 switch-case 分发，新增消息类型只需调用 Register 注册一次，扩展成本极低。
 type Server struct {
-	functions         map[uint32]Handler          // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
-	chanCall          *chanx.Unbounded[*CallInfo] // RPC 调用队列，发送方永不阻塞、永不失败
-	closing           atomic.Bool                 // Close 是否已经开始，只用于保证 Close 本身的幂等性
-	closed            atomic.Bool                 // 是否已经完全关闭（排空彻底完成），client.check 据此拒绝新调用
-	pending           atomic.Int64                // 已成功入队但还未 Exec 完成的调用数，Close 排空时的终止条件，见 Close 的说明
-	closeDrainTimeout time.Duration               // Close 排空的超时上限，见 WithCloseDrainTimeout
+	functions         map[uint32]Handler // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
+	chanCall          chan *CallInfo     // RPC 调用队列，有界；满时异步投递失败、同步调用阻塞等待
+	closing           atomic.Bool        // Close 是否已经开始，只用于保证 Close 本身的幂等性
+	closed            atomic.Bool        // 是否已经完全关闭（排空彻底完成），client.check 据此拒绝新调用
+	pending           atomic.Int64       // 已成功入队但还未 Exec 完成的调用数，Close 排空时的终止条件，见 Close 的说明
+	closeDrainTimeout time.Duration      // Close 排空的超时上限，见 WithCloseDrainTimeout
 }
 
 // NewServer 创建 ChanRPC 服务端，所有配置均可选，见各 WithXxx 选项。
@@ -84,8 +92,7 @@ func NewServer(opts ...ServerOption) *Server {
 
 	s := new(Server)
 	s.functions = map[uint32]Handler{}
-	s.chanCall = chanx.NewUnbounded[*CallInfo](context.Background(),
-		chanx.WithInitialCapacity(cfg.initCap))
+	s.chanCall = make(chan *CallInfo, cfg.chanLen)
 	s.closeDrainTimeout = cfg.closeDrainTimeout
 	return s
 }
@@ -98,12 +105,18 @@ func NewServer(opts ...ServerOption) *Server {
 // 依据；只取不 Exec 会让计数永久多出一次，使 Close 失去终止条件而永久
 // 阻塞在排空循环里。
 func (s *Server) Event() <-chan *CallInfo {
-	return s.chanCall.Out()
+	return s.chanCall
 }
 
-// Len 返回 RPC 调用队列的近似积压数量，用于监控和告警。
+// Len 返回 RPC 调用队列当前的积压数量，用于监控和告警。
 func (s *Server) Len() int64 {
-	return s.chanCall.Len()
+	return int64(len(s.chanCall))
+}
+
+// Cap 返回 RPC 调用队列的容量上限，与 Len 搭配即可算出水位（Len/Cap），
+// 用于在真正打满、开始丢消息之前就发出告警。
+func (s *Server) Cap() int64 {
+	return int64(cap(s.chanCall))
 }
 
 // Register 注册消息处理函数，通过传入 message 实例的类型自动推导消息名。
@@ -225,11 +238,10 @@ func (s *Server) IsClosed() bool {
 // 自投递），但按 xhive 的 LIFO 停机顺序，此刻不会再有别的模块向本模块
 // 投递新请求，所以这不会让排空永远停不下来。
 //
-// pending 由每次成功入队 +1（client.go 的 call）、每次 Exec 完成 -1
-// 配对维护，不依赖对内部转发 goroutine（chanx.Unbounded）任何时序假设：
-// 自投递用的是阻塞发送，Exec 里触发的自投递在 handler 返回前必定已经
-// 完成入队和计数，所以"pending 归零"就是确凿的"再也不会有新工作"，
-// 而不是对队列瞬时快照的轮询猜测。
+// pending 由每次入队前 +1（client.go 的 call，投递失败再回滚）、每次 Exec
+// 完成 -1 配对维护：Exec 里触发的自投递在 handler 返回前必定已经完成计数，
+// 所以"pending 归零"就是确凿的"再也不会有新工作"，而不是对队列瞬时快照的
+// 轮询猜测。
 //
 // 排空不是无条件等下去：closeDrainTimeout 兜底防止某个 handler 的自
 // 投递没有收敛条件而永远排不空，超时后放弃剩余部分、直接完成关闭。
@@ -248,7 +260,7 @@ func (s *Server) Close() {
 drain:
 	for s.pending.Load() > 0 {
 		select {
-		case ci, ok := <-s.chanCall.Out():
+		case ci, ok := <-s.chanCall:
 			if !ok {
 				break drain
 			}
@@ -260,19 +272,13 @@ drain:
 	}
 
 	s.closed.Store(true)
-	s.chanCall.Close()
+	// 关闭队列而不是只置 closed 标志：同步 Call 在队列满时是**阻塞**等待空位的，
+	// 若此刻恰好有调用方卡在那次发送上，只置标志它永远醒不过来；关闭会让那次
+	// 发送 panic，由 client.call 的 recover 转成错误返回给调用方。
+	close(s.chanCall)
 
-	if !timedOut {
-		return
+	if timedOut {
+		slog.Error("chanrpc server close drain timeout, dropping remaining self-cast chain",
+			slog.Int64("remaining_pending", s.pending.Load()))
 	}
-	slog.Error("chanrpc server close drain timeout, dropping remaining self-cast chain",
-		slog.Int64("remaining_pending", s.pending.Load()))
-	// chanCall 内部的转发 goroutine 在 In() 关闭后，会尝试把环形缓冲区里
-	// 剩下的值全部送进 Out()；这里已经没人再读 Out() 了，若不主动接手，
-	// 那次 send 会因为没有接收方而永久阻塞，泄漏该 goroutine。起一个只管
-	// 丢弃的消费者接住剩余部分，让它能正常退出。
-	go func() {
-		for range s.chanCall.Out() {
-		}
-	}()
 }

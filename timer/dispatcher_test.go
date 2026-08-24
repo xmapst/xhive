@@ -67,7 +67,7 @@ func TestDispatcherPlaceSelectsLevelsAndImmediateFires(t *testing.T) {
 
 	immediate := &dispatcherTimer{id: 1, name: "immediate", deadline: now.Add(-time.Millisecond), cb: func(int64) {}}
 	disp.place(immediate)
-	if ev := waitEvent(t, disp.chanFired.Out(), 100*time.Millisecond); ev.Name() != "immediate" {
+	if ev := waitEvent(t, disp.chanFired, 100*time.Millisecond); ev.Name() != "immediate" {
 		t.Fatalf("event name = %q, want immediate", ev.Name())
 	}
 
@@ -159,7 +159,7 @@ func TestDispatcherDoTickRebasesOnBackwardClockAndKeepsFiring(t *testing.T) {
 		cb: func(int64) { called.Add(1) }, canceled: &disp.canceledTimers})
 
 	disp.doTick(deadline, got)
-	ev := waitEvent(t, disp.chanFired.Out(), 100*time.Millisecond)
+	ev := waitEvent(t, disp.chanFired, 100*time.Millisecond)
 	if ev.Name() != "after-rewind" {
 		t.Fatalf("event name = %q, want after-rewind", ev.Name())
 	}
@@ -182,12 +182,12 @@ func TestDispatcherRescanDoesNotDoubleFire(t *testing.T) {
 
 	// 第一次推进：触发。
 	disp.doTick(deadline, baseTick)
-	ev := waitEvent(t, disp.chanFired.Out(), 100*time.Millisecond)
+	ev := waitEvent(t, disp.chanFired, 100*time.Millisecond)
 	ev.Callback()
 
 	// 把基准退回去，再把同一段区间重扫一遍：不应再有事件。
 	disp.doTick(deadline, baseTick)
-	assertNoEvent(t, disp.chanFired.Out(), 50*time.Millisecond)
+	assertNoEvent(t, disp.chanFired, 50*time.Millisecond)
 	if called.Load() != 1 {
 		t.Fatalf("callback count = %d, want 1 (rescan must not re-fire)", called.Load())
 	}
@@ -205,7 +205,7 @@ func TestDispatcherDoTickMovesForwardAndStopsAtCurrentTick(t *testing.T) {
 	if got != nowTick {
 		t.Fatalf("doTick returned %d, want %d", got, nowTick)
 	}
-	ev := waitEvent(t, disp.chanFired.Out(), 100*time.Millisecond)
+	ev := waitEvent(t, disp.chanFired, 100*time.Millisecond)
 	if ev.Name() != "due" {
 		t.Fatalf("event name = %q, want due", ev.Name())
 	}
@@ -213,7 +213,7 @@ func TestDispatcherDoTickMovesForwardAndStopsAtCurrentTick(t *testing.T) {
 	if called.Load() != 1 {
 		t.Fatalf("callback count = %d, want 1", called.Load())
 	}
-	assertNoEvent(t, disp.chanFired.Out(), 20*time.Millisecond)
+	assertNoEvent(t, disp.chanFired, 20*time.Millisecond)
 }
 
 func TestDispatcherNewFiresAndCallbackReceivesGeneratedID(t *testing.T) {
@@ -229,7 +229,7 @@ func TestDispatcherNewFiresAndCallbackReceivesGeneratedID(t *testing.T) {
 		t.Fatal("expected non-zero timer id")
 	}
 
-	ev := waitEvent(t, disp.chanFired.Out(), 300*time.Millisecond)
+	ev := waitEvent(t, disp.chanFired, 300*time.Millisecond)
 	if ev.Name() != "near" {
 		t.Fatalf("event name = %q, want near", ev.Name())
 	}
@@ -246,7 +246,7 @@ func TestDispatcherCancelBeforeCallbackSuppressesEvent(t *testing.T) {
 	timer := &dispatcherTimer{id: id, name: "cancel", deadline: time.Now().Add(-time.Millisecond), cb: func(int64) { called.Add(1) }, canceled: &disp.canceledTimers}
 	disp.place(timer)
 	disp.Cancel("cancel", id)
-	ev := waitEvent(t, disp.chanFired.Out(), 100*time.Millisecond)
+	ev := waitEvent(t, disp.chanFired, 100*time.Millisecond)
 	ev.Callback()
 	if got := called.Load(); got != 0 {
 		t.Fatalf("callback called %d times after cancel", got)
@@ -269,7 +269,7 @@ func TestDispatcherUpdateReplacesDeadlineAndCancelSuppresses(t *testing.T) {
 	disp.Update("update", id, time.Now().Add(150*time.Millisecond))
 	disp.Cancel("update", id)
 
-	assertNoEvent(t, disp.chanFired.Out(), 220*time.Millisecond)
+	assertNoEvent(t, disp.chanFired, 220*time.Millisecond)
 	if got := called.Load(); got != 0 {
 		t.Fatalf("callback called %d times after update/cancel chain", got)
 	}
@@ -294,12 +294,12 @@ func TestDispatcherSameIDReplacementOnlyNewCallbackRuns(t *testing.T) {
 		t.Fatalf("new timer id = %d, want %d", got, id)
 	}
 
-	ev := waitEvent(t, disp.chanFired.Out(), 300*time.Millisecond)
+	ev := waitEvent(t, disp.chanFired, 300*time.Millisecond)
 	if ev.Name() != "same-id-new" {
 		t.Fatalf("event name = %q, want same-id-new", ev.Name())
 	}
 	ev.Callback()
-	assertNoEvent(t, disp.chanFired.Out(), 80*time.Millisecond)
+	assertNoEvent(t, disp.chanFired, 80*time.Millisecond)
 	if got := oldCalled.Load(); got != 0 {
 		t.Fatalf("old callback called %d times, want 0", got)
 	}
@@ -321,5 +321,44 @@ func TestDispatcherDeleteRemovesOnlyOneTimer(t *testing.T) {
 	}
 	if countSlots(disp) != 1 {
 		t.Fatalf("slot count = %d, want 1", countSlots(disp))
+	}
+}
+
+// TestDispatcherFiredChannelFullKeepsTimer 验证到期队列打满时定时器不会被丢掉：
+// place 把它退回第 0 层，trigger 则留在原地不删除，等消费方腾出空位后照常送达。
+// 分发器主循环因此永远不会被消费方阻塞，同时又不以丢定时器为代价。
+func TestDispatcherFiredChannelFullKeepsTimer(t *testing.T) {
+	disp := newDispatcher(1)
+
+	// 先用一个已到期的定时器占满容量为 1 的到期队列。
+	first := &dispatcherTimer{id: 1, name: "first", deadline: time.Now().Add(-time.Millisecond), cb: func(int64) {}}
+	disp.place(first)
+	if got := len(disp.chanFired); got != 1 {
+		t.Fatalf("chanFired len = %d, want 1", got)
+	}
+
+	// 队列已满，第二个到期定时器应退回第 0 层而不是被丢弃。
+	second := &dispatcherTimer{id: 2, name: "second", deadline: time.Now().Add(-time.Millisecond), cb: func(int64) {}}
+	disp.place(second)
+	if _, ok := disp.timerSlots[0][second.id]; !ok {
+		t.Fatal("second timer should fall back to level 0 instead of being dropped")
+	}
+
+	// trigger 在队列仍满时同样不得删除槽位里的定时器。
+	disp.trigger(time.Now(), 0)
+	if _, ok := disp.timerSlots[0][second.id]; !ok {
+		t.Fatal("second timer should stay in slot while chanFired is full")
+	}
+
+	// 消费掉一条腾出空位后，下一次 trigger 应把它送出去。
+	if ev := waitEvent(t, disp.chanFired, 100*time.Millisecond); ev.Name() != "first" {
+		t.Fatalf("first event name = %q", ev.Name())
+	}
+	disp.trigger(time.Now(), 0)
+	if ev := waitEvent(t, disp.chanFired, 100*time.Millisecond); ev.Name() != "second" {
+		t.Fatalf("second event name = %q", ev.Name())
+	}
+	if got := countSlots(disp); got != 0 {
+		t.Fatalf("slots remaining = %d, want 0", got)
 	}
 }

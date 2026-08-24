@@ -10,8 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/xmapst/xhive/chanx"
 )
 
 // defaultClientCloseTimeout 是 Close 等待待处理异步回调排空的默认硬
@@ -19,40 +17,46 @@ import (
 // 覆盖。
 const defaultClientCloseTimeout = 5 * time.Second
 
+// defaultClientChanLen 是异步调用返回队列的默认容量，未显式指定
+// WithClientChanLen 时生效。与 Server 侧一样，这个队列是有界的：满了之后
+// 服务端的回包会被丢弃并记录日志，而不是无限堆积直到 OOM。
+const defaultClientChanLen = 1024
+
 // Client ChanRPC 客户端，向其他模块的 Server 发起 RPC 调用。
 //
 // 通过 pendingAsyncCall 原子计数器追踪所有未处理完毕的异步调用，
 // 在 Close 时等待计数归零，确保模块关闭前所有回调均已执行，防止业务状态不一致。
 // closed 标志在 CAS 语义下保证关闭操作的幂等性，防止关闭后再次发起调用。
 type Client struct {
-	chanAsyncRet     *chanx.Unbounded[*RetInfo] // 异步调用结果队列，发送方永不阻塞、永不失败
-	pendingAsyncCall atomic.Int64               // 当前尚未处理完毕的异步调用数量，原子操作保证并发安全
-	closed           atomic.Bool                // 关闭标志，防止关闭后继续发起新的调用
-	closeTimeout     time.Duration              // Close 排空 pending 异步回调的超时上限，见 WithClientCloseTimeout
+	chanAsyncRet     chan *RetInfo // 异步调用结果队列，有界；满时回包被丢弃，见 asyncRet.send
+	pendingAsyncCall atomic.Int64  // 当前尚未处理完毕的异步调用数量，原子操作保证并发安全
+	closed           atomic.Bool   // 关闭标志，防止关闭后继续发起新的调用
+	closeTimeout     time.Duration // Close 排空 pending 异步回调的超时上限，见 WithClientCloseTimeout
 }
 
 // clientOptions 保存 NewClient 的可选配置项。
 type clientOptions struct {
-	initCap      int // 0 表示未显式设置，透传给 chanx.WithInitialCapacity 时对 0 不生效，沿用 chanx 自己的默认值
+	chanLen      int
 	closeTimeout time.Duration
 }
 
 func defaultClientOptions() clientOptions {
-	return clientOptions{closeTimeout: defaultClientCloseTimeout}
+	return clientOptions{chanLen: defaultClientChanLen, closeTimeout: defaultClientCloseTimeout}
 }
 
 // ClientOption 用于自定义 Client 的可选行为。
 type ClientOption func(*clientOptions)
 
-// WithClientInitialCapacity 自定义内部环形缓冲区的初始容量提示，语义与
-// Server 的 WithInitialCapacity 一致：用于减少高频场景下的反复扩容，
-// 不是硬性上限。命名带 Client 前缀是为了跟 ServerOption 的同名选项在
-// 包级别不冲突——两者分别只用于 NewClient/NewServer，各自的调用点上
-// 语义都是清楚的。n <= 0 时该选项不生效，沿用 chanx 包自己的默认值（16）。
-func WithClientInitialCapacity(n int) ClientOption {
+// WithClientChanLen 自定义异步调用返回队列的容量，语义与 Server 的
+// WithChanLen 一致：硬性上限，不是容量提示。它应当不小于本模块可能同时
+// 在途的异步调用数，否则回包会在服务端被丢弃（见 asyncRet.send）。
+// 命名带 Client 前缀是为了跟 ServerOption 的同名选项在包级别不冲突——
+// 两者分别只用于 NewClient/NewServer，各自的调用点上语义都是清楚的。
+// n <= 0 时该选项不生效，沿用 defaultClientChanLen。
+func WithClientChanLen(n int) ClientOption {
 	return func(opts *clientOptions) {
 		if n > 0 {
-			opts.initCap = n
+			opts.chanLen = n
 		}
 	}
 }
@@ -80,8 +84,7 @@ func NewClient(opts ...ClientOption) *Client {
 	}
 
 	c := &Client{
-		chanAsyncRet: chanx.NewUnbounded[*RetInfo](context.Background(),
-			chanx.WithInitialCapacity(cfg.initCap)),
+		chanAsyncRet: make(chan *RetInfo, cfg.chanLen),
 		closeTimeout: cfg.closeTimeout,
 	}
 	return c
@@ -89,12 +92,17 @@ func NewClient(opts ...ClientOption) *Client {
 
 // Event 返回异步调用响应队列的只读接收端，供调用方事件循环消费。
 func (c *Client) Event() <-chan *RetInfo {
-	return c.chanAsyncRet.Out()
+	return c.chanAsyncRet
 }
 
-// Len 返回异步调用响应队列的近似积压数量，用于监控和告警。
+// Len 返回异步调用响应队列当前的积压数量，用于监控和告警。
 func (c *Client) Len() int64 {
-	return c.chanAsyncRet.Len()
+	return int64(len(c.chanAsyncRet))
+}
+
+// Cap 返回异步调用响应队列的容量上限，与 Len 搭配即可算出水位（Len/Cap）。
+func (c *Client) Cap() int64 {
+	return int64(cap(c.chanAsyncRet))
 }
 
 // IsClosed 检查客户端是否已关闭。
@@ -146,6 +154,10 @@ func (c *Client) Call(s *Server, request any, opts ...CallOption) *RetInfo {
 // 相比 Call 固定的"无限等待 + 周期告警"策略，CallWithContext 允许调用方
 // 通过 ctx（如 context.WithTimeout）主动放弃等待：ctx 被取消时立即返回
 // 携带 ctx.Err() 的 RetInfo，而不必永久阻塞在等待响应上。
+// ctx 同样覆盖**入队**这一段：队列满时同步调用是阻塞等待空位的（这正是有界
+// 队列提供的背压），ctx 取消可以让调用方从这段等待中脱身，而不是连队列都还
+// 没进去就卡死。
+//
 // 需要注意：ctx 取消只影响调用方的等待，不会取消 Server 端已经入队、
 // 正在处理的调用，对端处理完成后仍会尝试回包（届时 syncRet 已无人接收，
 // send 会返回 false，转化为 ErrRetDropped，属于预期行为）。
@@ -161,12 +173,12 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 	o := c.applyOpts(opts...)
 
 	chanRet := newSyncRet()
-	err = c.call(s, &CallInfo{
+	err = c.call(ctx, s, &CallInfo{
 		id:       id,
 		Request:  request,
 		chanRet:  chanRet,
 		metadata: o.metadata,
-	})
+	}, true)
 	if err != nil {
 		slog.Warn("chanrpc sync call failed", slog.Any("id", id), slog.Any("error", err))
 		return &RetInfo{Err: err}
@@ -192,6 +204,10 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 // 异步结果写入共享的 chanAsyncRet 队列，由调用方模块的事件循环通过 AsyncCallback 触发回调，
 // 保证回调在发起调用的 goroutine 中串行执行，无需为访问模块状态加锁。
 // pendingAsyncCall 计数在此加一，在 AsyncCallback 中减一，用于 Close 时的优雅等待。
+//
+// 投递是非阻塞的：对端队列已满时立即返回 ErrChanFull，不阻塞本模块的事件循环。
+// 这一点与同步 Call 相反——同步调用方本来就在等结果，多等一会儿入队是合理的；
+// 异步调用方还要继续处理别的消息，为一次投递把整个事件循环停下来得不偿失。
 func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...CallOption) error {
 	if callback == nil {
 		return ErrCallbackNil
@@ -204,25 +220,30 @@ func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...Ca
 	}
 	o := c.applyOpts(opts...)
 
-	err = c.call(s, &CallInfo{
+	// 计数必须在入队**之前**加：入队成功的那一刻，对端就可能已经处理完并回包，
+	// 而回包丢弃路径（asyncRet.send）会把计数减回来。先入队后加一存在一个窗口，
+	// 会让计数先减到 -1 再加回 0，Close 的排空判断据此提前收工。
+	c.pendingAsyncCall.Add(1)
+	err = c.call(context.Background(), s, &CallInfo{
 		id:       id,
 		Request:  request,
-		chanRet:  asyncRet{c.chanAsyncRet}, // 共享异步回调队列，回调由事件循环统一消费
+		chanRet:  asyncRet{c}, // 共享异步回调队列，回调由事件循环统一消费
 		callback: callback,
 		metadata: o.metadata,
-	})
+	}, false)
 	if err != nil {
+		c.pendingAsyncCall.Add(-1)
 		slog.Warn("chanrpc async call failed", slog.Any("id", id), slog.Any("error", err))
 		return err
 	}
 
-	c.pendingAsyncCall.Add(1)
 	return nil
 }
 
 // Cast 向指定 Server 单向投递消息，不等待响应，也不关心处理结果。
 //
 // 适用于日志上报、事件通知、统计埋点等无需确认的场景，开销最低。
+// 与 AsyncCall 一样是非阻塞投递：对端队列满时本次消息被丢弃并记录警告日志。
 // 与 AsyncCall 的本质区别：CallInfo 中 chanRet 和 callback 均为 nil，
 // Server 处理后直接丢弃结果，不产生任何回调开销。
 // 对 ErrServerNil 不打 warn 日志：允许对端模块尚未就绪时静默丢弃，避免大量误报。
@@ -236,12 +257,12 @@ func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
 	}
 	o := c.applyOpts(opts...)
 
-	err = c.call(s, &CallInfo{
+	err = c.call(context.Background(), s, &CallInfo{
 		id:       id,
 		Request:  request,
 		metadata: o.metadata,
 		// chanRet 和 callback 均为 nil，Server 端处理后不回包
-	})
+	}, false)
 	if err != nil {
 		slog.Warn("chanrpc cast failed", slog.Any("id", id), slog.Any("error", err))
 	}
@@ -280,10 +301,9 @@ func (c *Client) AsyncCallback(ri *RetInfo) {
 // 因某个回调永久阻塞或计数异常导致 Close 无法返回；超时后强制清零
 // pendingAsyncCall 并返回，可能丢失部分未执行的回调，会记录警告日志。
 //
-// 最后无条件关闭 chanAsyncRet：这一步是必须的——chanAsyncRet 内部有一个
-// 常驻转发 goroutine，只有显式 Close 才会让它退出，否则即使 Client 本身
-// 不再被引用，那个 goroutine 也会一直阻塞、造成泄漏（这是无界队列相比
-// 普通 channel 多出来的生命周期管理责任）。
+// chanAsyncRet 是普通的有界 channel，这里**不**关闭它：它没有需要唤醒的常驻
+// goroutine，Client 不再被引用后自然被 GC 回收；而关闭反而会让此刻仍在处理中、
+// 稍后才回包的服务端 goroutine 撞上“send on closed channel”。
 func (c *Client) Close() {
 	// CAS 保证 Close 的幂等性，重复调用安全
 	if !c.closed.CompareAndSwap(false, true) {
@@ -306,7 +326,7 @@ func (c *Client) Close() {
 				}
 
 				select {
-				case ret := <-c.chanAsyncRet.Out():
+				case ret := <-c.chanAsyncRet:
 					c.AsyncCallback(ret)
 				case <-timer.C:
 					// 超时后强制清零，避免 Close 永久阻塞，但可能丢失部分未处理的回调
@@ -321,8 +341,6 @@ func (c *Client) Close() {
 		wg.Wait()
 		slog.Info("chanrpc client closed successfully")
 	}
-
-	c.chanAsyncRet.Close()
 }
 
 // Idle 判断客户端是否处于空闲状态（无待处理的异步调用）。
@@ -339,23 +357,32 @@ func (c *Client) PendingCount() int64 {
 
 // call 将 CallInfo 投递到 Server 的调用队列。
 //
-// 入队成功后立即给 s.pending 加一：这是 Server.Close 判断排空是否真正
-// 见底的唯一依据，见 Server.Close 的说明。之所以传 *Server 而不是像早前
-// 那样直接传 chanCall，就是为了能在这里摸到 pending 这个计数——两者本
-// 该是同一件事的一体两面（“投给这个 Server 的队列”和“这个 Server 记一笔
-// 待办”），拆成两个参数反而会把这份配对关系暴露给调用方，让人误以为
-// 可以只做其中一半。
+// 入队前先给 s.pending 加一、失败再回滚：这是 Server.Close 判断排空是否真正
+// 见底的唯一依据，见 Server.Close 的说明。之所以传 *Server 而不是直接传
+// chanCall，就是为了能在这里摸到 pending 这个计数——两者本该是同一件事的
+// 一体两面（“投给这个 Server 的队列”和“这个 Server 记一笔待办”），拆成两个
+// 参数反而会把这份配对关系暴露给调用方，让人误以为可以只做其中一半。
 //
-// chanCall 是无界队列，In() 按设计永不阻塞、永不因队列满而失败；
-// 因此不再区分"阻塞模式"和"非阻塞模式"两条路径。
+// chanCall 是**有界**队列，block 决定队列满时的行为：
 //
-// panic 恢复：唯一的失败模式是向已关闭的队列投递（Server.Close 排空
-// 完成之后），通过 recover 捕获并转化为 error 返回；若 chanRet 非空，
-// 还会尝试向调用方回包错误，确保 Call 调用方不会永久阻塞在等待响应上。
-// 回包本身也用内层 recover 包裹，防止 retSink.send 自身 panic（例如
-// asyncRet 对应的 chanAsyncRet 也恰好已被关闭）导致这里发生二次 panic
-// 而无法恢复。
-func (c *Client) call(s *Server, ci *CallInfo) (err error) {
+//   - block=true（同步 Call）：阻塞等待空位，把积压变成调用方的等待——调用方
+//     本来就在等结果，让它多等一会儿入队，比丢掉这次调用更符合预期。等待期间
+//     每 5 秒打一条警告，并可由 ctx 取消。
+//   - block=false（AsyncCall / Cast）：立即返回 ErrChanFull。调用方还要继续
+//     处理自己的消息，不能为一次投递把整个事件循环停下来。
+//
+// 无论哪种模式都不会无声无息地堆积：这正是有界队列相对无界队列的意义——
+// 过载在发生的那一刻就变成一个可观测的错误或一次可观测的等待，而不是内存
+// 曲线一路上扬直到进程被 OOM 杀掉。
+//
+// panic 恢复：向已关闭的队列投递（Server.Close 之后）会 panic，通过 recover
+// 捕获并转化为 error 返回。
+//
+// 失败时**不**再往 ci.chanRet 补一个错误响应：三个入口（Call/AsyncCall/Cast）
+// 都直接消费 call 的返回值，那个补包是多余的；对异步调用它还有害——补进去的
+// RetInfo 会被事件循环当成一次正常回包消费掉，AsyncCallback 减一次
+// pendingAsyncCall，AsyncCall 自己在失败分支上又减一次，计数就被减穿了。
+func (c *Client) call(ctx context.Context, s *Server, ci *CallInfo, block bool) (err error) {
 	if s == nil {
 		return ErrServerNil
 	}
@@ -371,20 +398,49 @@ func (c *Client) call(s *Server, ci *CallInfo) (err error) {
 		reqType = reflect.TypeOf(ci.Request).String()
 	}
 
+	enqueued := false
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v\n%s", r, string(debug.Stack()))
 			slog.Warn("chanrpc call panic", slog.String("req_type", reqType), slog.Any("error", err))
-			if ci.chanRet != nil {
-				func() {
-					defer func() { _ = recover() }() // 防止 send 自身 panic 导致二次崩溃
-					ci.chanRet.send(&RetInfo{Err: err})
-				}()
-			}
+		}
+		if !enqueued {
+			s.pending.Add(-1) // 没进队列，把上面预加的那一笔撤销
 		}
 	}()
 
-	s.chanCall.In() <- ci
+	// 先加后投：入队成功的那一刻 Server 就可能已经取走并 Exec 完成（pending 减一），
+	// 若此时这边还没来得及加一，计数会先掉到 -1，Close 的排空循环据此提前收工。
 	s.pending.Add(1)
-	return nil
+
+	// 队列有空位时两种模式的行为完全一致，先走一次非阻塞尝试把这条共同的
+	// 快路径走完，免得为一个用不上的告警 ticker 付出分配与调度开销。
+	select {
+	case s.chanCall <- ci:
+		enqueued = true
+		return nil
+	default:
+	}
+
+	if !block {
+		return fmt.Errorf("%w: id=%d type=%s len=%d cap=%d",
+			ErrChanFull, ci.id, reqType, len(s.chanCall), cap(s.chanCall))
+	}
+
+	// 阻塞模式下仍然周期性告警：队列打满是个需要被看见的事故，
+	// 不能只表现为“某个模块莫名其妙卡住了”。
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case s.chanCall <- ci:
+			enqueued = true
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+			slog.Warn("chanrpc call blocked on full server channel",
+				slog.String("req_type", reqType), slog.Int("len", len(s.chanCall)), slog.Int("cap", cap(s.chanCall)))
+		}
+	}
 }

@@ -80,7 +80,8 @@ type Manager struct {
 	dispatcher *dispatcher        // 底层多级时间轮分发器
 }
 
-// NewManager 创建定时器管理器，参数 l 为底层分发器的通道容量。
+// NewManager 创建定时器管理器，参数 l 为底层分发器操作队列与到期队列的容量
+// （有界，硬上限）。
 func NewManager(l int) *Manager {
 	return &Manager{
 		timers:     make(map[int64]*Timer),
@@ -106,7 +107,7 @@ func (tm *Manager) Stop() {
 
 // Event 返回定时器触发通知通道，供模块事件循环（Skeleton.Serve）通过 select 监听。
 func (tm *Manager) Event() <-chan Event {
-	return tm.dispatcher.chanFired.Out()
+	return tm.dispatcher.chanFired
 }
 
 // Find 通过 ID 查询定时器业务层元数据，不存在时返回 nil。

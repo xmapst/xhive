@@ -10,8 +10,6 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
-
-	"github.com/xmapst/xhive/chanx"
 )
 
 // BKDRBytesHash 使用 BKDR 哈希算法计算字节序列的哈希值。
@@ -96,6 +94,13 @@ var (
 	ErrCallTimeout = errors.New("chanrpc: call timeout waiting for response")
 	// ErrRetDropped 表示响应未能投递给调用方。
 	ErrRetDropped = errors.New("chanrpc: ret dropped, caller already gone")
+	// ErrChanFull 表示目标队列已满，本次投递被拒绝。
+	//
+	// 队列有界是刻意的：无界队列在消费端跟不上时只会一路吃内存，最终以 OOM
+	// 的形式在离现场很远的地方崩掉；有界队列把同一个问题在发生的那一刻就变成
+	// 一个带消息类型和水位的错误，既能立即告警，也能让调用方自己决定重试、
+	// 降级还是丢弃。
+	ErrChanFull = errors.New("chanrpc: channel is full")
 	// ErrAlreadyRet 表示该次调用此前已经回过包，本次回包被丢弃。
 	//
 	// 之所以要把它暴露成错误而不是静默返回 nil：延迟响应场景下回包发生在
@@ -153,8 +158,12 @@ type Callback func(ri *RetInfo)
 // retSink 是 CallInfo 投递响应结果的目的地，屏蔽同步调用与异步调用在
 // 底层通道上的差异，使 CallInfo.Ret 无需关心自己面对的是哪一种。
 //
-// send 返回 false 表示响应未能投递（例如同步 Call 的一次性响应槽已满，
-// 或调用方不再有能力消费该响应），调用方应将其视为“已丢弃”而非“需要重试”。
+// 两种实现的 send 都是非阻塞的：回包路径跑在服务端的事件循环上，一旦它能被
+// 调用方的消费速度反向拖住，一个慢模块就足以让整个服务端停摆，甚至与调用方
+// 形成互等的死锁。因此这里宁可丢一次响应，也不让服务端阻塞。
+//
+// send 返回 false 表示响应未能投递（同步 Call 的一次性响应槽已满，或异步回包
+// 队列已满），调用方应将其视为“已丢弃”而非“需要重试”。
 type retSink interface {
 	send(ri *RetInfo) bool
 }
@@ -177,18 +186,28 @@ func (r syncRet) send(ri *RetInfo) bool {
 	}
 }
 
-// asyncRet 包装 Client 的异步返回队列，用于异步调用（AsyncCall）的响应投递。
+// asyncRet 指向发起调用的 Client，用于把异步调用（AsyncCall）的响应投递回
+// 它的返回队列。
 //
-// send 直接写入 chanx.Unbounded.In()：该操作按设计永不阻塞，唯一的失败
-// 模式是目标队列已被 Client.Close 关闭，此时会 panic，交由调用方
-// （CallInfo.Ret）的 recover 统一处理，因此这里总是返回 true。
+// send 非阻塞：队列满时丢弃本次响应，并把 pendingAsyncCall 减回来——该计数
+// 本应在 AsyncCallback 执行回调时才递减，响应既然已经丢了，回调永远不会执行，
+// 不在这里补上这一笔，Client.Close 就会一直等一个不会到来的回调，直到超时兜底
+// 才放弃。
+//
+// 之所以持有 *Client 而不是仅仅持有那个 channel：丢弃与计数回滚本来就是同一
+// 件事的两半，只拿到 channel 就没法把计数修回去。
 type asyncRet struct {
-	u *chanx.Unbounded[*RetInfo]
+	c *Client
 }
 
 func (r asyncRet) send(ri *RetInfo) bool {
-	r.u.In() <- ri
-	return true
+	select {
+	case r.c.chanAsyncRet <- ri:
+		return true
+	default:
+		r.c.pendingAsyncCall.Add(-1)
+		return false
+	}
 }
 
 // CallInfo 封装一次 RPC 调用的完整上下文信息。
@@ -269,8 +288,8 @@ func (ci *CallInfo) IsHeld() bool {
 //
 // 投递本身不会阻塞（retSink 的两种实现都不阻塞）：
 //   - syncRet 满/无人接收时返回 false，转化为 ErrRetDropped；
-//   - asyncRet 只有在目标队列已被 Client.Close 关闭时才会失败，
-//     表现为 panic，由下面的 recover 捕获并转化为 error。
+//   - asyncRet 在调用方的返回队列已满时返回 false，同样转化为 ErrRetDropped；
+//     若该队列此前已被关闭，则表现为 panic，由下面的 recover 捕获并转化为 error。
 //
 // 若 chanRet 为 nil（Cast 调用），直接返回 nil，不做任何操作。
 func (ci *CallInfo) ret(ri *RetInfo) (err error) {
@@ -312,6 +331,9 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	}
 
 	if !ci.chanRet.send(ri) {
+		// 丢包必须留痕：调用方那边只会表现为“回调没被执行”或“同步 Call 一直
+		// 等不到结果”，不在丢弃的这一刻打日志，现场就彻底没了。
+		slog.Error("chanrpc ret dropped", slog.Any("id", ci.ID()))
 		return fmt.Errorf("%w: id=%d", ErrRetDropped, ci.ID())
 	}
 	return nil

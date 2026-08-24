@@ -33,7 +33,7 @@ type testModule struct {
 func newTestModule(name string) *testModule {
 	return &testModule{
 		name:       name,
-		server:     chanrpc.NewServer(chanrpc.WithInitialCapacity(4)),
+		server:     chanrpc.NewServer(chanrpc.WithChanLen(4)),
 		runStarted: make(chan struct{}),
 		runStopped: make(chan struct{}),
 	}

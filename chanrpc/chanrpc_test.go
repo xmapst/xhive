@@ -1,6 +1,7 @@
 package chanrpc
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"testing"
@@ -65,7 +66,7 @@ func TestIDDefaultPointerAndCustom(t *testing.T) {
 }
 
 func TestServerRegisterValidationAndDuplicate(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
 	defer s.Close()
 
 	if err := s.Register(nil, func(*CallInfo) *RetInfo { return nil }); !errors.Is(err, ErrRegisterMsgNil) {
@@ -85,9 +86,9 @@ func TestServerRegisterValidationAndDuplicate(t *testing.T) {
 // TestClientCallExecAndMetadata 覆盖同步 Call 的完整链路：Client 投递、Server.Event 出队、Exec 路由处理、
 // RetInfo 回包以及 metadata 从请求透传到响应。
 func TestClientCallExecAndMetadata(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
 	defer s.Close()
-	c := NewClient(WithClientInitialCapacity(4))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	if err := s.Register(pingReq{}, func(ci *CallInfo) *RetInfo {
@@ -126,9 +127,9 @@ func TestClientCallExecAndMetadata(t *testing.T) {
 // TestClientAsyncCallCallbackAndPending 验证 AsyncCall 的 pending 计数和回调执行语义：响应先进入客户端事件队列，
 // 只有调用 AsyncCallback 后才真正执行业务 callback 并减少 pending。
 func TestClientAsyncCallCallbackAndPending(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
 	defer s.Close()
-	c := NewClient(WithClientInitialCapacity(4))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	if err := s.Register(pingReq{}, func(ci *CallInfo) *RetInfo {
@@ -167,9 +168,9 @@ func TestClientAsyncCallCallbackAndPending(t *testing.T) {
 }
 
 func TestClientCast(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
 	defer s.Close()
-	c := NewClient(WithClientInitialCapacity(4))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	seen := make(chan string, 1)
@@ -206,9 +207,9 @@ func TestServerExecUnregisteredAndPanicReturnsError(t *testing.T) {
 		{name: "panic", register: true, handler: func(*CallInfo) *RetInfo { panic("boom") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewServer(WithInitialCapacity(4))
+			s := NewServer(WithChanLen(4))
 			defer s.Close()
-			c := NewClient(WithClientInitialCapacity(4))
+			c := NewClient(WithClientChanLen(4))
 			defer c.Close()
 			if tc.register {
 				if err := s.Register(pingReq{}, tc.handler); err != nil {
@@ -232,18 +233,18 @@ func TestServerExecUnregisteredAndPanicReturnsError(t *testing.T) {
 }
 
 func TestClientValidationAndClose(t *testing.T) {
-	c := NewClient(WithClientInitialCapacity(4))
+	c := NewClient(WithClientChanLen(4))
 	if err := c.AsyncCall(nil, pingReq{}, func(*RetInfo) {}); !errors.Is(err, ErrServerNil) {
 		t.Fatalf("AsyncCall nil server err = %v", err)
 	}
-	if err := c.AsyncCall(NewServer(WithInitialCapacity(1)), pingReq{}, nil); !errors.Is(err, ErrCallbackNil) {
+	if err := c.AsyncCall(NewServer(WithChanLen(1)), pingReq{}, nil); !errors.Is(err, ErrCallbackNil) {
 		t.Fatalf("AsyncCall nil callback err = %v", err)
 	}
 	c.Close()
 	if !c.IsClosed() {
 		t.Fatal("client should be closed")
 	}
-	s := NewServer(WithInitialCapacity(1))
+	s := NewServer(WithChanLen(1))
 	defer s.Close()
 	if err := c.AsyncCall(s, pingReq{}, func(*RetInfo) {}); !errors.Is(err, ErrClientClosed) {
 		t.Fatalf("AsyncCall closed client err = %v", err)
@@ -256,8 +257,8 @@ func TestClientValidationAndClose(t *testing.T) {
 // 让它凭空消失，见 Server.Close 的注释。
 // Close **之后**发起的新调用仍然会被拒绝，这条不变。
 func TestServerCloseDrainsQueuedCalls(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	if err := s.Register(pingReq{}, func(ci *CallInfo) *RetInfo {
@@ -333,8 +334,8 @@ func TestCallInfoRetOnlyOnceAndMetadataCopy(t *testing.T) {
 // TestServerCloseDrainsQueuedCalls：队列里排队的同步调用同样必须被
 // Close 真正执行并把真实结果送回调用方，而不是回一个 ErrServerClosed。
 func TestServerCloseDrainsQueuedSyncCall(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	if err := s.Register(pingReq{}, func(ci *CallInfo) *RetInfo {
@@ -373,8 +374,8 @@ type chainMsg struct{ Remaining int }
 // 被继续处理直到链条真正走完，而不是在 Close 一开始把 closed 置位后，
 // 这类自投递被 client.check 的 IsClosed 判断直接腰斩。
 func TestServerCloseDrainsSelfCastChain(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	const chainLen = 5
@@ -420,8 +421,8 @@ func TestServerCloseDrainsSelfCastChain(t *testing.T) {
 // 泄漏（超时前修复中曾经漏掉这一步：没人再读 Out()，那个 goroutine
 // 试图把剩余缓冲送进 Out() 时会因为没有接收方而永久阻塞）。
 func TestServerCloseGivesUpOnRunawaySelfCastChain(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4), WithCloseDrainTimeout(50*time.Millisecond))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4), WithCloseDrainTimeout(50*time.Millisecond))
+	c := NewClient(WithClientChanLen(4))
 	defer c.Close()
 
 	type foreverMsg struct{}
@@ -469,9 +470,9 @@ func TestServerCloseGivesUpOnRunawaySelfCastChain(t *testing.T) {
 }
 
 func TestClientCloseDrainsPendingAsyncCallbacks(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
 	defer s.Close()
-	c := NewClient(WithClientInitialCapacity(4))
+	c := NewClient(WithClientChanLen(4))
 
 	if err := s.Register(pingReq{}, func(ci *CallInfo) *RetInfo {
 		return &RetInfo{Ack: pingAck{Value: ci.Request.(pingReq).Value}}
@@ -560,7 +561,7 @@ func TestRetInfoIDAndCallOptions(t *testing.T) {
 		t.Fatalf("RetInfo.ID nil ack = %d, want 0", got)
 	}
 
-	c := NewClient(WithClientInitialCapacity(1))
+	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
 	o := c.applyOpts(WithMeta("a", 1), WithMeta("b", "two"))
 	if o.metadata["a"] != 1 || o.metadata["b"] != "two" {
@@ -569,11 +570,11 @@ func TestRetInfoIDAndCallOptions(t *testing.T) {
 }
 
 func TestServerExecNilAndCallValidationErrors(t *testing.T) {
-	s := NewServer(WithInitialCapacity(1))
+	s := NewServer(WithChanLen(1))
 	defer s.Close()
 	s.Exec(nil)
 
-	c := NewClient(WithClientInitialCapacity(1))
+	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
 	if ri := c.Call(nil, pingReq{}); !errors.Is(ri.Err, ErrServerNil) {
 		t.Fatalf("Call nil server err = %v", ri.Err)
@@ -581,13 +582,14 @@ func TestServerExecNilAndCallValidationErrors(t *testing.T) {
 	if ri := c.Call(s, nil); !errors.Is(ri.Err, ErrInvalidMsgType) {
 		t.Fatalf("Call nil request err = %v", ri.Err)
 	}
-	if err := c.call(nil, &CallInfo{}); !errors.Is(err, ErrServerNil) {
+	ctx := context.Background()
+	if err := c.call(ctx, nil, &CallInfo{}, false); !errors.Is(err, ErrServerNil) {
 		t.Fatalf("raw call nil server err = %v", err)
 	}
-	if err := c.call(&Server{}, &CallInfo{}); !errors.Is(err, ErrCallChannelNil) {
+	if err := c.call(ctx, &Server{}, &CallInfo{}, false); !errors.Is(err, ErrCallChannelNil) {
 		t.Fatalf("raw call nil channel err = %v", err)
 	}
-	if err := c.call(s, nil); !errors.Is(err, ErrCallInfoNil) {
+	if err := c.call(ctx, s, nil, false); !errors.Is(err, ErrCallInfoNil) {
 		t.Fatalf("raw call nil CallInfo err = %v", err)
 	}
 }
@@ -608,12 +610,12 @@ func TestBKDRHashKnownValuesAndConsistency(t *testing.T) {
 }
 
 func TestClientCheckValidationMatrixAndCastNoPanic(t *testing.T) {
-	c := NewClient(WithClientInitialCapacity(1))
+	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
 	if _, err := c.check(nil, pingReq{}); !errors.Is(err, ErrServerNil) {
 		t.Fatalf("check nil server err = %v", err)
 	}
-	s := NewServer(WithInitialCapacity(1))
+	s := NewServer(WithChanLen(1))
 	if _, err := c.check(s, nil); !errors.Is(err, ErrInvalidMsgType) {
 		t.Fatalf("check nil request err = %v", err)
 	}
@@ -622,9 +624,9 @@ func TestClientCheckValidationMatrixAndCastNoPanic(t *testing.T) {
 		t.Fatalf("check closed server err = %v", err)
 	}
 
-	closedClient := NewClient(WithClientInitialCapacity(1))
+	closedClient := NewClient(WithClientChanLen(1))
 	closedClient.Close()
-	openServer := NewServer(WithInitialCapacity(1))
+	openServer := NewServer(WithChanLen(1))
 	defer openServer.Close()
 	if _, err := closedClient.check(openServer, pingReq{}); !errors.Is(err, ErrClientClosed) {
 		t.Fatalf("check closed client err = %v", err)
@@ -634,7 +636,7 @@ func TestClientCheckValidationMatrixAndCastNoPanic(t *testing.T) {
 }
 
 func TestServerRegisterInvalidMessageID(t *testing.T) {
-	s := NewServer(WithInitialCapacity(1))
+	s := NewServer(WithChanLen(1))
 	defer s.Close()
 	if err := s.Register(customZeroIDMsg{}, func(*CallInfo) *RetInfo { return nil }); err == nil {
 		t.Fatal("register zero custom message ID should fail")
@@ -646,9 +648,9 @@ type customZeroIDMsg struct{}
 func (customZeroIDMsg) ID() uint32 { return 0 }
 
 func TestServerExecHandlerReturnsNilAndCastReturnPath(t *testing.T) {
-	s := NewServer(WithInitialCapacity(2))
+	s := NewServer(WithChanLen(2))
 	defer s.Close()
-	c := NewClient(WithClientInitialCapacity(2))
+	c := NewClient(WithClientChanLen(2))
 	defer c.Close()
 
 	if err := s.Register(pingReq{}, func(ci *CallInfo) *RetInfo {
@@ -678,9 +680,9 @@ func TestServerExecHandlerReturnsNilAndCastReturnPath(t *testing.T) {
 }
 
 func TestAsyncCallbackRecoversPanicAndPendingDecrements(t *testing.T) {
-	s := NewServer(WithInitialCapacity(1))
+	s := NewServer(WithChanLen(1))
 	defer s.Close()
-	c := NewClient(WithClientInitialCapacity(1))
+	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
 	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return &RetInfo{Ack: pingAck{}} }); err != nil {
 		t.Fatalf("register failed: %v", err)
@@ -709,11 +711,11 @@ func TestCallInfoRetDroppedWhenSyncRetFullAndNoRetForCast(t *testing.T) {
 }
 
 func TestClientCallPanicOnClosedQueueReturnsError(t *testing.T) {
-	s := NewServer(WithInitialCapacity(1))
-	c := NewClient(WithClientInitialCapacity(1))
+	s := NewServer(WithChanLen(1))
+	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
-	s.chanCall.Close()
-	err := c.call(s, &CallInfo{id: ID(pingReq{}), Request: pingReq{}, chanRet: newSyncRet()})
+	close(s.chanCall)
+	err := c.call(context.Background(), s, &CallInfo{id: ID(pingReq{}), Request: pingReq{}, chanRet: newSyncRet()}, false)
 	if err == nil {
 		t.Fatal("call to closed queue should return panic error")
 	}
@@ -742,8 +744,8 @@ func serveOnce(s *Server) (stop func()) {
 // TestHoldDefersResponse 验证延迟响应：handler 先 Hold 再返回 nil，
 // 框架不得自动回包；调用方应当等到稍后那次真正的 Ret。
 func TestHoldDefersResponse(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer s.Close()
 
 	const delay = 60 * time.Millisecond
@@ -784,8 +786,8 @@ func TestHoldDefersResponse(t *testing.T) {
 // TestNilRetWithoutHoldRepliesEmpty 验证未 Hold 而返回 nil 时框架必须兜底回包，
 // 否则所有「无需响应」的 handler 都会让同步 Call 挂死。
 func TestNilRetWithoutHoldRepliesEmpty(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer s.Close()
 
 	if err := s.Register((*pingReq)(nil), func(*CallInfo) *RetInfo { return nil }); err != nil {
@@ -813,8 +815,8 @@ func TestNilRetWithoutHoldRepliesEmpty(t *testing.T) {
 // TestHoldStillRepliesOnPanic 验证 handler 在 Hold 之后 panic 时框架仍会回包——
 // handler 已经崩了，再守着「稍后会回」的承诺只会让调用方一直等下去。
 func TestHoldStillRepliesOnPanic(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer s.Close()
 
 	if err := s.Register((*pingReq)(nil), func(ci *CallInfo) *RetInfo {
@@ -842,8 +844,8 @@ func TestHoldStillRepliesOnPanic(t *testing.T) {
 // TestRetTwiceReportsAlreadyRet 验证重复回包会返回 ErrAlreadyRet 而非静默成功。
 // 延迟响应下回包发生在别的 goroutine，静默丢弃会让业务完全察觉不到。
 func TestRetTwiceReportsAlreadyRet(t *testing.T) {
-	s := NewServer(WithInitialCapacity(4))
-	c := NewClient(WithClientInitialCapacity(4))
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(4))
 	defer s.Close()
 
 	second := make(chan error, 1)
@@ -871,5 +873,130 @@ func TestRetTwiceReportsAlreadyRet(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting duplicate ret result")
+	}
+}
+
+// --- 有界队列语义 ---
+
+// TestCastAndAsyncCallFailWhenChannelFull 验证队列打满后异步语义直接失败，
+// 而不是把积压悄悄堆进内存：这正是从无界队列换成有界队列要买到的东西。
+func TestCastAndAsyncCallFailWhenChannelFull(t *testing.T) {
+	s := NewServer(WithChanLen(1))
+	c := NewClient(WithClientChanLen(4))
+	defer c.Close()
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return nil }); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// 不启动事件循环，第一条占满容量为 1 的队列。
+	c.Cast(s, pingReq{})
+	if got := s.Len(); got != 1 {
+		t.Fatalf("Len after first cast = %d, want 1", got)
+	}
+	if got := s.Cap(); got != 1 {
+		t.Fatalf("Cap = %d, want 1", got)
+	}
+
+	if err := c.AsyncCall(s, pingReq{}, func(*RetInfo) {}); !errors.Is(err, ErrChanFull) {
+		t.Fatalf("AsyncCall on full channel err = %v, want ErrChanFull", err)
+	}
+	// 投递失败必须回滚 pending 计数，否则 Close 会白等一个不会到来的回调。
+	if got := c.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount after failed AsyncCall = %d, want 0", got)
+	}
+	// Cast 失败同样不能给服务端留下一笔永远不会被 Exec 的待办。
+	c.Cast(s, pingReq{})
+	if got := s.pending.Load(); got != 1 {
+		t.Fatalf("server pending after failed cast = %d, want 1", got)
+	}
+}
+
+// TestSyncCallBlocksUntilChannelHasRoom 验证同步调用在队列满时是等待而非失败：
+// 调用方本来就在等结果，让它多等一会儿入队，比丢掉这次调用更符合预期。
+func TestSyncCallBlocksUntilChannelHasRoom(t *testing.T) {
+	s := NewServer(WithChanLen(1))
+	c := NewClient(WithClientChanLen(4))
+	defer c.Close()
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return &RetInfo{Ack: pingAck{Value: "pong"}} }); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	c.Cast(s, pingReq{}) // 占满队列，此时事件循环还没起来
+
+	done := make(chan *RetInfo, 1)
+	go func() { done <- c.Call(s, pingReq{}) }()
+
+	select {
+	case ri := <-done:
+		t.Fatalf("Call returned before channel had room: %#v", ri)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	stop := serveOnce(s)
+	defer stop()
+
+	select {
+	case ri := <-done:
+		if ri.Err != nil {
+			t.Fatalf("Call err = %v", ri.Err)
+		}
+		if ack, ok := ri.Ack.(pingAck); !ok || ack.Value != "pong" {
+			t.Fatalf("Call ack = %#v", ri.Ack)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for blocked Call to complete")
+	}
+}
+
+// TestSyncCallCanceledWhileWaitingForRoom 验证 ctx 覆盖的是"入队"这一段：
+// 队列满时调用方能靠 ctx 从等待中脱身，而不是连队列都没进去就永久卡死。
+func TestSyncCallCanceledWhileWaitingForRoom(t *testing.T) {
+	s := NewServer(WithChanLen(1))
+	c := NewClient(WithClientChanLen(4))
+	defer c.Close()
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return nil }); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	c.Cast(s, pingReq{}) // 占满队列
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	ri := c.CallWithContext(ctx, s, pingReq{})
+	if !errors.Is(ri.Err, context.DeadlineExceeded) {
+		t.Fatalf("CallWithContext err = %v, want DeadlineExceeded", ri.Err)
+	}
+	if got := s.pending.Load(); got != 1 {
+		t.Fatalf("server pending after canceled call = %d, want 1", got)
+	}
+}
+
+// TestAsyncRetDroppedWhenClientChannelFull 验证回包队列满时响应被丢弃，
+// 且 pendingAsyncCall 被减回来——否则 Client.Close 会一直等一个永远不会
+// 执行的回调，直到超时兜底才放弃。
+func TestAsyncRetDroppedWhenClientChannelFull(t *testing.T) {
+	s := NewServer(WithChanLen(4))
+	c := NewClient(WithClientChanLen(1))
+	defer c.Close()
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return &RetInfo{Ack: pingAck{}} }); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// 两次异步调用，但调用方一直不消费 Event()，回包队列容量只有 1。
+	for range 2 {
+		if err := c.AsyncCall(s, pingReq{}, func(*RetInfo) {}); err != nil {
+			t.Fatalf("AsyncCall: %v", err)
+		}
+	}
+	for range 2 {
+		s.Exec(<-s.Event())
+	}
+
+	if got := c.Len(); got != 1 {
+		t.Fatalf("client Len = %d, want 1", got)
+	}
+	// 一条留在队列里等回调（pending=1），另一条被丢弃并已回滚计数。
+	if got := c.PendingCount(); got != 1 {
+		t.Fatalf("PendingCount = %d, want 1", got)
 	}
 }

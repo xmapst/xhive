@@ -11,14 +11,11 @@
 package timer
 
 import (
-	"context"
 	"log/slog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
-	
-	"github.com/xmapst/xhive/chanx"
 )
 
 // 时间轮配置常量。
@@ -58,13 +55,17 @@ type Event interface {
 // 核心数据结构：
 //   - timerSlots[i] 存储剩余时间落在 [2^(i-1), 2^i) × timerTick 区间的定时器
 //   - chanOp 通道将外部的增删改操作串行化到分发器 goroutine，避免外部调用方与时间轮逻辑并发修改内部状态
+//   - chanOp / chanFired 都是**有界** channel，且方向相反地处理"满"这件事：
+//     向 chanOp 发送是阻塞的（业务侧等一下即可，分发器主循环总在推进），
+//     向 chanFired 发送是非阻塞的（分发器绝不能被消费方拖住，否则两边互等成死锁），
+//     发不进去的到期定时器留在槽里，下一个 tick 再试，见 place 与 trigger
 //   - canceledTimers 采用"双重取消"机制：先在 sync.Map 标记取消，再异步从时间轮物理删除，
 //     使取消操作对已投递到 chanFired 的到期事件也能立即生效
 type dispatcher struct {
 	atomicID       atomic.Int64                           // 定时器唯一 ID 生成器
 	timerSlots     [timerLevel]map[int64]*dispatcherTimer // 分级时间轮槽位，每级对应不同的时间区间
-	chanOp         *chanx.Unbounded[*dispatcherTimer]     // 操作串行化通道，确保时间轮数据的单线程访问
-	chanFired      *chanx.Unbounded[Event]                // 定时器到期通知通道，由调用方（Manager）消费
+	chanOp         chan *dispatcherTimer                  // 操作串行化通道（有界，阻塞发送），确保时间轮数据的单线程访问
+	chanFired      chan Event                             // 定时器到期通知通道（有界，非阻塞发送），由调用方（Manager）消费
 	canceledTimers sync.Map                               // 已取消定时器的快速过滤集合，key 为 timerID
 }
 
@@ -104,17 +105,17 @@ func (t *dispatcherTimer) Name() string {
 
 // newDispatcher 创建并初始化多级时间轮分发器。
 //
-// bufSize 指定操作队列和触发队列的初始容量，建议与模块的 ChanRPC 容量保持一致，
-// 以降低大量定时器同时到期时的队列扩容开销。
+// bufSize 指定操作队列和触发队列的容量（硬上限，不是提示值）：它应当覆盖模块
+// 同时活跃的定时器规模。容量不足不会丢定时器，但会让到期通知推迟到后续 tick
+// 才送达（见 trigger 的重试逻辑）。
 func newDispatcher(bufSize int) *dispatcher {
 	if bufSize <= 0 {
 		bufSize = 10000
 	}
 
-	ctx := context.Background()
 	disp := &dispatcher{
-		chanFired: chanx.NewUnbounded[Event](ctx, chanx.WithInitialCapacity(bufSize), chanx.WithChanCapacity(bufSize, bufSize)),
-		chanOp:    chanx.NewUnbounded[*dispatcherTimer](ctx, chanx.WithInitialCapacity(bufSize), chanx.WithChanCapacity(bufSize, bufSize)),
+		chanFired: make(chan Event, bufSize),
+		chanOp:    make(chan *dispatcherTimer, bufSize),
 	}
 	for k := range disp.timerSlots {
 		disp.timerSlots[k] = make(map[int64]*dispatcherTimer)
@@ -142,7 +143,7 @@ func (disp *dispatcher) run() {
 	tickTimer := time.NewTimer(timerTick)
 	for {
 		select {
-		case t := <-disp.chanOp.Out():
+		case t := <-disp.chanOp:
 			if !disp.doOp(t) {
 				return // 收到 opStop 停止信号，退出主循环
 			}
@@ -232,8 +233,17 @@ func (disp *dispatcher) place(t *dispatcherTimer) {
 
 	diff := t.deadline.Sub(time.Now())
 	if diff <= 0 {
-		// 已到期，直接投递到触发队列。
-		disp.chanFired.In() <- t
+		// 已到期，直接投递到触发队列。发送必须非阻塞：这里跑在分发器主循环上，
+		// 一旦被消费方（模块事件循环）拖住，而对方又正好在往 chanOp 发操作，
+		// 两边就互等成死锁。
+		select {
+		case disp.chanFired <- t:
+		default:
+			// 触发队列已满，退而求其次放进第 0 层：它每个 tick 都会被扫描，
+			// trigger 会持续重试投递，最多晚一个 tick 送达，而不是把这个定时器
+			// 直接丢掉。
+			disp.timerSlots[0][t.id] = t
+		}
 		return
 	}
 	if diff < timerTick {
@@ -309,7 +319,8 @@ func (disp *dispatcher) doTick(now time.Time, lastTick int64) int64 {
 // trigger 扫描指定层级的定时器。
 //
 // 当定时器剩余时间已短于当前层级跨度时，trigger 会将其下移至更精确的低层级；
-// 当最低层定时器已经到期时，trigger 会将其投递到触发队列并从槽位中删除。
+// 当最低层定时器已经到期时，trigger 会将其投递到触发队列，投递成功后才从槽位
+// 中删除（触发队列满时留在原地，下个 tick 重试）。
 func (disp *dispatcher) trigger(now time.Time, level int) {
 	slotMap := disp.timerSlots[level]
 	for k, v := range slotMap {
@@ -327,9 +338,14 @@ func (disp *dispatcher) trigger(now time.Time, level int) {
 				disp.timerSlots[level-1][k] = v
 				delete(slotMap, k)
 			} else if !now.Before(v.deadline) {
-				// 最低层已到期，投递成功后从槽位删除，防止重复触发。
-				disp.chanFired.In() <- v
-				delete(slotMap, k)
+				// 最低层已到期。非阻塞投递，理由同 place：分发器主循环不能被
+				// 消费方拖住。**只有投递成功才从槽位删除**，失败则原地留到下个
+				// tick 重试——这样队列满只会让到期通知延迟，不会静默丢定时器。
+				select {
+				case disp.chanFired <- v:
+					delete(slotMap, k)
+				default:
+				}
 			}
 		}
 	}
@@ -337,15 +353,16 @@ func (disp *dispatcher) trigger(now time.Time, level int) {
 
 // Stop 向分发器发送停止信号，通知主循环退出。
 func (disp *dispatcher) Stop() {
-	disp.chanOp.In() <- &dispatcherTimer{op: opStop, name: "stop", id: 0}
+	disp.chanOp <- &dispatcherTimer{op: opStop, name: "stop", id: 0}
 }
 
 // Update 更新定时器的到期时刻，用于加速或延迟已存在的定时器。
 //
 // 通过 chanOp 将更新操作异步发送到分发器 goroutine 处理，
-// 保证时间轮数据的单线程访问，无需外部加锁。
+// 保证时间轮数据的单线程访问，无需外部加锁。chanOp 有界，队列满时本次发送
+// 阻塞等待——分发器主循环始终在推进，这段等待是有界的，且不会丢操作。
 func (disp *dispatcher) Update(name string, timerID int64, deadline time.Time) {
-	disp.chanOp.In() <- &dispatcherTimer{op: opUpdate, name: name, id: timerID, deadline: deadline}
+	disp.chanOp <- &dispatcherTimer{op: opUpdate, name: name, id: timerID, deadline: deadline}
 }
 
 // New 创建定时器并放入时间轮，timerID 为 0 时自动生成全局唯一 ID。
@@ -355,7 +372,7 @@ func (disp *dispatcher) New(name string, timerID int64, deadline time.Time, cb f
 	if timerID == 0 {
 		timerID = disp.atomicID.Add(1)
 	}
-	disp.chanOp.In() <- &dispatcherTimer{op: opNew, name: name, id: timerID, deadline: deadline, cb: cb, canceled: &disp.canceledTimers}
+	disp.chanOp <- &dispatcherTimer{op: opNew, name: name, id: timerID, deadline: deadline, cb: cb, canceled: &disp.canceledTimers}
 	return timerID
 }
 
@@ -367,5 +384,5 @@ func (disp *dispatcher) New(name string, timerID int64, deadline time.Time, cb f
 // 两者结合保证取消操作在逻辑层面的即时性和内存层面的最终一致性。
 func (disp *dispatcher) Cancel(name string, timerID int64) {
 	disp.canceledTimers.Store(timerID, struct{}{}) // 立即生效：即使定时器已到期且在通道中排队，也会被过滤
-	disp.chanOp.In() <- &dispatcherTimer{op: opCancel, name: name, id: timerID}
+	disp.chanOp <- &dispatcherTimer{op: opCancel, name: name, id: timerID}
 }

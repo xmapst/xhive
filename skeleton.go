@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"time"
-	
+
 	"github.com/xmapst/xhive/chanrpc"
 	"github.com/xmapst/xhive/stat"
 	"github.com/xmapst/xhive/timer"
@@ -97,7 +97,7 @@ func defaultSkeletonOptions() skeletonOptions {
 	}
 }
 
-// WithTimerChanLen 自定义定时器事件通道长度。
+// WithTimerChanLen 自定义定时器事件通道长度（有界队列的容量上限）。
 func WithTimerChanLen(n int) SkeletonOption {
 	return func(opts *skeletonOptions) {
 		if n > 0 {
@@ -106,7 +106,11 @@ func WithTimerChanLen(n int) SkeletonOption {
 	}
 }
 
-// WithServerChanLen 自定义 ChanRPC 服务端通道长度。
+// WithServerChanLen 自定义 ChanRPC 服务端通道长度（有界队列的容量上限）。
+//
+// 队列满之后，别的模块对本模块的 Cast/AsyncCall 会直接失败（ErrChanFull），
+// 同步 Call 则阻塞等待空位。因此这个值要覆盖本模块的正常突发量，
+// 见 chanrpc.WithChanLen 的取值说明。
 func WithServerChanLen(n int) SkeletonOption {
 	return func(opts *skeletonOptions) {
 		if n > 0 {
@@ -115,7 +119,10 @@ func WithServerChanLen(n int) SkeletonOption {
 	}
 }
 
-// WithClientChanLen 自定义 ChanRPC 客户端异步返回通道长度。
+// WithClientChanLen 自定义 ChanRPC 客户端异步返回通道长度（有界队列的容量上限）。
+//
+// 它应当不小于本模块可能同时在途的异步调用数：队列满时对端的回包会被丢弃，
+// 对应的回调不会被执行，见 chanrpc.WithClientChanLen。
 func WithClientChanLen(n int) SkeletonOption {
 	return func(opts *skeletonOptions) {
 		if n > 0 {
@@ -160,10 +167,12 @@ func WithClientCloseTimeout(d time.Duration) SkeletonOption {
 
 // NewSkeleton 创建模块骨架，初始化 ChanRPC 和定时器组件。
 //
-// 默认配置为：定时器事件通道 1024、ChanRPC 服务端队列初始容量 4096、
-// 客户端异步返回队列初始容量 4096、统计采样容量 8192。
-// ChanRPC 队列容量是无界队列的初始容量提示，不是硬性上限。
-// 可通过 WithXXX 选项按模块特征自定义不同组件容量，避免统一配置带来的浪费。
+// 默认配置为：定时器事件通道 1024、ChanRPC 服务端队列 4096、
+// 客户端异步返回队列 4096、统计采样容量 8192。
+//
+// 这些容量都是**硬性上限**：队列打满时，异步投递直接失败、同步调用阻塞等待，
+// 过载会在发生的那一刻就变成可观测的错误或等待，而不是把积压一路堆进内存
+// 直到进程被 OOM 杀掉。可通过 WithXXX 选项按模块特征自定义不同组件容量。
 func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 	cfg := defaultSkeletonOptions()
 	for _, opt := range opts {
@@ -177,11 +186,11 @@ func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 		ready: make(chan struct{}),
 		timer: timer.NewManager(cfg.timerChanLen),
 		server: chanrpc.NewServer(
-			chanrpc.WithInitialCapacity(cfg.serverChanLen),
+			chanrpc.WithChanLen(cfg.serverChanLen),
 			chanrpc.WithCloseDrainTimeout(cfg.closeDrainTimeout),
 		),
 		client: chanrpc.NewClient(
-			chanrpc.WithClientInitialCapacity(cfg.clientChanLen),
+			chanrpc.WithClientChanLen(cfg.clientChanLen),
 			chanrpc.WithClientCloseTimeout(cfg.clientCloseTimeout),
 		),
 		stat: stat.NewTPStats(cfg.statCap),
@@ -200,6 +209,11 @@ func (s *Skeleton) Priority() uint {
 }
 
 // Serve 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
+//
+// 事件循环必须持续消费这三个队列——它们都是有界的，事件循环一旦被某个耗时
+// handler 或某次同步 Call 卡住，上游要么开始丢消息（Cast/AsyncCall）、要么
+// 跟着一起阻塞（同步 Call）。这正是有界队列的取舍：把"处理不过来"这件事
+// 立刻暴露出来，而不是攒在内存里。
 //
 // 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
 //  1. ctx.Done()：接收框架的停止信号，触发模块关闭流程

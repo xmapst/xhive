@@ -203,10 +203,12 @@ func (a *app) appendModuleStats(builder *strings.Builder, moduleType string, wra
 	rpcServer := wrapper.ChanRPC()
 
 	if rpcServer != nil {
-		_, _ = fmt.Fprintf(builder, "%s: %s, rpc_queue_length: %d\n",
-			moduleType, wrapper.Name(), rpcServer.Len())
+		// 同时输出容量：队列有界，只看积压量看不出离打满还有多远，
+		// 水位（length/cap）才是能拿来告警的东西。
+		_, _ = fmt.Fprintf(builder, "%s: %s, rpc_queue_length: %d, rpc_queue_cap: %d\n",
+			moduleType, wrapper.Name(), rpcServer.Len(), rpcServer.Cap())
 	} else {
-		_, _ = fmt.Fprintf(builder, "%s: %s, rpc_queue_length: N/A\n",
+		_, _ = fmt.Fprintf(builder, "%s: %s, rpc_queue_length: N/A, rpc_queue_cap: N/A\n",
 			moduleType, wrapper.Name())
 	}
 }
