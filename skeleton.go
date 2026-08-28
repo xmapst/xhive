@@ -52,6 +52,14 @@ type ITimer interface {
 	CancelTimer(id int64)
 }
 
+// ISkeleton 模块骨架的抽象接口，聚合了跨模块 RPC 调用（IRPC）和定时器管理（ITimer）
+// 两个能力。业务模块通过组合 Skeleton（或实现 ISkeleton）获得完整的事件驱动能力，
+// 框架据此对模块进行统一调度与生命周期管理。
+type ISkeleton interface {
+	IRPC
+	ITimer
+}
+
 // Skeleton 模块骨架，将 ChanRPC（服务端/客户端）和定时器管理器整合为统一的事件驱动框架。
 //
 // 核心设计思想（Actor 模型）：
