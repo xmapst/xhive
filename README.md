@@ -371,7 +371,7 @@ AppStateNone
 4. 每个模块先取消 context 并等待 goroutine 退出，再执行 `OnDestroy`，最后调用 `Close` 释放出站 client。只有 `OnInit` 成功返回过的模块参与这一步（启动中途失败时，未初始化的模块只会被关掉 ChanRPC 服务端，不收 `OnDestroy`/`Close`）。
 5. 单个模块关闭超时默认为 30 分钟，静态与动态模块同样受此保护；超时不强杀，仅记录错误日志，并跳过该模块的 `OnDestroy` 与 `Close`。
 6. 全部关闭后回到 `AppStateNone`。注意此时**不支持再次启动**——`start` 会检查模块生命周期状态并明确拒绝，需要重启请新建模块实例与新的 app。
-7. 关闭若发生在启动尚未完成时（例如启动期收到 SIGTERM），框架先等 `start` 收敛（默认上限 30 秒）再开始销毁，避免 `OnDestroy` 与仍在执行的 `OnInit` 并发读写同一批业务内存；超时兜底放行时，仍在 `OnInit` 中的那个模块会被跳过销毁。
+7. 关闭若发生在启动尚未完成时（例如启动期收到 SIGTERM），框架先等 `start` 收敛（默认上限 5 秒，独立于模块关闭超时）再开始销毁，避免 `OnDestroy` 与仍在执行的 `OnInit` 并发读写同一批业务内存；超时兜底放行时，仍在 `OnInit` 中的那个模块会被跳过销毁（它的资源由 `OnInit` 自己负责，框架会记一条 error）。
 
 ---
 
@@ -401,7 +401,7 @@ _ = removed
 动态模块特性：
 
 - `AddDynamicModules` 按 `Priority` 升序（同优先级保留传参顺序）依次执行 `OnInit`，成功后启动 `Serve`，并等待模块 `Ready()` 后才登记到动态模块表。重名模块会被直接拒绝，不会覆盖已有模块；应用已进入关闭流程后调用会整体拒绝，避免登记出无人负责关闭的模块。
-- `RemoveDynamicModule` 先把模块从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走与静态模块完全相同的关闭路径：取消 context → 等待 goroutine 退出（受关闭超时保护）→ `OnDestroy` → `Close`。并发卸载同名模块时只有一个调用方会执行销毁并返回 `true`。
+- `RemoveDynamicModule` 先把模块从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走与静态模块完全相同的关闭路径：取消 context → 等待 goroutine 退出（受关闭超时保护）→ `OnDestroy` → `Close`。并发卸载同名模块时只有一个调用方会执行销毁。返回值表示销毁是否**真的完整走完**：模块不存在返回 `false`，等待 goroutine 退出超时、框架跳过 `OnDestroy`/`Close` 时同样返回 `false`——此时资源并未释放，且模块已被摘出模块表，不要立刻用同名模块重新加载。
 - 动态模块 `Serve`、`OnDestroy` 与 `Close` 中的 panic 会被捕获，不会退出进程；`OnInit` 在调用方 goroutine 上同步执行，其 panic 不被框架捕获。
 - 批量添加中途失败时，已经启动的动态模块不会自动回滚；`OnInit` 失败的那个模块不会收到 `OnDestroy`/`Close`（须由 `OnInit` 自行回滚），与静态模块语义一致。
 

@@ -225,9 +225,13 @@ func (s *Server) IsClosed() bool {
 // （而不是回一个"服务已关闭"的错误）。
 //
 // 调用前提：Close 必须在这个 Server 所属模块自己的事件循环 goroutine 上
-// 调用（xhive 里唯一的调用点是 Skeleton.Serve，由 Serve 在返回前同步调用），
+// 调用（xhive 里的调用点是 Skeleton.Serve，由 Serve 在返回前同步调用；
+// 事件循环从未运行过的模块走的是 Abandon 而不是这里），
 // 这样 Exec 里对业务状态的访问仍然只发生在这一个 goroutine 上，
 // 没有引入新的并发访问。
+//
+// 事件循环从未运行过的模块（启动中途失败时排在故障点之前的那些）不能用
+// Close 收场——那等于让别的 goroutine 去跑它的 handler，见 Abandon。
 //
 // 排空必须一直持续到 pending 真正归零，而不是只处理调用这一刻的存量：
 // 不少 handler 是"每次处理一批，剩余部分自己 Cast 给本模块继续"的分批
@@ -280,5 +284,60 @@ drain:
 	if timedOut {
 		slog.Error("chanrpc server close drain timeout, dropping remaining self-cast chain",
 			slog.Int64("remaining_pending", s.pending.Load()))
+	}
+}
+
+// Abandon 关闭一个事件循环从未运行过的 Server：拒绝新调用，并把队列里已经
+// 排队的调用逐一回一个 ErrServerAbandoned，**不执行它们的 handler**。
+//
+// 与 Close 的区别只有一条，但很关键：**由谁来执行 handler**。
+// Close 假定自己跑在所属模块的事件循环 goroutine 上，因此可以放心把积压
+// 请求真正执行完；Abandon 面向的是从来没有过事件循环的模块，调用它的是
+// 框架的停机 goroutine。在那里执行别人的 handler 有两个问题：
+//
+//   - handler 里对业务状态的访问不再局限于单一 goroutine，actor 模型赖以
+//     免锁的前提被打破；
+//   - handler 若发起同步 Call，而对端同样是一个事件循环从未运行过的模块，
+//     回包永远不会产生，整个停机流程就永久卡死——Close 的 closeDrainTimeout
+//     只保护"等待队列里的下一个请求"，保护不了"handler 自身的执行"。
+//
+// 那么这些积压请求就丢了吗？是的，但丢得明明白白：每个调用方都会收到
+// ErrServerAbandoned，同步 Call 立刻返回错误、AsyncCall 的回调拿到错误。
+// 这比静默入队后随进程蒸发要好得多——那种情况下业务连"我的数据没送到"
+// 都无从得知。而执行它们并不是一个可选项：这个模块从未宣告过就绪
+// （Ready 未关闭），本就不该处理任何请求。
+//
+// 顺序与 Close 相反，先置 closed 再排空：Close 期间要允许 handler 的自投递
+// 继续入队，Abandon 不执行任何 handler，也就不会产生自投递，因此可以立刻
+// 拒绝新调用。close(chanCall) 让恰好阻塞在满队列发送上的调用方醒来
+// （由 client.call 的 recover 转成错误返回），随后的 range 读完缓冲区存量。
+//
+// 与 Close 共用 closing 标志，因此两者互斥且各自幂等：一个 Server 只会被
+// 关闭一次，无论走的是哪条路径。
+func (s *Server) Abandon() {
+	if !s.closing.CompareAndSwap(false, true) {
+		slog.Warn("chanrpc server already closed")
+		return
+	}
+
+	s.closed.Store(true)
+	close(s.chanCall)
+
+	var abandoned int
+	for ci := range s.chanCall {
+		if ci == nil {
+			continue
+		}
+		// 回包失败（调用方已经走了）只会记在 ret 内部的日志里，这里不再重复处理：
+		// 调用方都不在了，也就没有人需要这个错误。
+		_ = ci.ret(&RetInfo{Err: ErrServerAbandoned})
+		// 与入队时的 pending.Add(1) 配对，语义等同于 Exec 的 defer。
+		s.pending.Add(-1)
+		abandoned++
+	}
+
+	if abandoned > 0 {
+		slog.Warn("chanrpc server abandoned pending calls, module event loop never ran",
+			slog.Int("abandoned", abandoned))
 	}
 }

@@ -116,13 +116,18 @@ const (
 	// 刻意与 shutdownTimeout 分开、且短得多：这段等待发生在"收到停止信号但
 	// start 还没跑完"的窗口里，等的是 OnInit（通常是连接依赖、加载配置，秒级），
 	// 而不是 shutdownTimeout 所针对的"大批量落盘"。若复用 30 分钟，启动期卡住
-	// 一个 OnInit 就会让 SIGTERM 之后的停机整整空等半小时，早已被 k8s 的
-	// terminationGracePeriodSeconds（默认 30 秒）强杀。
+	// 一个 OnInit 就会让 SIGTERM 之后的停机整整空等半小时。
+	//
+	// 取 5 秒而不是 30 秒，是因为这段等待完全落在停机的关键路径上，而它之后
+	// 才轮到真正要花时间的事——逐个模块 OnDestroy 落盘。k8s 的
+	// terminationGracePeriodSeconds 默认就是 30 秒，等满 30 秒等于把整个宽限期
+	// 用在"等一个卡住的 OnInit"上，已经 OnInit 成功的那些持久化模块一个都轮不上。
+	// 5 秒足够覆盖正常的 OnInit 收敛，剩下的时间留给真正的落地工作。
 	//
 	// 超时后不是强行并发销毁：兜底放行只是让 stop 继续往下走，仍在执行 OnInit
-	// 的那个模块停在 lifecycleIniting，shutdownModule 会跳过它，不会退化成
-	// 与 OnInit 并发读写同一批业务内存。
-	defaultStartupSettleTimeout = 30 * time.Second
+	// 的那个模块停在 lifecycleIniting，shutdownModule 会跳过它的 OnDestroy，
+	// 不会退化成与 OnInit 并发读写同一批业务内存。
+	defaultStartupSettleTimeout = 5 * time.Second
 )
 
 // AppOption 用于自定义 app 实例的可选行为。
@@ -153,15 +158,25 @@ func WithShutdownTimeout(d time.Duration) AppOption {
 // 只能无差别地对所有模块执行 OnDestroy/Close——对后者而言，那是在一个
 // 字段全为零值的对象上执行"释放所有资源"，属于契约违反。
 //
-// 状态跃迁（单向，不可回退）：
+// 状态跃迁：
 //
 //	Registered ──OnInit 开始──> Initing ──成功──> Inited ──启动 Serve──> Serving
 //	                               │                  │                    │
 //	                               └──失败──> InitFailed                   │
 //	                                                  │                    │
-//	                                        shutdownModule 抢占            │
+//	                                        claimShutdown 抢占（任意状态）  │
 //	                                                  ▼                    ▼
 //	                                            Destroying ──完成──> Destroyed
+//
+// 两条写入路径的分工是这套状态机能成立的关键：
+//   - 启动路径（start / AddDynamicModules）只用 advanceLifecycle 做 CAS 推进。
+//     它随时可能被一个并发的 stop 抢走模块，推进失败就意味着"已经不归我管了"。
+//   - 关闭路径先用 claimShutdown 把状态 CAS 成 Destroying 拿下销毁权，
+//     此后这个 wrapper 归它独占，可以直接 setLifecycle 直写。
+//
+// 所以 Destroying 之后不会再回到任何"活着"的状态：启动路径的 CAS 前置条件
+// 是它推进前读到的那个状态，一旦被抢占就必然失败。反过来，Registered →
+// Initing → Inited → Serving 这条主链本身是单向的。
 type moduleLifecycle int32
 
 const (
@@ -237,6 +252,7 @@ type moduleWrapper struct {
 	exited    chan struct{}
 	wg        sync.WaitGroup
 	lifecycle atomic.Int32 // moduleLifecycle，零值即 lifecycleRegistered
+	visible   atomic.Bool  // 动态模块是否已完成登记、可被 ChanRPC 寻址，见 AddDynamicModules
 	seq       uint64
 }
 
@@ -245,9 +261,27 @@ func (w *moduleWrapper) lifecycleState() moduleLifecycle {
 	return moduleLifecycle(w.lifecycle.Load())
 }
 
-// setLifecycle 原子推进模块生命周期状态，仅由启动路径（单写者）调用。
+// setLifecycle 无条件写入模块生命周期状态。
+//
+// 只有关闭路径可以这样写：它先通过 claimShutdown 拿到了销毁权，此后这个
+// wrapper 的状态归它独占。启动路径必须改用 advanceLifecycle——那里随时可能
+// 有一个并发的 stop 已经接管了模块，无条件覆盖会把它拉回"活着"的状态。
 func (w *moduleWrapper) setLifecycle(state moduleLifecycle) {
 	w.lifecycle.Store(int32(state))
+}
+
+// advanceLifecycle 仅当模块当前正处于 from 状态时，才把它推进到 to，
+// 返回是否推进成功。
+//
+// 启动路径全程用它而不是 setLifecycle，是为了让"销毁权"真正独占：
+// 启动期收到停止信号时，stop 会对仍在 OnInit 的模块 claimShutdown
+// （Initing → Destroying）并跳过销毁；此刻 OnInit 若返回 nil，用
+// setLifecycle 直写就会把 Destroying 覆盖成 Inited——模块从此停在一个
+// "资源已分配、框架必须销毁"的状态上，而 stop 的 LIFO 循环早已走过它，
+// 再也不会有人来销毁，OnDestroy/Close 永远不执行。
+// 用 CAS 推进则会失败，调用方据此知道模块已被接管，就此收手。
+func (w *moduleWrapper) advanceLifecycle(from, to moduleLifecycle) bool {
+	return w.lifecycle.CompareAndSwap(int32(from), int32(to))
 }
 
 // claimShutdown 通过 CAS 抢占模块的销毁权，返回抢占前的状态。
@@ -372,9 +406,11 @@ func (a *app) Stats() string {
 		a.appendModuleStats(&builder, "static", wrapper)
 	}
 
-	// 遍历动态模块（sync.Map.Range 保证并发安全）
+	// 遍历动态模块（sync.Map.Range 保证并发安全）。
+	// 跳过尚未完成登记的占位条目：它们的 OnInit 正在另一条 goroutine 上运行，
+	// 此刻读它们的 Name/ChanRPC 就是与 OnInit 并发读写同一批字段。
 	a.dynamicModules.Range(func(key, value any) bool {
-		if wrapper, ok := value.(*moduleWrapper); ok {
+		if wrapper, ok := value.(*moduleWrapper); ok && wrapper.visible.Load() {
 			a.appendModuleStats(&builder, "dynamic", wrapper)
 		}
 		return true
@@ -424,6 +460,14 @@ func (a *app) ChanRPC(name string) *chanrpc.Server {
 func (a *app) getChanRPCDynamic(name string) *chanrpc.Server {
 	if value, ok := a.dynamicModules.Load(name); ok {
 		if wrapper, ok := value.(*moduleWrapper); ok {
+			// 只有完成登记的模块对外可见。AddDynamicModules 在 OnInit 之前就用
+			// LoadOrStore 把名字占住了（那是防并发重名的唯一可靠手段），
+			// 占位期间模块还没就绪，不能让别人寻址到它——这条判断把"名字已占用"
+			// 与"模块可服务"这两件事分开，对外语义仍然是"等模块 Ready 之后
+			// ChanRPC(name) 才查得到它"。
+			if !wrapper.visible.Load() {
+				return nil
+			}
 			return wrapper.ChanRPC()
 		}
 	}
@@ -603,18 +647,33 @@ func (a *app) start(mods ...IModule) bool {
 	// 逐个推进模块生命周期状态：Registered → Initing → Inited / InitFailed。
 	// 这份记账正是 shutdownModule 区分"该不该销毁"的唯一依据；启动中途失败时，
 	// 排在失败模块之后的模块停在 lifecycleRegistered，不会收到 OnDestroy/Close。
+	// 全程用 advanceLifecycle 的 CAS 推进而非直写：并发的 stop 随时可能
+	// 通过 claimShutdown 接管某个模块，推进失败即表示"它已经不归我管了"。
 	for _, wrapper := range staticModules {
 		if a.stopRequested.Load() {
 			slog.Warn("application start aborted by shutdown request", slog.String("module", wrapper.Name()))
 			return false
 		}
-		wrapper.setLifecycle(lifecycleIniting)
+		if !wrapper.advanceLifecycle(lifecycleRegistered, lifecycleIniting) {
+			slog.Warn("module already claimed by shutdown, start aborted",
+				slog.String("module", wrapper.Name()), slog.String("module_state", wrapper.lifecycleState().String()))
+			return false
+		}
 		if err := wrapper.OnInit(); err != nil {
-			wrapper.setLifecycle(lifecycleInitFailed)
+			// 推进失败说明 stop 已在 OnInit 期间接管了这个模块，它自己会收尾，
+			// 这里不再改状态；无论哪种情况启动都到此为止。
+			wrapper.advanceLifecycle(lifecycleIniting, lifecycleInitFailed)
 			slog.Error("module initialization failed", slog.String("module", wrapper.Name()), slog.Any("error", err))
 			return false
 		}
-		wrapper.setLifecycle(lifecycleInited)
+		if !wrapper.advanceLifecycle(lifecycleIniting, lifecycleInited) {
+			// stop 在 OnInit 执行期间抢走了销毁权（它会跳过销毁以避开与 OnInit
+			// 的并发）。模块资源已经分配却不会有人释放，这一点必须留痕——
+			// 它是"启动期收到停止信号"这条罕见路径上唯一的资源泄漏出口。
+			slog.Error("module claimed by shutdown while initializing, resources may leak",
+				slog.String("module", wrapper.Name()))
+			return false
+		}
 	}
 
 	// 拉起 goroutine 之前再复查一道：上面的 OnInit 循环只在每次迭代开头检查
@@ -629,7 +688,11 @@ func (a *app) start(mods ...IModule) bool {
 
 	// 所有模块初始化完成后，并发启动各自的 goroutine
 	for _, wrapper := range staticModules {
-		a.startServing(wrapper, false)
+		if !a.startServing(wrapper, false) {
+			slog.Warn("application start aborted, module already claimed by shutdown",
+				slog.String("module", wrapper.Name()))
+			return false
+		}
 	}
 
 	// 等待所有模块的事件循环（Serve）进入 select 就绪，避免 Serve 中跨模块 Call
@@ -662,11 +725,34 @@ func (a *app) start(mods ...IModule) bool {
 // 状态先于 goroutine 置位：关闭流程只对 lifecycleServing 的模块执行 wg.Wait，
 // 若先起 goroutine 再置位，并发的 stop 可能读到 lifecycleInited 而跳过等待。
 // wg.Go 在内部完成 Add，与 goroutine 的创建是原子的，无需外部 Add/Done 配对。
-func (a *app) startServing(wrapper *moduleWrapper, dynamic bool) {
-	wrapper.setLifecycle(lifecycleServing)
-	wrapper.wg.Go(func() {
+// 返回 false 表示模块已被并发的关闭流程接管，goroutine 未启动，调用方应就此收手。
+func (a *app) startServing(wrapper *moduleWrapper, dynamic bool) bool {
+	// wg.Add 必须排在状态置位**之前**，不能用 wg.Go 把两者合成一步。
+	// 关闭流程只对 lifecycleServing 的模块执行 wg.Wait：若先置位再 Add，
+	// 恰好卡在这两行之间的并发 stop 会抢到 lifecycleServing，然后对一个计数
+	// 仍为 0 的 wg 立刻 Wait 成功，紧接着开始 OnDestroy——而 Serve 此刻才被
+	// 拉起，事件循环与 OnDestroy 并发读写同一批业务内存，正是不可 recover 的 fatal。
+	// 先 Add 就没有这个窗口：stop 要么还没看到 Serving（跳过等待，但那时
+	// goroutine 也确实还没起），要么看到 Serving 且 wg 计数已经是 1。
+	wrapper.wg.Add(1)
+
+	// 用 CAS 而不是直写，理由与启动路径其余各处相同，但这里的后果最严重：
+	// 一个并发的 RemoveDynamicModule 可能刚刚把这个模块完整销毁过
+	// （OnDestroy → Close → Destroyed），直写会把它覆盖成 Serving 并拉起
+	// 事件循环——一个已经释放完资源的模块就这样复活了，之后再也不会有人
+	// 销毁它第二次。CAS 失败即表示模块已被接管，goroutine 不能起。
+	if !wrapper.advanceLifecycle(lifecycleInited, lifecycleServing) {
+		wrapper.wg.Done()
+		slog.Warn("module claimed before serving, goroutine not started",
+			slog.String("module", wrapper.Name()), slog.String("module_state", wrapper.lifecycleState().String()))
+		return false
+	}
+
+	go func() {
+		defer wrapper.wg.Done()
 		a.serveModule(wrapper, dynamic)
-	})
+	}()
+	return true
 }
 
 // serveModule 在独立 goroutine 中运行模块的 Serve 主循环。
@@ -719,7 +805,15 @@ func (a *app) stop() {
 		slog.Warn("application is not running")
 		return
 	}
-	// 先向 start 公示关闭意图，再决定是否需要等它跑完。
+	// 在同一个临界区里就把状态置成 AppStateStop，而不是等启动收敛之后再置：
+	// 下面等待 startDone 时锁是放开的，若那时状态还停在 AppStateInit，
+	// 并发的第二次 stop 会一路穿过上面的闸门跟着往下走。销毁本身有
+	// claimShutdown 的 CAS 兜底不会重复执行，但两条流程会各自扫一遍动态模块、
+	// 刷两遍 "shutdown initiated/complete" 日志，还会让外部观察到的 State()
+	// 出现 None → Stop → None 的抖动。闸门与状态置位原子化之后，
+	// 第二次 stop 在入口就被 "already stopping" 挡住。
+	a.setState(AppStateStop)
+	// 向 start 公示关闭意图，再决定是否需要等它跑完。
 	a.stopRequested.Store(true)
 	startDone := a.startDone
 	a.Unlock()
@@ -745,18 +839,10 @@ func (a *app) stop() {
 		timer.Stop()
 	}
 
-	a.Lock()
-	// 重取锁后复查：等待 startDone 的这段时间里锁是放开的，另一个 stop 可能
-	// 已经越过上面的状态闸门。销毁本身由 moduleWrapper.claimShutdown 保证只做
-	// 一次，这里再拦一道，避免两条关闭流程重复扫动态模块、刷重复日志。
-	if a.state.Load() == AppStateStop {
-		a.Unlock()
-		slog.Warn("application already stopping")
-		return
-	}
-	a.setState(AppStateStop)
+	// 状态已在入口置好，这里只需要取一份模块快照。
+	a.RLock()
 	staticModules := slices.Clone(a.modules)
-	a.Unlock()
+	a.RUnlock()
 
 	slog.Info("application shutdown initiated")
 
@@ -826,12 +912,15 @@ func (a *app) stop() {
 // 都会因为投递到已关闭队列而失败。OnDestroy 需要的收尾工作应该直接写成同步
 // 函数调用/循环，不要指望能把处理逻辑重新投递回本模块的事件循环——此刻事件
 // 循环已经不存在，没有人能消费这条自投递（详见 IModule.OnDestroy 的说明）。
-func (a *app) shutdownModule(wrapper *moduleWrapper) {
+// 返回值表示本次调用是否走完了完整的销毁（OnDestroy → Close），
+// false 出现在三种情形：销毁权被别人拿走、模块仍在 OnInit 中被跳过、
+// 等待 goroutine 退出超时。调用方（RemoveDynamicModule）据此如实告知使用者。
+func (a *app) shutdownModule(wrapper *moduleWrapper) bool {
 	state := wrapper.claimShutdown()
 	if state == lifecycleDestroying || state == lifecycleDestroyed {
 		// 销毁权已被别的调用方拿走（重复 stop、stop 与 RemoveDynamicModule 并发、
 		// 并发卸载同名动态模块），直接返回，保证销毁严格只发生一次。
-		return
+		return false
 	}
 
 	slog.Info("stopping module", slog.String("module", wrapper.Name()), slog.String("module_state", state.String()))
@@ -840,31 +929,40 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 	// 以释放 context 树上这个节点，并让任何持有该 ctx 的业务逻辑及时脱身。
 	wrapper.cancel()
 
+	// case 按状态机的自然顺序排列（Registered → Initing → InitFailed → Inited → Serving），
+	// 与 moduleLifecycle 常量的声明顺序一致，便于对照检查有没有漏掉哪个状态。
 	switch state {
-	case lifecycleIniting:
-		// OnInit 仍在另一条 goroutine 上执行，此刻碰它的业务内存必然是并发读写。
-		// 宁可漏掉一次销毁，也不要 fatal——与关闭超时分支同一条取舍。
-		slog.Error("module still initializing, destroy skipped", slog.String("module", wrapper.Name()))
-		return
 	case lifecycleRegistered, lifecycleInitFailed:
-		// OnInit 从未成功，模块没有由框架托管的资源，不调 OnDestroy / Close。
-		// 但仍要关掉它的 Server：否则别的模块向它投递时 IsClosed 为 false，
+		// OnInit 从未成功——要么一次都没被调用（Registered，启动在它之前就中止了），
+		// 要么返回了 error 并已按契约自行回滚（InitFailed）。两种情况下模块都没有
+		// 由框架托管的资源，不调 OnDestroy / Close。
+		// 但仍要收掉它的 Server：否则别的模块向它投递时 IsClosed 为 false，
 		// Cast/AsyncCall 会"成功"入队后静默蒸发，同步 Call 更是永久阻塞。
 		a.closeIdleServer(wrapper)
 		slog.Info("module destroy skipped, OnInit never succeeded",
 			slog.String("module", wrapper.Name()), slog.String("module_state", state.String()))
 		wrapper.setLifecycle(lifecycleDestroyed)
-		return
+		// 这类模块没有任何由框架托管的资源，"不调 OnDestroy"本身就是正确且
+		// 完整的收尾，因此算成功。
+		return true
+	case lifecycleIniting:
+		// OnInit 仍在另一条 goroutine 上执行，此刻碰它的业务内存必然是并发读写。
+		// 宁可漏掉一次销毁，也不要 fatal——与关闭超时分支同一条取舍。
+		// server 仍然要收掉：它的事件循环永远不会存在了，留着只会让别的模块
+		// 在 OnDestroy 里投递时以为投成功了（Cast/AsyncCall 静默蒸发），
+		// 或者同步 Call 永久等待一个不会到来的回包。
+		a.closeIdleServer(wrapper)
+		slog.Error("module still initializing, destroy skipped", slog.String("module", wrapper.Name()))
+		return false
 	case lifecycleInited:
 		// 资源已分配但事件循环从未启动：没有 goroutine 需要等待，
-		// 也没有人会替它关闭 Server，由框架代劳后再进入销毁。
-		a.closeIdleServer(wrapper)
+		// server 由下面的统一收口代劳。
 	case lifecycleServing:
 		if !a.waitModuleExit(wrapper) {
 			// 超时说明 Serve 还没退出，此时调 OnDestroy 就回到了并发读写的老问题上，
 			// 因此直接放弃本模块的销毁：宁可漏掉一次落地，也不要 fatal。
 			// 状态停在 lifecycleDestroying，不会被标记为已完成销毁。
-			return
+			return false
 		}
 	default:
 		// 兜底而非省略：状态机是这套关闭逻辑的唯一依据，日后新增一个
@@ -873,8 +971,18 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 		// （lifecycleDestroying / lifecycleDestroyed 已在函数开头拦下，到不了这里。）
 		slog.Error("unexpected module lifecycle state, destroy skipped",
 			slog.String("module", wrapper.Name()), slog.String("module_state", state.String()))
-		return
+		return false
 	}
+
+	// 统一收口，保证「OnDestroy 执行时本模块 Server 已关闭」这条不变量在
+	// **所有**路径上都成立，而不只是正常停机那条：
+	//   - Serving 且正常退出：Serve 的 ctx.Done 分支已经 Close 过，这里因
+	//     IsClosed 为真而跳过（幂等）；
+	//   - Serving 但 Serve 在 ctx.Done 分支之前 panic 或提前 return（动态模块
+	//     的 panic 只记日志不退进程，AddDynamicModules 的 waitReady 失败路径
+	//     走的就是这里）：没有人关过它，由这里收掉；
+	//   - Inited：事件循环从未存在，同样由这里收掉。
+	a.closeIdleServer(wrapper)
 
 	// 事件循环已停（或从未存在），业务内存此刻只有本 goroutine 访问，
 	// OnDestroy 可以安全遍历；client 仍然打开，OnDestroy 里的
@@ -886,6 +994,7 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) {
 	a.closeModule(wrapper)
 	wrapper.setLifecycle(lifecycleDestroyed)
 	slog.Info("module shutdown complete", slog.String("module", wrapper.Name()))
+	return true
 }
 
 // waitModuleExit 等待模块 goroutine 退出，返回 false 表示等待超时。
@@ -916,28 +1025,33 @@ func (a *app) waitModuleExit(wrapper *moduleWrapper) bool {
 	}
 }
 
-// closeIdleServer 关闭一个事件循环从未运行过的模块的 ChanRPC 服务端。
+// closeIdleServer 收掉一个事件循环从未运行过的模块的 ChanRPC 服务端。
 //
-// chanrpc.Server.Close 的前提是"必须在所属模块自己的事件循环 goroutine 上调用"，
-// 正常路径由 Skeleton.Serve 的 ctx.Done 分支满足。启动中途失败时这些模块的
-// Serve 一次都没跑过，没有任何 goroutine 会替它们关 server，于是：
+// server 的关闭正常由 Skeleton.Serve 的 ctx.Done 分支完成。启动中途失败时
+// 这些模块的 Serve 一次都没跑过，没有任何 goroutine 会替它们关 server，于是：
 //   - 别的模块 OnDestroy 里的 Cast/AsyncCall 因为 IsClosed 为 false 而"投递成功"，
 //     然后随进程退出静默蒸发，没有任何错误或日志；
 //   - 同步 Call 更糟：对端事件循环根本不存在，回包永远不会产生，
 //     调用方永久阻塞在 chanrpc 的等待循环里（只每 5 秒打一条 warn），
 //     而 shutdownTimeout 只覆盖 wg.Wait，覆盖不到 OnDestroy 本身。
 //
-// 由框架在这里代关是安全的：该模块从来没有事件循环，此刻唯一的访问者就是
-// 停机 goroutine，不存在 Close 注释所担心的并发访问。队列里若有 OnInit 阶段
-// 投递进来的积压请求，Close 会照常排空执行；对 OnInit 从未成功的模块，
-// handler 尚未注册，exec 会回一个 "not registered" 错误包，
-// 调用方拿到的是明确错误而不是永久等待。
+// 用的是 Abandon 而不是 Close，这个区别很关键。Close 会把队列里的积压请求
+// 真正**执行**一遍，那正是它要求"只能在所属模块自己的事件循环上调用"的原因；
+// 而这里跑的是框架的停机 goroutine。在这里执行别人的 handler 会踩两个坑：
+// 一是 handler 对业务状态的访问不再局限于单一 goroutine，actor 模型赖以免锁
+// 的前提被打破；二是 handler 若发起同步 Call、而对端同样是个事件循环从未运行
+// 过的模块，回包永远不会产生，整个 stop 就永久卡死——Close 的 closeDrainTimeout
+// 只保护"等待队列里的下一个请求"，保护不了 handler 自身的执行。
+//
+// Abandon 因此选择把积压请求逐一回成 ErrServerAbandoned：调用方拿到一个明确
+// 的失败，而不是静默蒸发或永久等待。丢掉这些请求是正确的——该模块从未宣告
+// 就绪（Ready 未关闭），本就不该处理任何请求。
 func (a *app) closeIdleServer(wrapper *moduleWrapper) {
 	server := wrapper.ChanRPC()
 	if server == nil || server.IsClosed() {
 		return
 	}
-	server.Close()
+	server.Abandon()
 }
 
 // closeModule 调用模块的 Close 并捕获其中可能发生的 panic。
@@ -976,6 +1090,11 @@ func (a *app) destroyModule(wrapper *moduleWrapper) {
 // DynamicModules 返回当前所有动态模块的名称列表，用于监控和管理。
 func (a *app) DynamicModules() (res []string) {
 	a.dynamicModules.Range(func(key, value any) bool {
+		// 与 getChanRPCDynamic 一致：跳过仍在 OnInit / 等待就绪的占位条目，
+		// 对外只呈现真正已经在服务的模块。
+		if wrapper, ok := value.(*moduleWrapper); ok && !wrapper.visible.Load() {
+			return true
+		}
 		res = append(res, key.(string))
 		return true
 	})
@@ -1036,47 +1155,95 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 	})
 	for _, wrapper := range wrappers {
 		name := wrapper.Name()
-		// 重名直接拒绝：Store 会静默覆盖同名 key，被覆盖的旧 wrapper 从此再无
-		// 任何引用能触及——cancel 永不调用、goroutine 永久驻留、OnDestroy/Close
-		// 永不执行，removeAllDynamicModules 按名字遍历也看不见它。
-		if _, exists := a.dynamicModules.Load(name); exists {
-			initErr := fmt.Errorf("dynamic module %q already exists", name)
-			wrapper.cancel()
+		fail := func(initErr error) {
 			slog.Error("module init error", slog.String("module", name), slog.Any("error", initErr))
 			results = append(results, AddDynamicModuleResult{Name: name, Err: initErr})
 			failedNames = append(failedNames, name)
+		}
+
+		// **先原子占住名字，再 OnInit。** 此前是"Load 检查重名 → OnInit →
+		// startServing → waitReady → Store"，检查与登记之间隔着整个初始化过程，
+		// 两个并发调用会双双通过检查、各自跑完 OnInit 并启动 goroutine，最后
+		// 后写入的那个静默覆盖前一个：被覆盖的 wrapper 从此再无任何引用能触及，
+		// cancel 永不调用、goroutine 连同 LockOSThread 绑定的系统线程永久驻留、
+		// OnDestroy/Close 永不执行，而两个同名模块还在同时对外服务。
+		// LoadOrStore 把"检查 + 占位"合成一个原子操作，彻底消掉这个窗口。
+		//
+		// 占位期间模块尚未就绪，靠 wrapper.visible 挡住对外可见性，
+		// 语义仍是"等模块 Ready 之后 ChanRPC(name) 才查得到它"（见 getChanRPCDynamic）。
+		// 顺带的好处是：占位一旦落进 dynamicModules，正在进行的 stop 就能
+		// 通过 removeAllDynamicModules 看见它，不会再漏掉一个还在 OnInit 的模块。
+		// seq 必须在占位**之前**写定：占位一落进表里，wrapper 就可能被别的
+		// goroutine 读到，而 seq 是普通字段不是原子量，那时再写就是数据竞争。
+		// 代价是被拒绝的模块也会消耗一个序号，这无关紧要——seq 只用于同优先级
+		// 内部的相对排序，不要求连续。
+		wrapper.seq = a.dynSeq.Add(1)
+
+		if _, loaded := a.dynamicModules.LoadOrStore(name, wrapper); loaded {
+			wrapper.cancel()
+			fail(fmt.Errorf("dynamic module %q already exists", name))
 			continue
 		}
 
-		wrapper.setLifecycle(lifecycleIniting)
+		wrapper.advanceLifecycle(lifecycleRegistered, lifecycleIniting)
 		if initErr := wrapper.OnInit(); initErr != nil {
-			wrapper.setLifecycle(lifecycleInitFailed)
-			// 释放 context 节点：wrapper 到此被彻底丢弃，不会再有任何路径能触及它。
+			wrapper.advanceLifecycle(lifecycleIniting, lifecycleInitFailed)
+			// 摘除占位并释放 context 节点：wrapper 到此被彻底丢弃。
 			// OnInit 已分配的业务资源由 OnInit 自己在返回 error 前回滚，
 			// 框架不调用 OnDestroy/Close——与静态路径的契约完全一致。
+			a.dynamicModules.CompareAndDelete(name, wrapper)
 			wrapper.cancel()
-			slog.Error("module init error", slog.String("module", name), slog.Any("error", initErr))
-			results = append(results, AddDynamicModuleResult{Name: name, Err: initErr})
-			failedNames = append(failedNames, name)
+			fail(initErr)
 			continue
 		}
-		a.startServing(wrapper, true) // dynamic=true：panic 不退出进程
-		// 等待事件循环就绪后再存入，保证 ChanRPC 可接收。
+		// CAS 推进而非直写：占位已经落进 dynamicModules，一个并发的 stop
+		// 可能在 OnInit 执行期间就通过 removeAllDynamicModules 接管了这个模块
+		// （抢到 lifecycleIniting 后会跳过销毁，以避开与 OnInit 的并发）。
+		// 此刻直写会把 Destroying 覆盖成 Inited，把一个已被放弃的模块重新
+		// 拉回"活着"的状态，然后照常 startServing——那正是孤儿模块的来源。
+		if !wrapper.advanceLifecycle(lifecycleIniting, lifecycleInited) {
+			a.dynamicModules.CompareAndDelete(name, wrapper)
+			slog.Error("module claimed by shutdown while initializing, resources may leak",
+				slog.String("module", name), slog.String("module_state", wrapper.lifecycleState().String()))
+			fail(fmt.Errorf("dynamic module %q claimed by shutdown while initializing", name))
+			continue
+		}
+
+		// OnInit 期间收到了停止信号：入口那道闸门只挡住"调用时已经在关闭"，
+		// 挡不住"调用通过之后才开始关闭"。OnInit 动辄几百毫秒到数秒（建连接池、
+		// 拉配置），这段时间足够 stop 跑完两轮 removeAllDynamicModules 并宣告
+		// "shutdown complete"。此刻再把模块启动起来，它就成了一个永不退出、
+		// 永不 OnDestroy 的孤儿。这里就地收掉它：状态是 lifecycleInited，
+		// shutdownModule 会完整执行 OnDestroy → Close。
+		if a.stopRequested.Load() {
+			a.dynamicModules.CompareAndDelete(name, wrapper)
+			a.shutdownModule(wrapper)
+			fail(fmt.Errorf("application is shutting down, dynamic module %q rolled back", name))
+			continue
+		}
+
+		if !a.startServing(wrapper, true) { // dynamic=true：panic 不退出进程
+			// 并发的 RemoveDynamicModule 已经接管（甚至可能已销毁完）这个模块，
+			// 占位若还在则摘掉，本次添加算失败。
+			a.dynamicModules.CompareAndDelete(name, wrapper)
+			fail(fmt.Errorf("dynamic module %q claimed by shutdown before serving", name))
+			continue
+		}
+		// 等待事件循环就绪后才对外可见，保证 ChanRPC 一定能接收。
 		// waitReady 同时监视 goroutine 退出：Serve 若在 close(ready) 之前 panic，
 		// 动态模块的 panic 不会退出进程，只等 ready 会让调用方（常是 HTTP 热加载
 		// 接口的处理协程）永久挂死。
 		if !wrapper.waitReady() {
-			initErr := fmt.Errorf("dynamic module %q serve exited before becoming ready", name)
 			slog.Error("module serve exited before becoming ready", slog.String("module", name))
+			a.dynamicModules.CompareAndDelete(name, wrapper)
 			a.shutdownModule(wrapper)
-			results = append(results, AddDynamicModuleResult{Name: name, Err: initErr})
-			failedNames = append(failedNames, name)
+			fail(fmt.Errorf("dynamic module %q serve exited before becoming ready", name))
 			continue
 		}
-		// 记录添加序号：sync.Map.Range 不保证遍历顺序，removeAllDynamicModules
-		// 靠这个单调递增序号在同优先级内重建真实的添加顺序，见 moduleWrapper.seq 的说明。
-		wrapper.seq = a.dynSeq.Add(1)
-		a.dynamicModules.Store(name, wrapper)
+
+		// 置为可见：至此模块才真正对 ChanRPC/Stats/DynamicModules 以及停机
+		// 流程存在。seq 早在占位之前就写好了（见上），这里只翻可见性开关。
+		wrapper.visible.Store(true)
 		results = append(results, AddDynamicModuleResult{Name: name})
 	}
 
@@ -1106,8 +1273,18 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 // shutdownModule 之后，动态模块也拿到了 Close 调用、wg.Wait 超时保护，
 // 以及"OnDestroy 执行时本模块 Server 已关闭"这条与静态模块相同的语义。
 //
-// 该操作是同步阻塞的，调用方会等待模块完全停止后才返回，
-// 确保模块的所有资源在函数返回前已被完整清理，避免悬挂的 goroutine 或资源泄漏。
+// 该操作是同步阻塞的，调用方会等待模块停止后才返回。
+//
+// 返回值表示**销毁是否真的完整走完**（OnDestroy → Close），而不只是"找到了这个
+// 模块"。false 有两种来源，都意味着调用方不能认为资源已经释放：
+//   - 模块不存在，或表里存的不是一个合法 wrapper；
+//   - 等待模块 goroutine 退出超时（Serve 不响应 ctx.Done），此时框架按既定取舍
+//     跳过 OnDestroy/Close，宁可漏掉一次落地也不与仍在运行的事件循环并发。
+//
+// 后一种情况尤其要留意：模块已经被摘出模块表，再也不会有人来补做这次销毁，
+// 而它的 goroutine 可能还在跑。此时**不要**立刻用同名模块重新加载——重名检查
+// 只看模块表，旧实例已经不在表里，检查会通过，于是新旧两个实例同时持有同一份
+// 外部资源（监听端口、连接池、分布式锁），而旧实例的 OnDestroy 永远不会执行。
 func (a *app) RemoveDynamicModule(name string) bool {
 	value, ok := a.dynamicModules.LoadAndDelete(name)
 	if !ok {
@@ -1119,9 +1296,7 @@ func (a *app) RemoveDynamicModule(name string) bool {
 		return false
 	}
 
-	a.shutdownModule(wrapper)
-
-	return true
+	return a.shutdownModule(wrapper)
 }
 
 // removeAllDynamicModules 按优先级倒序关闭所有动态模块。
@@ -1137,11 +1312,21 @@ func (a *app) RemoveDynamicModule(name string) bool {
 // 之间同样会被重新排序，只有同优先级组内部保留添加顺序，示例见 start 中的注释。
 // 倒序遍历即得到与初始化相反的关闭顺序：后添加的模块先关闭，与静态模块的
 // LIFO 停机语义保持一致，避免动态模块间的依赖关系在关闭阶段被打破。
+//
+// **只处理已完成登记（visible）的模块。** AddDynamicModules 为了原子地防住
+// 并发重名，会在 OnInit 之前就用 LoadOrStore 把名字占进这张表；那些条目此刻
+// 正被自己的 OnInit 修改，既不该被这里读（排序要读 Priority/seq）、也不该被
+// 这里销毁——抢占一个仍在 OnInit 的模块只能跳过它的 OnDestroy（避开与 OnInit
+// 的并发读写），结果就是它的资源永远没人释放。
+//
+// 占位期模块的收尾由 AddDynamicModules 自己负责：它在 OnInit 返回后会复查
+// stopRequested，发现关闭已经开始就地执行完整的 shutdownModule。职责这样划分
+// 之后两边都不会漏：可见的归 stop，不可见的归添加它的那个调用方。
 func (a *app) removeAllDynamicModules() {
 	var wrappers []*moduleWrapper
 
 	a.dynamicModules.Range(func(key, value any) bool {
-		if wrapper, ok := value.(*moduleWrapper); ok {
+		if wrapper, ok := value.(*moduleWrapper); ok && wrapper.visible.Load() {
 			wrappers = append(wrappers, wrapper)
 		}
 		return true

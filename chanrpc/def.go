@@ -82,6 +82,14 @@ func ID(m any) uint32 {
 var (
 	// ErrServerClosed 表示 ChanRPC 服务端已关闭。
 	ErrServerClosed = errors.New("chanrpc: server closed")
+	// ErrServerAbandoned 表示请求投递到了一个事件循环从未运行过的模块。
+	//
+	// 出现在应用启动中途失败的场景：某个模块的 OnInit 成功了（handler 已注册、
+	// 队列可以接收），但排在它后面的模块 OnInit 失败导致启动中止，它的 Serve
+	// 一次都没被拉起。此时队列里的积压请求没有任何事件循环会来消费，框架在
+	// 关闭该模块时用 Server.Abandon 把它们逐一回成这个错误——调用方拿到一个
+	// 明确的失败，而不是静默丢弃（Cast/AsyncCall）或永久等待（同步 Call）。
+	ErrServerAbandoned = errors.New("chanrpc: server abandoned")
 	// ErrClientClosed 表示 ChanRPC 客户端已关闭。
 	ErrClientClosed = errors.New("chanrpc: client closed")
 	// ErrServerNil 表示调用目标服务端为空。

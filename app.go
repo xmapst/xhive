@@ -67,7 +67,17 @@ func DynamicModules() []string {
 //
 // 返回值 results 记录每个模块的处理结果（成功或失败原因），调用方可据此
 // 精确判断哪些模块成功、哪些失败，而不必因为 err 非 nil 就误以为全部失败；
-// err 非 nil 时仅表示至少有一个模块初始化失败，具体失败列表见 results。
+// err 非 nil 时通常表示至少有一个模块初始化失败，具体失败列表见 results。
+//
+// 有一个例外：应用已进入关闭流程时整批调用会被直接拒绝，此时 err 非 nil 而
+// results 为 nil——按 results 遍历上报的调用方在这条路径上会什么都上报不出来，
+// 需要单独处理 err。
+//
+// 两项拒绝规则：
+//   - 名称已被占用的模块会被拒绝，不会覆盖已有模块（此前是静默覆盖，
+//     被覆盖的模块从此无人可达，goroutine 与资源永久泄漏）；
+//   - 应用已经开始关闭（或已关闭）时整批拒绝，避免登记出无人负责销毁的模块。
+//     初始化期间才开始关闭的模块会被就地回滚（执行 OnDestroy → Close）并计为失败。
 func AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err error) {
 	return defaultApp.AddDynamicModules(mods...)
 }
@@ -77,7 +87,10 @@ func AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err e
 // 操作为同步阻塞，与静态模块的关闭路径完全一致：
 // 先原子摘除（模块立即对 ChanRPC 不可见）→ cancel（发停止信号）→
 // 等待 goroutine 退出（受 WithShutdownTimeout 保护）→ OnDestroy → Close。
-// 调用方会等待模块完全停止后才返回，确保所有资源在函数返回前已被完整清理。
+//
+// 返回值表示销毁是否真的完整走完，而不只是"找到了这个模块"：模块不存在返回
+// false，等待 goroutine 退出超时、框架跳过 OnDestroy/Close 时同样返回 false。
+// 后者意味着资源并未释放且再也没有人会来补做，详见 app.RemoveDynamicModule。
 func RemoveDynamicModule(name string) bool {
 	return defaultApp.RemoveDynamicModule(name)
 }
