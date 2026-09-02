@@ -64,7 +64,7 @@ func WithClientChanLen(n int) ClientOption {
 // WithClientCloseTimeout 自定义 Close 等待待处理异步回调排空的超时
 // 上限，见 Client.Close 的说明。d <= 0 时该选项不生效，沿用
 // defaultClientCloseTimeout（5 秒）。命名带 Client 前缀的原因与
-// WithClientInitialCapacity 相同：跟 Server 侧的 WithCloseDrainTimeout
+// WithClientChanLen 相同：跟 Server 侧的 WithCloseDrainTimeout
 // 是两个不同的 Option 类型，包级别不能同名。
 func WithClientCloseTimeout(d time.Duration) ClientOption {
 	return func(opts *clientOptions) {

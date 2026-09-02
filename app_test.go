@@ -25,9 +25,17 @@ type testModule struct {
 	initCount   atomic.Int32
 	runCount    atomic.Int32
 	destroyCnt  atomic.Int32
+	closeCnt    atomic.Int32
 	runStarted  chan struct{}
 	runStopped  chan struct{}
+	initHook    func()
 	destroyHook func()
+	closeHook   func()
+	// keepServerOpen 让 OnDestroy 不再自己关闭 server。testModule 的 OnDestroy
+	// 默认顺手关掉 server，这会掩盖"框架是否替从未 Serve 过的模块关过 server"
+	// 这一点——模块自己关了，测试就永远看不出框架漏关。
+	keepServerOpen bool
+	serveHook      func(ctx context.Context) bool // 返回 false 表示不走默认 Serve（不关闭 runStarted）
 }
 
 func newTestModule(name string) *testModule {
@@ -47,11 +55,17 @@ func (m *testModule) Priority() uint { return m.priority }
 
 func (m *testModule) OnInit() error {
 	m.initCount.Add(1)
+	if m.initHook != nil {
+		m.initHook()
+	}
 	return m.initErr
 }
 
 func (m *testModule) Serve(ctx context.Context) {
 	m.runCount.Add(1)
+	if m.serveHook != nil && !m.serveHook(ctx) {
+		return
+	}
 	close(m.runStarted)
 	<-ctx.Done()
 	close(m.runStopped)
@@ -66,7 +80,7 @@ func (m *testModule) OnDestroy() {
 	if m.destroyHook != nil {
 		m.destroyHook()
 	}
-	if m.server != nil && !m.server.IsClosed() {
+	if !m.keepServerOpen && m.server != nil && !m.server.IsClosed() {
 		m.server.Close()
 	}
 }
@@ -76,7 +90,13 @@ func (m *testModule) ChanRPC() *chanrpc.Server { return m.server }
 // Close 是 IModule 的第二段关闭钩子，由框架在 OnDestroy 之后调用。
 // testModule 没有独立的 client 资源（真实模块的 client 由内嵌的
 // *Skeleton 持有），这里无事可做。
-func (m *testModule) Close() error { return nil }
+func (m *testModule) Close() error {
+	m.closeCnt.Add(1)
+	if m.closeHook != nil {
+		m.closeHook()
+	}
+	return nil
+}
 
 func waitClosed(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
 	t.Helper()

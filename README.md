@@ -172,10 +172,10 @@ type IModule interface {
 生命周期约定：
 
 1. 静态模块按 `Priority()` 升序执行 `OnInit`，同优先级时保留注册顺序（稳定排序）。
-2. 任一静态模块 `OnInit` 失败，应用启动失败。
+2. 任一静态模块 `OnInit` 失败，应用启动失败。框架随后只对**已成功 `OnInit`** 的模块执行 `OnDestroy` → `Close`：`OnInit` 返回了 error 的模块（它必须在返回前自行回滚已分配的资源）、以及排在它之后一次都没被 `OnInit` 过的模块，都不会收到 `OnDestroy`/`Close`。
 3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`；进入事件循环后 `Ready()` 返回的 channel 会被关闭。框架只在两处等待该信号：`start` 等全部静态模块 `Ready` 后才把状态置为 `AppStateRun`，`AddDynamicModules` 等模块 `Ready` 后才把它放进动态模块表（在此之前 `ChanRPC(name)` 查不到它）。静态模块的 goroutine 是并发启动的，框架不会阻止已就绪模块向尚未就绪的模块发起调用；`Priority` 只决定 `OnInit` 的先后，不保证 `Serve` 就绪的先后。
-4. `OnDestroy` 用于释放业务资源。静态模块的关闭顺序是 `cancel` → 等待 `Serve` 退出 → `OnDestroy` → `Close`，此时事件循环已停，不能再对本模块自投递（见 `IModule.OnDestroy` 的说明），`Close` 释放出站 client 资源；动态模块由 `RemoveDynamicModule` 先执行 `OnDestroy` 再 `cancel` 并等待 goroutine 退出，此时事件循环仍在运行，且框架不会调用 `Close`。
-5. 逃出 `Serve` 主循环的 panic：静态模块记录堆栈后以退出码 `255` 终止进程，动态模块只记录日志；`start`（含静态模块 `OnInit`）期间的 panic 同样以 `255` 退出。`OnDestroy` 期间的 panic 由框架统一 recover，静态、动态模块都只记日志并继续后续关闭流程。
+4. `OnDestroy` 用于释放业务资源。**静态模块与动态模块走同一条关闭路径**：`cancel` → 等待 `Serve` 退出（受关闭超时保护）→ `OnDestroy` → `Close`。此时事件循环已停，不能再对本模块自投递（见 `IModule.OnDestroy` 的说明），`Close` 释放出站 client 资源。动态模块由 `RemoveDynamicModule` 先把自己从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走上述同一流程。
+5. 逃出 `Serve` 主循环的 panic：静态模块记录堆栈后以退出码 `255` 终止进程，动态模块只记录日志；`start`（含静态模块 `OnInit`）期间的 panic 同样以 `255` 退出。`OnDestroy` 与 `Close` 期间的 panic 都由框架统一 recover，静态、动态模块都只记日志并继续后续关闭流程。
 
 ### Skeleton
 
@@ -352,11 +352,11 @@ AppStateNone
     │ Run
     ▼
 AppStateInit
-    │ 所有静态模块 OnInit 成功
-    ▼
-AppStateRun
-    │ 收到 SIGINT / SIGTERM 或启动失败
-    ▼
+    │ 所有静态模块 OnInit 成功        │ 任一 OnInit 失败
+    ▼                                │
+AppStateRun                          │
+    │ 收到 SIGINT / SIGTERM          │
+    ▼                                ▼
 AppStateStop
     │ 关闭动态模块，再逆序关闭静态模块
     ▼
@@ -368,9 +368,10 @@ AppStateNone
 1. 进入 `AppStateStop`。
 2. 关闭所有动态模块。
 3. 按启动顺序（`Priority` 升序，同优先级保留注册顺序）整体逆序关闭静态模块（LIFO）。
-4. 每个静态模块先取消 context 并等待 goroutine 退出，再执行 `OnDestroy`，最后调用 `Close` 释放出站 client。
-5. 单个静态模块关闭超时默认为 30 分钟；超时不强杀，仅记录错误日志，并跳过该模块的 `OnDestroy` 与 `Close`。
-6. 全部关闭后回到 `AppStateNone`。
+4. 每个模块先取消 context 并等待 goroutine 退出，再执行 `OnDestroy`，最后调用 `Close` 释放出站 client。只有 `OnInit` 成功返回过的模块参与这一步（启动中途失败时，未初始化的模块只会被关掉 ChanRPC 服务端，不收 `OnDestroy`/`Close`）。
+5. 单个模块关闭超时默认为 30 分钟，静态与动态模块同样受此保护；超时不强杀，仅记录错误日志，并跳过该模块的 `OnDestroy` 与 `Close`。
+6. 全部关闭后回到 `AppStateNone`。注意此时**不支持再次启动**——`start` 会检查模块生命周期状态并明确拒绝，需要重启请新建模块实例与新的 app。
+7. 关闭若发生在启动尚未完成时（例如启动期收到 SIGTERM），框架先等 `start` 收敛（默认上限 30 秒）再开始销毁，避免 `OnDestroy` 与仍在执行的 `OnInit` 并发读写同一批业务内存；超时兜底放行时，仍在 `OnInit` 中的那个模块会被跳过销毁。
 
 ---
 
@@ -399,10 +400,10 @@ _ = removed
 
 动态模块特性：
 
-- `AddDynamicModules` 按 `Priority` 升序（同优先级保留传参顺序）依次执行 `OnInit`，成功后启动 `Serve`，并等待模块 `Ready()` 后才登记到动态模块表。
-- `RemoveDynamicModule` 同步执行 `OnDestroy`、取消 context、等待 goroutine 退出，再删除模块记录。
-- 动态模块 `Serve` 与 `OnDestroy` 中的 panic 会被捕获，不会退出进程；`OnInit` 在调用方 goroutine 上同步执行，其 panic 不被框架捕获。
-- 批量添加中途失败时，已经启动的动态模块不会自动回滚。
+- `AddDynamicModules` 按 `Priority` 升序（同优先级保留传参顺序）依次执行 `OnInit`，成功后启动 `Serve`，并等待模块 `Ready()` 后才登记到动态模块表。重名模块会被直接拒绝，不会覆盖已有模块；应用已进入关闭流程后调用会整体拒绝，避免登记出无人负责关闭的模块。
+- `RemoveDynamicModule` 先把模块从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走与静态模块完全相同的关闭路径：取消 context → 等待 goroutine 退出（受关闭超时保护）→ `OnDestroy` → `Close`。并发卸载同名模块时只有一个调用方会执行销毁并返回 `true`。
+- 动态模块 `Serve`、`OnDestroy` 与 `Close` 中的 panic 会被捕获，不会退出进程；`OnInit` 在调用方 goroutine 上同步执行，其 panic 不被框架捕获。
+- 批量添加中途失败时，已经启动的动态模块不会自动回滚；`OnInit` 失败的那个模块不会收到 `OnDestroy`/`Close`（须由 `OnInit` 自行回滚），与静态模块语义一致。
 
 ---
 
@@ -426,7 +427,7 @@ _ = removed
 
 | 常量 | 说明 |
 | --- | --- |
-| `AppStateNone` | 应用未启动或已完全停止。 |
+| `AppStateNone` | 应用未启动或已完全停止；已停止的应用**不支持再次启动**。 |
 | `AppStateInit` | 应用正在初始化。 |
 | `AppStateRun` | 应用运行中。 |
 | `AppStateStop` | 应用正在关闭。 |
@@ -532,11 +533,13 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 ### 动态模块和静态模块有什么区别？
 
-静态模块随应用启停，不支持运行时卸载，逃出 `Serve` 主循环的 panic 会以退出码 `255` 终止进程。动态模块支持运行时加载和卸载，同样位置的 panic 只记录日志。两者的 ChanRPC handler、异步回调、定时器回调和 `OnDestroy` 都由框架各自 recover，只记录日志（handler panic 还会回包错误），不会退出进程。
+静态模块随应用启停，不支持运行时卸载，逃出 `Serve` 主循环的 panic 会以退出码 `255` 终止进程。动态模块支持运行时加载和卸载，同样位置的 panic 只记录日志。两者的 ChanRPC handler、异步回调、定时器回调、`OnDestroy` 和 `Close` 都由框架各自 recover，只记录日志（handler panic 还会回包错误），不会退出进程。
 
 ### 模块关闭超时了会怎样？
 
-框架等待单个模块 `Serve` 退出的上限是 30 分钟。超时后不强杀，但会记录一条 error 并跳过该模块的 `OnDestroy` 和 client 释放——此时事件循环仍在运行，调 `OnDestroy` 会与它并发读写同一批业务内存，触发 Go 运行时不可 recover 的 fatal。因此 `Serve` 必须能及时响应 `ctx.Done()`，否则依赖 `OnDestroy` 的落地逻辑整段不会执行。
+框架等待单个模块 `Serve` 退出的上限是 30 分钟，静态模块与动态模块（含 `RemoveDynamicModule` 卸载）都受这一保护。超时后不强杀，但会记录一条 error 并跳过该模块的 `OnDestroy` 和 client 释放——此时事件循环仍在运行，调 `OnDestroy` 会与它并发读写同一批业务内存，触发 Go 运行时不可 recover 的 fatal。因此 `Serve` 必须能及时响应 `ctx.Done()`，否则依赖 `OnDestroy` 的落地逻辑整段不会执行。
+
+注意该超时只覆盖"等待模块 goroutine 退出"这一步，覆盖不到 `OnDestroy` 自身的执行。所以 `OnDestroy` 里跨模块投递请用 `Cast`/`AsyncCall` 或带超时的 `CallWithContext`，不要用同步 `Call`：启动中途失败时对端的事件循环可能一次都没跑过，回包永远不会产生，同步 `Call` 会让整个停机流程永久卡住。
 
 ### 延迟响应如何使用？
 

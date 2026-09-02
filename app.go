@@ -74,7 +74,9 @@ func AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err e
 
 // RemoveDynamicModule 从全局默认应用实例中同步移除并销毁指定名称的动态模块。
 //
-// 操作为同步阻塞：OnDestroy（清理资源）→ cancel（发停止信号）→ wg.Wait（等待 goroutine 退出）→ 从 map 移除。
+// 操作为同步阻塞，与静态模块的关闭路径完全一致：
+// 先原子摘除（模块立即对 ChanRPC 不可见）→ cancel（发停止信号）→
+// 等待 goroutine 退出（受 WithShutdownTimeout 保护）→ OnDestroy → Close。
 // 调用方会等待模块完全停止后才返回，确保所有资源在函数返回前已被完整清理。
 func RemoveDynamicModule(name string) bool {
 	return defaultApp.RemoveDynamicModule(name)
