@@ -321,6 +321,14 @@ func (s *Server) Abandon() {
 	}
 
 	s.closed.Store(true)
+
+	// 防住手工构造的 Server（&chanrpc.Server{} 而不是 NewServer）：它的 chanCall
+	// 是 nil，close(nil) 会 panic。这条路径由框架的停机流程走，且只在启动中途
+	// 失败时才触发——那是最不该再叠加一次 panic 的时刻，何况 closeIdleServer
+	// 的调用点外面并没有 recover。标记为已关闭就够了：没有队列，也就没有积压。
+	if s.chanCall == nil {
+		return
+	}
 	close(s.chanCall)
 
 	var abandoned int

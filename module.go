@@ -724,7 +724,9 @@ func (a *app) start(mods ...IModule) bool {
 //
 // 状态先于 goroutine 置位：关闭流程只对 lifecycleServing 的模块执行 wg.Wait，
 // 若先起 goroutine 再置位，并发的 stop 可能读到 lifecycleInited 而跳过等待。
-// wg.Go 在内部完成 Add，与 goroutine 的创建是原子的，无需外部 Add/Done 配对。
+//
+// **不要把 wg.Add + go 合并回 wg.Go。** 见下面对顺序的说明：wg.Go 会把 Add
+// 挪到状态置位之后，重新打开那个"stop 对 0 计数 wg 立刻 Wait 成功"的窗口。
 // 返回 false 表示模块已被并发的关闭流程接管，goroutine 未启动，调用方应就此收手。
 func (a *app) startServing(wrapper *moduleWrapper, dynamic bool) bool {
 	// wg.Add 必须排在状态置位**之前**，不能用 wg.Go 把两者合成一步。
@@ -948,10 +950,13 @@ func (a *app) shutdownModule(wrapper *moduleWrapper) bool {
 	case lifecycleIniting:
 		// OnInit 仍在另一条 goroutine 上执行，此刻碰它的业务内存必然是并发读写。
 		// 宁可漏掉一次销毁，也不要 fatal——与关闭超时分支同一条取舍。
-		// server 仍然要收掉：它的事件循环永远不会存在了，留着只会让别的模块
-		// 在 OnDestroy 里投递时以为投成功了（Cast/AsyncCall 静默蒸发），
-		// 或者同步 Call 永久等待一个不会到来的回包。
-		a.closeIdleServer(wrapper)
+		//
+		// **连它的 Server 都不能碰。** closeIdleServer 要先调 wrapper.ChanRPC()，
+		// 那是模块自己的方法，读的是 OnInit 此刻可能正在赋值的字段；
+		// 在这里代关 server 等于把"不与 OnInit 并发"这条规矩自己破了一次。
+		// 代价是这个模块的 server 保持打开，别的模块向它投递不会立刻失败——
+		// 但这条路径本身就已经是"启动期卡住 + 收到停止信号"的异常现场，
+		// 记一条 error 让运维能定位，比为了收个 server 去冒 fatal 的风险划算。
 		slog.Error("module still initializing, destroy skipped", slog.String("module", wrapper.Name()))
 		return false
 	case lifecycleInited:
@@ -1185,7 +1190,17 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 			continue
 		}
 
-		wrapper.advanceLifecycle(lifecycleRegistered, lifecycleIniting)
+		// 必须检查这次 CAS：占位一落进表里，一个并发的 RemoveDynamicModule 就
+		// 可能立刻摘走它并抢到销毁权。那时模块还是 lifecycleRegistered，
+		// shutdownModule 走"OnInit 从未成功"分支、宣告收尾完整并返回 true——
+		// 卸载方据此回复"已卸载"。此刻若无视失败的 CAS 继续跑 OnInit，
+		// 就会在框架已经宣告该模块不存在之后，再建一套连接池、再占一次端口，
+		// 而这些资源没有任何引用能触及。
+		if !wrapper.advanceLifecycle(lifecycleRegistered, lifecycleIniting) {
+			a.dynamicModules.CompareAndDelete(name, wrapper)
+			fail(fmt.Errorf("dynamic module %q claimed before initialization", name))
+			continue
+		}
 		if initErr := wrapper.OnInit(); initErr != nil {
 			wrapper.advanceLifecycle(lifecycleIniting, lifecycleInitFailed)
 			// 摘除占位并释放 context 节点：wrapper 到此被彻底丢弃。
@@ -1244,6 +1259,25 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 		// 置为可见：至此模块才真正对 ChanRPC/Stats/DynamicModules 以及停机
 		// 流程存在。seq 早在占位之前就写好了（见上），这里只翻可见性开关。
 		wrapper.visible.Store(true)
+
+		// 翻开可见性之后再复查一次。前一次复查（OnInit 之后）挡不住这段窗口：
+		// 那之后还要 startServing + waitReady，Serve 启动本身就要几毫秒，
+		// 足够一次 stop 跑完两轮 removeAllDynamicModules——而那两轮因为
+		// visible 还是 false 全都跳过了这个模块。等这里翻开开关时，
+		// 停机流程早已结束，谁也不会再来关它：goroutine 连同 LockOSThread
+		// 绑定的系统线程永久驻留，OnDestroy/Close 永不执行，而且没有任何日志。
+		//
+		// 顺序上先 Store 再复查是必要的：反过来的话，恰好在"复查通过"与
+		// "Store" 之间开始的 stop 仍然看不见这个模块，窗口没有被消掉。
+		// 先翻开可见性意味着从这一刻起 stop 一定能看到它，两边至少有一方
+		// 会负责收尾——重复销毁由 claimShutdown 的 CAS 兜住。
+		if a.stopRequested.Load() {
+			a.dynamicModules.CompareAndDelete(name, wrapper)
+			a.shutdownModule(wrapper)
+			fail(fmt.Errorf("application started shutting down, dynamic module %q rolled back", name))
+			continue
+		}
+
 		results = append(results, AddDynamicModuleResult{Name: name})
 	}
 
@@ -1286,13 +1320,39 @@ func (a *app) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 // 只看模块表，旧实例已经不在表里，检查会通过，于是新旧两个实例同时持有同一份
 // 外部资源（监听端口、连接池、分布式锁），而旧实例的 OnDestroy 永远不会执行。
 func (a *app) RemoveDynamicModule(name string) bool {
-	value, ok := a.dynamicModules.LoadAndDelete(name)
+	value, ok := a.dynamicModules.Load(name)
 	if !ok {
 		return false
 	}
 
 	wrapper, ok := value.(*moduleWrapper)
 	if !ok {
+		// 表里存的不是一个合法 wrapper（只可能来自包内误用）。摘掉它免得
+		// 后续调用反复撞上同一个坏条目，但不声称销毁成功。
+		a.dynamicModules.CompareAndDelete(name, value)
+		return false
+	}
+
+	// **只处理已完成登记的模块。** 名字可能只是 AddDynamicModules 的一个占位，
+	// 它的 OnInit 还在跑。摘走这样的占位有害无益：抢到 lifecycleIniting 只能
+	// 跳过销毁（不能与 OnInit 并发），而 AddDynamicModules 那边的 CAS 随后失败，
+	// 结果是 OnInit 已经建好的连接池、占好的端口谁都不再持有——两个调用都
+	// 报失败，资源却确定性泄漏。就算抢到的是 lifecycleRegistered，
+	// shutdownModule 也会宣告"无资源、收尾完整"并返回 true，而 OnInit 随后
+	// 照跑不误。这两种情况都不是使用者想要的"卸载"。
+	//
+	// 语义上也说得通：模块还没就绪，ChanRPC(name) 查不到它、DynamicModules()
+	// 也不列它，那么"卸载一个还不存在的模块"返回 false 是自洽的。
+	// 它的收尾归 AddDynamicModules 负责——OnInit 之后与置为可见之后各有一次
+	// stopRequested 复查，停机时会就地回滚。
+	if !wrapper.visible.Load() {
+		return false
+	}
+
+	// CompareAndDelete 而不是 LoadAndDelete：从上面 Load 到这里，另一个并发的
+	// 卸载可能已经把它摘走并换上了别的 wrapper（先 remove 再 add 同名模块）。
+	// 只有摘到自己刚才看见的那一个才继续，否则说明这次卸载已经被别人做掉了。
+	if !a.dynamicModules.CompareAndDelete(name, wrapper) {
 		return false
 	}
 

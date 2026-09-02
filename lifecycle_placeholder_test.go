@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,98 +15,6 @@ import (
 // 用例 1：占位期间被 RemoveDynamicModule 抢走销毁权之后，
 // startServing 的 setLifecycle 直写把已经 Destroyed 的模块拉回 Serving，
 // 并在 OnDestroy/Close 之后重新拉起 Serve。
-// ---------------------------------------------------------------------------
-
-func TestPlaceholderNotResurrectedAfterDestroy(t *testing.T) {
-	a := newApp()
-	base := newTestModule("base")
-	if !a.start(base) {
-		t.Fatal("start should succeed")
-	}
-	defer a.stop()
-
-	var mu sync.Mutex
-	var events []string
-	rec := func(s string) {
-		mu.Lock()
-		events = append(events, s)
-		mu.Unlock()
-	}
-
-	m := newTestModule("victim")
-	m.keepServerOpen = true
-	initReturning := make(chan struct{})
-	m.initHook = func() {
-		rec("OnInit")
-		close(initReturning)
-	}
-	m.destroyHook = func() { rec("OnDestroy") }
-	m.closeHook = func() { rec("Close") }
-	m.serveHook = func(ctx context.Context) bool {
-		rec("Serve")
-		return true
-	}
-
-	sniperDone := make(chan struct{})
-	var removed bool
-	var sawInited bool
-	go func() {
-		defer close(sniperDone)
-		<-initReturning
-		// 自旋等待占位推进到 lifecycleInited，然后用**公开 API**卸载它。
-		// 这正是"热加载接口并发 add/remove 同名模块"的真实形态。
-		for {
-			value, ok := a.dynamicModules.Load("victim")
-			if !ok {
-				return
-			}
-			w, ok := value.(*moduleWrapper)
-			if !ok {
-				return
-			}
-			switch w.lifecycleState() {
-			case lifecycleRegistered, lifecycleIniting:
-				continue
-			case lifecycleInited:
-				sawInited = true
-				removed = a.RemoveDynamicModule("victim")
-				return
-			default:
-				return // 没抢到窗口
-			}
-		}
-	}()
-
-	results, err := a.AddDynamicModules(m)
-	<-sniperDone
-
-	if !sawInited {
-		t.Skip("未命中 Inited → startServing 窗口，重跑 -count 更多次")
-	}
-
-	mu.Lock()
-	seq := strings.Join(events, ",")
-	mu.Unlock()
-
-	t.Logf("events=%s addErr=%v results=%+v removed=%v destroyCnt=%d closeCnt=%d runCount=%d dyn=%v",
-		seq, err, results, removed, m.destroyCnt.Load(), m.closeCnt.Load(), m.runCount.Load(), a.DynamicModules())
-
-	if value, ok := a.dynamicModules.Load("victim"); ok {
-		t.Logf("still in map: %v", value)
-	}
-
-	if strings.Contains(seq, "OnDestroy,Close,Serve") {
-		t.Errorf("Serve 在 OnDestroy/Close 之后才被拉起（use-after-destroy）: %s", seq)
-	}
-	if err == nil && m.destroyCnt.Load() == 1 {
-		t.Errorf("AddDynamicModules 报告成功，但模块已被 OnDestroy 销毁: results=%+v", results)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 用例 2：removeAllDynamicModules 的排序比较器读取占位条目的
-// wrapper.seq（普通 uint64 字段），与 AddDynamicModules 写入 seq 无任何同步。
-// 两条路径同为 gate 的兄弟分支，彼此之间没有 happens-before。
 // ---------------------------------------------------------------------------
 
 func TestPlaceholderSeqHasNoDataRace(t *testing.T) {
@@ -295,4 +204,273 @@ func TestStatsSkipsPlaceholderDuringOnInit(t *testing.T) {
 
 	<-statsDone
 	<-addDone
+}
+
+// ---------------------------------------------------------------------------
+
+func TestPlaceholderNotResurrectedAfterDestroy(t *testing.T) {
+	a := newApp()
+	base := newTestModule("base")
+	if !a.start(base) {
+		t.Fatal("start should succeed")
+	}
+	defer a.stop()
+
+	var mu sync.Mutex
+	var events []string
+	rec := func(s string) {
+		mu.Lock()
+		events = append(events, s)
+		mu.Unlock()
+	}
+
+	m := newTestModule("victim")
+	m.keepServerOpen = true
+
+	initReturning := make(chan struct{})
+	spinnerHot := make(chan struct{})
+	m.initHook = func() {
+		rec("OnInit")
+		close(initReturning)
+		<-spinnerHot // 等卸载方先进入自旋，OnInit 再返回
+	}
+
+	serveExited := make(chan struct{})
+	m.serveHook = func(ctx context.Context) bool {
+		rec("Serve")
+		close(m.runStarted) // = Ready()，放行 waitReady
+		<-ctx.Done()
+		time.Sleep(100 * time.Millisecond) // 事件循环仍然活着
+		close(serveExited)
+		close(m.runStopped)
+		return false
+	}
+	m.destroyHook = func() {
+		select {
+		case <-serveExited:
+			rec("OnDestroy(serve已退出)")
+		default:
+			rec("OnDestroy(SERVE仍在运行)")
+		}
+	}
+	m.closeHook = func() { rec("Close") }
+
+	sniperDone := make(chan struct{})
+	var removed, sawInited bool
+	go func() {
+		defer close(sniperDone)
+		<-initReturning
+		close(spinnerHot)
+		// 自旋等占位推进到 lifecycleInited，然后用公开 API 卸载它。
+		// 这正是"热加载接口并发 add/remove 同名模块"的真实形态。
+		for {
+			value, ok := a.dynamicModules.Load("victim")
+			if !ok {
+				return
+			}
+			w, ok := value.(*moduleWrapper)
+			if !ok {
+				return
+			}
+			switch w.lifecycleState() {
+			case lifecycleRegistered, lifecycleIniting:
+				continue
+			case lifecycleInited:
+				sawInited = true
+				removed = a.RemoveDynamicModule("victim")
+				return
+			default:
+				return // 没抢到窗口
+			}
+		}
+	}()
+
+	results, err := a.AddDynamicModules(m)
+	<-sniperDone
+
+	if !sawInited {
+		t.Skip("未命中 Inited → startServing 窗口，加大 -count 重跑")
+	}
+
+	// 让被复活的 Serve 走完，events 才完整
+	select {
+	case <-serveExited:
+	case <-time.After(2 * time.Second):
+	}
+
+	mu.Lock()
+	seq := strings.Join(events, ",")
+	mu.Unlock()
+
+	value, stillInMap := a.dynamicModules.Load("victim")
+	finalState := lifecycleRegistered
+	if w, ok := value.(*moduleWrapper); ok {
+		finalState = w.lifecycleState()
+	}
+	t.Logf("events=[%s] addErr=%v results=%+v removed=%v destroyCnt=%d closeCnt=%d runCount=%d dyn=%v stillInMap=%v final=%s",
+		seq, err, results, removed, m.destroyCnt.Load(), m.closeCnt.Load(),
+		m.runCount.Load(), a.DynamicModules(), stillInMap, finalState)
+
+	if strings.Contains(seq, "OnDestroy(SERVE仍在运行)") {
+		t.Errorf("OnDestroy 与仍在运行的事件循环并发（真实模块即 fatal）: [%s]", seq)
+	}
+	if err == nil && m.destroyCnt.Load() == 1 {
+		t.Errorf("AddDynamicModules 报告成功，但模块已被 OnDestroy/Close 销毁: results=%+v", results)
+	}
+	if m.runCount.Load() > 0 && m.destroyCnt.Load() > 0 {
+		t.Errorf("同一个模块既被销毁又被拉起了事件循环: runCount=%d destroyCnt=%d",
+			m.runCount.Load(), m.destroyCnt.Load())
+	}
+}
+
+// 用例 1b：claimShutdown 抢到 lifecycleInited 并不代表"没有 goroutine 需要等待"。
+// shutdownModule 的 inited 分支不做任何等待，而 startServing 的 setLifecycle 直写
+// 会在抢占之后照样把事件循环拉起来 —— OnDestroy 于是与 Serve 并发。
+// 自旋只是把生产环境里那个纳秒级窗口放大，抢占本身走的仍是 RemoveDynamicModule
+// 的两步（先摘表、再 shutdownModule）。
+func TestInitedBranchDoesNotWaitForServe(t *testing.T) {
+	a := newApp()
+	base := newTestModule("base")
+	if !a.start(base) {
+		t.Fatal("start should succeed")
+	}
+	defer a.stop()
+
+	m := newTestModule("victim")
+	m.keepServerOpen = true
+
+	initReturning := make(chan struct{})
+	spinnerHot := make(chan struct{})
+	m.initHook = func() {
+		close(initReturning)
+		<-spinnerHot
+	}
+
+	var serveRunning atomic.Bool
+	var destroyedWhileServing atomic.Bool
+	m.serveHook = func(ctx context.Context) bool {
+		serveRunning.Store(true)
+		close(m.runStarted)
+		<-ctx.Done()
+		time.Sleep(80 * time.Millisecond) // 事件循环仍在跑
+		serveRunning.Store(false)
+		close(m.runStopped)
+		return false
+	}
+	m.destroyHook = func() {
+		if serveRunning.Load() {
+			destroyedWhileServing.Store(true)
+		}
+	}
+
+	var claimed moduleLifecycle = -1
+	sniperDone := make(chan struct{})
+	go func() {
+		defer close(sniperDone)
+		<-initReturning
+		value, ok := a.dynamicModules.Load("victim")
+		if !ok {
+			return
+		}
+		w := value.(*moduleWrapper)
+		// RemoveDynamicModule 第一步：把它摘出模块表
+		a.dynamicModules.CompareAndDelete("victim", w)
+		close(spinnerHot)
+		for {
+			switch w.lifecycleState() {
+			case lifecycleRegistered, lifecycleIniting:
+				continue
+			case lifecycleInited:
+				claimed = lifecycleInited
+				a.shutdownModule(w) // RemoveDynamicModule 第二步
+				return
+			default:
+				claimed = w.lifecycleState()
+				return
+			}
+		}
+	}()
+
+	_, _ = a.AddDynamicModules(m)
+	<-sniperDone
+	select {
+	case <-m.runStopped:
+	case <-time.After(time.Second):
+	}
+
+	t.Logf("claimed=%s runCount=%d destroyCnt=%d destroyedWhileServing=%v",
+		claimed, m.runCount.Load(), m.destroyCnt.Load(), destroyedWhileServing.Load())
+
+	if claimed != lifecycleInited {
+		t.Skip("没抢到 Inited 窗口，加大 -count 重跑")
+	}
+	if destroyedWhileServing.Load() {
+		t.Errorf("OnDestroy 与仍在运行的事件循环并发：真实模块在这里就是不可 recover 的 fatal")
+	}
+}
+
+// ---------------------------------------------------------------------------
+
+func TestNoOrphanWhenStopRunsDuringWaitReady(t *testing.T) {
+	a := newApp()
+	base := newTestModule("base")
+	if !a.start(base) {
+		t.Fatal("start should succeed")
+	}
+
+	victim := newTestModule("victim")
+	victim.serveHook = func(ctx context.Context) bool {
+		// 事件循环起步慢（真实模块里就是建表、预热缓存、注册 handler）
+		time.Sleep(400 * time.Millisecond)
+		close(victim.runStarted) // = Ready()
+		<-ctx.Done()
+		close(victim.runStopped)
+		return false
+	}
+
+	addDone := make(chan struct{})
+	var addErr error
+	go func() {
+		defer close(addDone)
+		_, addErr = a.AddDynamicModules(victim)
+	}()
+
+	// 等 Add 走到 startServing 之后、卡在 waitReady 上
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if value, ok := a.dynamicModules.Load("victim"); ok {
+			if w, ok := value.(*moduleWrapper); ok && w.lifecycleState() == lifecycleServing {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("victim never reached serving")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	a.stop() // 两轮 removeAllDynamicModules 都跳过 invisible 的 victim
+	<-addDone
+
+	select {
+	case <-victim.runStopped:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	t.Logf("addErr=%v state=%d destroyCnt=%d closeCnt=%d runCount=%d dyn=%v",
+		addErr, a.State(), victim.destroyCnt.Load(), victim.closeCnt.Load(),
+		victim.runCount.Load(), a.DynamicModules())
+
+	if victim.runCount.Load() == 0 {
+		t.Skip("Serve 未被拉起，没进入待测窗口")
+	}
+	if victim.destroyCnt.Load() != 1 {
+		t.Errorf("stop 已宣告 shutdown complete，但 victim 从未 OnDestroy（孤儿模块）: destroyCnt=%d",
+			victim.destroyCnt.Load())
+	}
+	select {
+	case <-victim.runStopped:
+	default:
+		t.Errorf("victim 的 Serve goroutine 在 stop 之后仍未退出（goroutine + LockOSThread 线程泄漏）")
+	}
 }
