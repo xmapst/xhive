@@ -218,16 +218,25 @@ func (s *Skeleton) Priority() uint {
 
 // Serve 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
 //
-// 事件循环必须持续消费这三个队列——它们都是有界的，事件循环一旦被某个耗时
-// handler 或某次同步 Call 卡住，上游要么开始丢消息（Cast/AsyncCall）、要么
-// 跟着一起阻塞（同步 Call）。这正是有界队列的取舍：把"处理不过来"这件事
+// 事件循环必须持续消费这三个队列——它们的容量都有硬上限，事件循环一旦被某个
+// 耗时 handler 或某次同步 Call 卡住，上游要么开始丢消息（Cast/AsyncCall）、
+// 要么跟着一起阻塞（同步 Call）。这正是有上限的取舍：把"处理不过来"这件事
 // 立刻暴露出来，而不是攒在内存里。
 //
 // 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
 //  1. ctx.Done()：接收框架的停止信号，触发模块关闭流程
-//  2. timer.Event()：处理到期的定时器事件（执行注册的 timer.Handler，并自动续期 Ticker）
-//  3. client.Event()：处理本模块发起的异步 RPC 调用返回结果（执行注册的 Callback）
-//  4. server.Event()：处理其他模块发来的 RPC 调用请求（查找并执行已注册的 Handler）
+//  2. timer.NotEmpty()：处理到期的定时器事件（执行注册的 timer.Handler，并自动续期 Ticker）
+//  3. client.NotEmpty()：处理本模块发起的异步 RPC 调用返回结果（执行注册的 Callback）
+//  4. server.NotEmpty()：处理其他模块发来的 RPC 调用请求（查找并执行已注册的 Handler）
+//
+// 三条队列都不再把数据本身放进 channel——channel 只承载一个「可能有事件」的
+// 边沿信号，数据在按积压伸缩的队列里，因此每一路都是「收到信号 → Pop 一次」，
+// 且必须容忍 Pop 扑空（信号会合并，存在虚假唤醒）。
+//
+// 每次只 Pop 一条而不是醒来后循环排空，是刻意的：排空循环里混进一个慢
+// handler，就会长时间回不到 select，ctx.Done() 的响应性和四路之间的公平性
+// 都会被破坏。队列在仍有存量时会把信号补回去，下一轮 select 立刻又能取到，
+// 因此「一次 select 处理一个事件」的语义和吞吐都没有损失。
 //
 // 单 goroutine 串行处理是性能与正确性权衡的结果：
 // 牺牲了 CPU 并行利用率，换取了零锁开销和极低的编程复杂度。
@@ -251,15 +260,27 @@ func (s *Skeleton) Serve(ctx context.Context) {
 			s.server.Close()
 			slog.Info("skeleton stopped", slog.String("name", s.name))
 			return
-		case t := <-s.timer.Event():
+		case <-s.timer.NotEmpty():
+			t, ok := s.timer.Pop()
+			if !ok {
+				continue
+			}
 			startUs := time.Now().UnixMicro()
 			t.Callback()
 			s.recordStat(t.Name(), time.Now().UnixMicro()-startUs)
-		case ri := <-s.client.Event():
+		case <-s.client.NotEmpty():
+			ri, ok := s.client.Pop()
+			if !ok {
+				continue
+			}
 			startUs := time.Now().UnixMicro()
 			s.client.AsyncCallback(ri)
 			s.recordStat(ri.ID(), time.Now().UnixMicro()-startUs)
-		case ci := <-s.server.Event():
+		case <-s.server.NotEmpty():
+			ci, ok := s.server.Pop()
+			if !ok {
+				continue
+			}
 			startUs := time.Now().UnixMicro()
 			s.server.Exec(ci)
 			s.recordStat(ci.ID(), time.Now().UnixMicro()-startUs)
@@ -384,7 +405,7 @@ func (s *Skeleton) RegisterChanRPC(msg any, f chanrpc.Handler) error {
 
 // AsyncCall 向指定模块发起异步 RPC 调用，结果通过 cb 回调在本模块事件循环中执行。
 //
-// 回调在 Serve 的 select 循环中消费 client.Event() 时执行，
+// 回调在 Serve 的 select 循环中消费 client.NotEmpty()/Pop() 时执行，
 // 与模块其他事件处理串行，无并发问题，可安全访问模块内部状态。
 func (s *Skeleton) AsyncCall(mod string, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error {
 	server := defaultApp.ChanRPC(mod)

@@ -214,15 +214,14 @@ func TestStopDuringInitUsesStartupSettleTimeout(t *testing.T) {
 
 	inInit := make(chan struct{})
 	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseInit := func() { releaseOnce.Do(func() { close(release) }) }
+	releaseInit := sync.OnceFunc(func() { close(release) })
 	// 即便中途 t.Fatal，也要放行 OnInit，避免把 start goroutine 永久留在那里。
 	t.Cleanup(releaseInit)
 
 	slow := newSSModule("settle-slow-init")
-	var enteredOnce sync.Once
+	markEntered := sync.OnceFunc(func() { close(inInit) })
 	slow.initHook = func() {
-		enteredOnce.Do(func() { close(inInit) })
+		markEntered()
 		<-release
 	}
 
@@ -314,14 +313,13 @@ func TestStopBeforeStartDoesNotStrandModules(t *testing.T) {
 
 	inInit := make(chan struct{})
 	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseInit := func() { releaseOnce.Do(func() { close(release) }) }
+	releaseInit := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(releaseInit)
 
 	late := newSSModule("late-start")
-	var enteredOnce sync.Once
+	markEntered := sync.OnceFunc(func() { close(inInit) })
 	late.initHook = func() {
-		enteredOnce.Do(func() { close(inInit) })
+		markEntered()
 		<-release
 	}
 

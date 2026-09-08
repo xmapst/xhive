@@ -81,7 +81,7 @@ type Manager struct {
 }
 
 // NewManager 创建定时器管理器，参数 l 为底层分发器操作队列与到期队列的容量
-// （有界，硬上限）。
+// 上限（硬上限，但按实际积压分配，不预留）。
 func NewManager(l int) *Manager {
 	return &Manager{
 		timers:     make(map[int64]*Timer),
@@ -105,9 +105,19 @@ func (tm *Manager) Stop() {
 	tm.dispatcher.Stop()
 }
 
-// Event 返回定时器触发通知通道，供模块事件循环（Skeleton.Serve）通过 select 监听。
-func (tm *Manager) Event() <-chan Event {
-	return tm.dispatcher.chanFired
+// NotEmpty 返回「有定时器到期」的信号，供模块事件循环（Skeleton.Serve）
+// 通过 select 监听。
+//
+// 它取代了过去直接返回 chan Event 的 Event()：到期事件本身放在按积压伸缩的
+// 队列里，channel 只承载一个边沿信号。收到信号后调用 Pop 取件，并且必须接受
+// Pop 返回 false——信号会合并，存在虚假唤醒。
+func (tm *Manager) NotEmpty() <-chan struct{} {
+	return tm.dispatcher.chanFired.NotEmpty()
+}
+
+// Pop 取出一个到期的定时器事件，队列为空时返回 ok=false。
+func (tm *Manager) Pop() (Event, bool) {
+	return tm.dispatcher.chanFired.Pop()
 }
 
 // Find 通过 ID 查询定时器业务层元数据，不存在时返回 nil。

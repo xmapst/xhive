@@ -65,7 +65,7 @@ func TestSkeletonRegisterChanRPCAndRPCWrappers(t *testing.T) {
 	}
 
 	caller := NewSkeleton("caller", WithTimerChanLen(8), WithClientChanLen(8), WithServerChanLen(8), WithStatCap(32))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		caller.Serve(ctx)
@@ -143,7 +143,7 @@ func TestSkeletonTimerWrappersAndStat(t *testing.T) {
 		t.Fatalf("RegisterChanRPC failed: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		s.Serve(ctx)

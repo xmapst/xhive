@@ -20,31 +20,37 @@ type customMsg struct{}
 
 func (customMsg) ID() uint32 { return 424242 }
 
+// waitCallInfo 等一条待处理调用。先 Pop 再等信号：NotEmpty 是边沿信号且会
+// 合并，上来就等会在调用早已入队、信号却已被上一轮取走时白等到超时。
 func waitCallInfo(t *testing.T, s *Server) *CallInfo {
 	t.Helper()
-	select {
-	case ci, ok := <-s.Event():
-		if !ok {
-			t.Fatal("server event channel closed")
+	deadline := time.After(time.Second)
+	for {
+		if ci, ok := s.Pop(); ok {
+			return ci
 		}
-		return ci
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting call info")
-		return nil
+		select {
+		case <-s.NotEmpty():
+		case <-deadline:
+			t.Fatal("timeout waiting call info")
+			return nil
+		}
 	}
 }
 
 func waitRetInfo(t *testing.T, c *Client) *RetInfo {
 	t.Helper()
-	select {
-	case ri, ok := <-c.Event():
-		if !ok {
-			t.Fatal("client event channel closed")
+	deadline := time.After(time.Second)
+	for {
+		if ri, ok := c.Pop(); ok {
+			return ri
 		}
-		return ri
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting ret info")
-		return nil
+		select {
+		case <-c.NotEmpty():
+		case <-deadline:
+			t.Fatal("timeout waiting ret info")
+			return nil
+		}
 	}
 }
 
@@ -191,8 +197,10 @@ func TestClientCast(t *testing.T) {
 		t.Fatal("timeout waiting cast handler")
 	}
 	select {
-	case ri := <-c.Event():
-		t.Fatalf("cast should not return event: %#v", ri)
+	case <-c.NotEmpty():
+		if ri, ok := c.Pop(); ok {
+			t.Fatalf("cast should not return event: %#v", ri)
+		}
 	case <-time.After(50 * time.Millisecond):
 	}
 }
@@ -582,7 +590,7 @@ func TestServerExecNilAndCallValidationErrors(t *testing.T) {
 	if ri := c.Call(s, nil); !errors.Is(ri.Err, ErrInvalidMsgType) {
 		t.Fatalf("Call nil request err = %v", ri.Err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := c.call(ctx, nil, &CallInfo{}, false); !errors.Is(err, ErrServerNil) {
 		t.Fatalf("raw call nil server err = %v", err)
 	}
@@ -710,14 +718,21 @@ func TestCallInfoRetDroppedWhenSyncRetFullAndNoRetForCast(t *testing.T) {
 	}
 }
 
-func TestClientCallPanicOnClosedQueueReturnsError(t *testing.T) {
+// TestClientCallOnClosedQueueReturnsServerClosed 覆盖「队列已关闭后仍有调用
+// 投递进来」这条路径。队列返回 ErrClosed，call 把它翻译成 ErrServerClosed：
+// 过去这里是靠 send on closed channel 的 panic 再由 recover 兜成一个字符串
+// 错误，调用方无从 errors.Is 判别，现在是一个确定的哨兵错误。
+func TestClientCallOnClosedQueueReturnsServerClosed(t *testing.T) {
 	s := NewServer(WithChanLen(1))
 	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
-	close(s.chanCall)
-	err := c.call(context.Background(), s, &CallInfo{id: ID(pingReq{}), Request: pingReq{}, chanRet: newSyncRet()}, false)
-	if err == nil {
-		t.Fatal("call to closed queue should return panic error")
+	s.chanCall.Close()
+	err := c.call(t.Context(), s, &CallInfo{id: ID(pingReq{}), Request: pingReq{}, chanRet: newSyncRet()}, false)
+	if !errors.Is(err, ErrServerClosed) {
+		t.Fatalf("call to closed queue = %v, want ErrServerClosed", err)
+	}
+	if got := s.pending.Load(); got != 0 {
+		t.Fatalf("投递失败后 pending = %d, want 0（预加的那一笔必须回滚）", got)
 	}
 }
 
@@ -727,12 +742,12 @@ func serveOnce(s *Server) (stop func()) {
 	done := make(chan struct{})
 	go func() {
 		for {
-			select {
-			case ci, ok := <-s.Event():
-				if !ok {
-					return
-				}
+			if ci, ok := s.Pop(); ok {
 				s.Exec(ci)
+				continue
+			}
+			select {
+			case <-s.NotEmpty():
 			case <-done:
 				return
 			}
@@ -960,7 +975,7 @@ func TestSyncCallCanceledWhileWaitingForRoom(t *testing.T) {
 
 	c.Cast(s, pingReq{}) // 占满队列
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	ri := c.CallWithContext(ctx, s, pingReq{})
 	if !errors.Is(ri.Err, context.DeadlineExceeded) {
@@ -989,7 +1004,7 @@ func TestAsyncRetDroppedWhenClientChannelFull(t *testing.T) {
 		}
 	}
 	for range 2 {
-		s.Exec(<-s.Event())
+		s.Exec(waitCallInfo(t, s))
 	}
 
 	if got := c.Len(); got != 1 {
@@ -998,5 +1013,93 @@ func TestAsyncRetDroppedWhenClientChannelFull(t *testing.T) {
 	// 一条留在队列里等回调（pending=1），另一条被丢弃并已回滚计数。
 	if got := c.PendingCount(); got != 1 {
 		t.Fatalf("PendingCount = %d, want 1", got)
+	}
+}
+
+// TestServerQueueGrowsOnDemandAndKeepsHardLimit 锁定「动态扩缩容 + 硬上限」
+// 这两件事同时成立，它们正是这套队列存在的理由：
+//
+//   - 上限不等于常驻内存：一个上限 4096 的 Server 空闲时只分配十几个槽位，
+//     原生 channel 做不到这点（缓冲区在 make 时一次性分配且永不增长）；
+//   - 但上限仍然是硬的：打满即拒绝，不会像无界队列那样一路吃内存到 OOM。
+//
+// 任何一半失效都会让这次重构变得没有意义，所以两半在同一个用例里断言。
+func TestServerQueueGrowsOnDemandAndKeepsHardLimit(t *testing.T) {
+	const limit = 4096
+	// 空闲和排空后允许的分配上限，给收缩留出余量（收缩要求连续低水位）。
+	const idleSlack = 64
+
+	s := NewServer(WithChanLen(limit))
+	c := NewClient(WithClientChanLen(4))
+	defer c.Close()
+
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return nil }); err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	if got := s.chanCall.Alloc(); got > idleSlack {
+		t.Fatalf("空闲时已分配 %d 个槽位（上限 %d）——队列不该按上限预留内存", got, limit)
+	}
+	if got := s.Cap(); got != limit {
+		t.Fatalf("Cap() = %d, want %d", got, limit)
+	}
+
+	for range limit {
+		c.Cast(s, pingReq{})
+	}
+	if got := s.Len(); got != limit {
+		t.Fatalf("打满后 Len() = %d, want %d", got, limit)
+	}
+	if got := s.chanCall.Alloc(); got != limit {
+		t.Fatalf("打满后分配 %d 个槽位, want %d——容量应随积压长到上限", got, limit)
+	}
+
+	// 上限是硬的：再投一条立即失败，而不是继续吃内存。
+	err := c.call(t.Context(), s, &CallInfo{id: ID(pingReq{}), Request: pingReq{}}, false)
+	if !errors.Is(err, ErrChanFull) {
+		t.Fatalf("打满后投递 = %v, want ErrChanFull", err)
+	}
+
+	for i := range limit {
+		ci, ok := s.Pop()
+		if !ok {
+			t.Fatalf("Pop 在第 %d 条就见底了, want %d 条", i, limit)
+		}
+		s.Exec(ci)
+	}
+	if got := s.chanCall.Alloc(); got > idleSlack {
+		t.Fatalf("排空后仍占 %d 个槽位, 未收缩到 %d 以内", got, idleSlack)
+	}
+	if got := s.pending.Load(); got != 0 {
+		t.Fatalf("全部 Exec 后 pending = %d, want 0", got)
+	}
+
+	s.Close()
+}
+
+// TestRequestAsAndAckAs 覆盖 Go 1.27 泛型方法版的类型解包：命中、类型不符、
+// 以及字段为 nil 三种情况都不能 panic，这正是它相对裸断言的全部价值。
+func TestRequestAsAndAckAs(t *testing.T) {
+	ci := &CallInfo{Request: pingReq{Value: "ping"}}
+	if req, ok := ci.RequestAs[pingReq](); !ok || req.Value != "ping" {
+		t.Fatalf("RequestAs[pingReq]() = (%v, %v), want ({ping}, true)", req, ok)
+	}
+	if got, ok := ci.RequestAs[pingAck](); ok {
+		t.Fatalf("类型不符时 RequestAs = (%v, true), want false", got)
+	}
+	if got, ok := ci.RequestAs[*pingReq](); ok {
+		t.Fatalf("值类型不该匹配指针类型: (%v, true)", got)
+	}
+	if got, ok := (&CallInfo{}).RequestAs[pingReq](); ok || got.Value != "" {
+		t.Fatalf("Request 为 nil 时 = (%v, %v), want (零值, false)", got, ok)
+	}
+
+	ri := &RetInfo{Ack: &pingAck{Value: "pong"}}
+	if ack, ok := ri.AckAs[*pingAck](); !ok || ack.Value != "pong" {
+		t.Fatalf("AckAs[*pingAck]() = (%v, %v), want ({pong}, true)", ack, ok)
+	}
+	// 错误响应上 Ack 通常是 nil，裸断言必 panic，这里必须安全返回。
+	if got, ok := (&RetInfo{Err: ErrServerClosed}).AckAs[*pingAck](); ok || got != nil {
+		t.Fatalf("错误响应 AckAs = (%v, %v), want (nil, false)", got, ok)
 	}
 }

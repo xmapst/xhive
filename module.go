@@ -520,13 +520,10 @@ func (a *app) Run(mods ...IModule) {
 	defer a.runInFlight.Store(false)
 
 	stopped := make(chan struct{})
-	stopOnce := sync.Once{}
-	stopFn := func() {
-		stopOnce.Do(func() {
-			a.stop()
-			close(stopped)
-		})
-	}
+	stopFn := sync.OnceFunc(func() {
+		a.stop()
+		close(stopped)
+	})
 
 	a.sm.Start(stopFn)
 

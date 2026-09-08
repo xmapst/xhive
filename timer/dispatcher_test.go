@@ -7,29 +7,43 @@ import (
 	"time"
 )
 
-func waitEvent(t *testing.T, ch <-chan Event, timeout time.Duration) Event {
+// eventSource 抽掉「到期事件从哪来」的差异：dispatcher 的 chanFired 与
+// Manager 都提供同一对「边沿信号 + Pop」，测试辅助函数据此复用。
+type eventSource interface {
+	NotEmpty() <-chan struct{}
+	Pop() (Event, bool)
+}
+
+// waitEvent 等一个到期事件。先 Pop 再等信号：信号是边沿的且会合并，
+// 上来就等会在事件早已入队、信号却已被上一轮取走时白等到超时。
+func waitEvent(t *testing.T, src eventSource, timeout time.Duration) Event {
 	t.Helper()
-	select {
-	case ev, ok := <-ch:
-		if !ok {
-			t.Fatal("event channel closed")
+	deadline := time.After(timeout)
+	for {
+		if ev, ok := src.Pop(); ok {
+			return ev
 		}
-		return ev
-	case <-time.After(timeout):
-		t.Fatalf("timeout waiting event after %v", timeout)
-		return nil
+		select {
+		case <-src.NotEmpty():
+		case <-deadline:
+			t.Fatalf("timeout waiting event after %v", timeout)
+			return nil
+		}
 	}
 }
 
-func assertNoEvent(t *testing.T, ch <-chan Event, timeout time.Duration) {
+func assertNoEvent(t *testing.T, src eventSource, timeout time.Duration) {
 	t.Helper()
-	select {
-	case ev, ok := <-ch:
-		if !ok {
+	deadline := time.After(timeout)
+	for {
+		if ev, ok := src.Pop(); ok {
+			t.Fatalf("unexpected event: %s", ev.Name())
+		}
+		select {
+		case <-src.NotEmpty():
+		case <-deadline:
 			return
 		}
-		t.Fatalf("unexpected event: %s", ev.Name())
-	case <-time.After(timeout):
 	}
 }
 
@@ -333,7 +347,7 @@ func TestDispatcherFiredChannelFullKeepsTimer(t *testing.T) {
 	// 先用一个已到期的定时器占满容量为 1 的到期队列。
 	first := &dispatcherTimer{id: 1, name: "first", deadline: time.Now().Add(-time.Millisecond), cb: func(int64) {}}
 	disp.place(first)
-	if got := len(disp.chanFired); got != 1 {
+	if got := disp.chanFired.Len(); got != 1 {
 		t.Fatalf("chanFired len = %d, want 1", got)
 	}
 

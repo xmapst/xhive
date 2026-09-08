@@ -285,7 +285,7 @@ func TestSkeletonOptionsWrappersAndEventLoop(t *testing.T) {
 		t.Fatal("NewTimer returned zero")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		s.Serve(ctx)

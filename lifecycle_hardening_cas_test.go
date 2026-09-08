@@ -611,7 +611,7 @@ func TestStartFailureClosesServerOfModuleWhoseServePanicked(t *testing.T) {
 	// 会立刻拿到一个明确的错误；留着不关则会一直等一个永远不会产生的回包。
 	client := chanrpc.NewClient()
 	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
 	ri := client.CallWithContext(ctx, m.server, casPingReq{})
 	if !errors.Is(ri.Err, chanrpc.ErrServerClosed) {

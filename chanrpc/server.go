@@ -8,6 +8,8 @@ import (
 	"runtime/debug"
 	"sync/atomic"
 	"time"
+
+	"github.com/xmapst/xhive/internal/queue"
 )
 
 // defaultCloseDrainTimeout 是 Close 排空自投递链条的默认硬上限：防止
@@ -19,12 +21,17 @@ import (
 // 按 Server 覆盖。
 const defaultCloseDrainTimeout = 30 * time.Second
 
-// defaultChanLen 是 RPC 调用队列的默认容量，未显式指定 WithChanLen 时生效。
+// defaultChanLen 是 RPC 调用队列的容量上限，未显式指定 WithChanLen 时生效。
 //
 // 队列是**有界**的，这一点是刻意的：无界队列在消费端跟不上时只会一路把积压
 // 堆进内存，最终以 OOM 的形式在离现场很远的地方崩掉，且中途没有任何信号。
 // 有界队列把同一个问题在发生的那一刻就暴露出来——异步投递立刻失败（带消息
 // 类型和水位），同步调用阻塞等待空位形成背压。
+//
+// 但「有上限」不等于「一开始就把上限那么多内存占住」：底层用的是
+// internal/queue，容量按实际积压增长、随空闲收缩，这个值只封顶不预留。
+// 原生 channel 做不到这一点——它的缓冲区在 make 时一次性分配且永不增长，
+// 每个模块无论闲忙都要先付出满容量的常驻内存和 GC 扫描开销。
 const defaultChanLen = 1024
 
 // serverOptions 保存 NewServer 的可选配置项。
@@ -43,10 +50,10 @@ type ServerOption func(*serverOptions)
 // WithChanLen 自定义 RPC 调用队列的容量，它是**硬性上限**而非容量提示：
 // 队列满之后 Cast/AsyncCall 立即返回 ErrChanFull，同步 Call 阻塞等待空位。
 //
-// 取值上的权衡：调得太小会让业务的正常突发被误判成过载，调得太大则推迟了
-// 过载的暴露时机、也占更多内存。建议按模块的稳态 QPS × 可容忍的排队时长
-// 估算，并配合 Len()/Cap() 做水位告警。n <= 0 时该选项不生效，沿用
-// defaultChanLen。
+// 取值上的权衡：调得太小会让业务的正常突发被误判成过载；调得太大只会推迟
+// 过载的暴露时机，不会额外占内存——队列按实际积压分配，这个值只封顶。
+// 建议按模块的稳态 QPS × 可容忍的排队时长估算，并配合 Len()/Cap() 做水位
+// 告警。n <= 0 时该选项不生效，沿用 defaultChanLen。
 func WithChanLen(n int) ServerOption {
 	return func(opts *serverOptions) {
 		if n > 0 {
@@ -68,17 +75,18 @@ func WithCloseDrainTimeout(d time.Duration) ServerOption {
 // Server ChanRPC 服务端，接收并处理来自 Client 的 RPC 调用。
 //
 // 每个模块持有一个 Server 实例，所有外部 RPC 调用通过有界队列排队，
-// 在模块的事件循环（Skeleton.Serve）中通过 Server.Event() 串行出队处理，从而保证模块内部状态访问无并发竞争。
+// 在模块的事件循环（Skeleton.Serve）中通过 NotEmpty()/Pop() 串行出队处理，
+// 从而保证模块内部状态访问无并发竞争。
 //
 // 架构优势：消息路由通过 functions 哈希表实现 O(1) 查找，
 // 相比传统的 switch-case 分发，新增消息类型只需调用 Register 注册一次，扩展成本极低。
 type Server struct {
-	functions         map[uint32]Handler // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
-	chanCall          chan *CallInfo     // RPC 调用队列，有界；满时异步投递失败、同步调用阻塞等待
-	closing           atomic.Bool        // Close 是否已经开始，只用于保证 Close 本身的幂等性
-	closed            atomic.Bool        // 是否已经完全关闭（排空彻底完成），client.check 据此拒绝新调用
-	pending           atomic.Int64       // 已成功入队但还未 Exec 完成的调用数，Close 排空时的终止条件，见 Close 的说明
-	closeDrainTimeout time.Duration      // Close 排空的超时上限，见 WithCloseDrainTimeout
+	functions         map[uint32]Handler      // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
+	chanCall          *queue.Queue[*CallInfo] // RPC 调用队列，容量按积压伸缩但有硬上限；满时异步投递失败、同步调用阻塞等待
+	closing           atomic.Bool             // Close 是否已经开始，只用于保证 Close 本身的幂等性
+	closed            atomic.Bool             // 是否已经完全关闭（排空彻底完成），client.check 据此拒绝新调用
+	pending           atomic.Int64            // 已成功入队但还未 Exec 完成的调用数，Close 排空时的终止条件，见 Close 的说明
+	closeDrainTimeout time.Duration           // Close 排空的超时上限，见 WithCloseDrainTimeout
 }
 
 // NewServer 创建 ChanRPC 服务端，所有配置均可选，见各 WithXxx 选项。
@@ -92,31 +100,42 @@ func NewServer(opts ...ServerOption) *Server {
 
 	s := new(Server)
 	s.functions = map[uint32]Handler{}
-	s.chanCall = make(chan *CallInfo, cfg.chanLen)
+	s.chanCall = queue.New[*CallInfo](cfg.chanLen)
 	s.closeDrainTimeout = cfg.closeDrainTimeout
 	return s
 }
 
-// Event 返回 RPC 调用队列的只读接收端，供模块事件循环消费。
+// NotEmpty 返回「队列可能有调用」的信号，供模块事件循环放进 select。
 //
-// 从这里取出的每一条 CallInfo 最终都必须传给 Exec（Skeleton.Serve 与本包
-// 测试的每一处直接消费都紧跟一次 Exec）：pending 计数在成功入队时 +1、
-// 在 Exec 完成时 -1，是 Close 排空循环判断"真的没有更多工作了"的唯一
-// 依据；只取不 Exec 会让计数永久多出一次，使 Close 失去终止条件而永久
-// 阻塞在排空循环里。
-func (s *Server) Event() <-chan *CallInfo {
-	return s.chanCall
+// 它取代了过去直接返回 chan *CallInfo 的 Event()：数据不再流经 channel，
+// 而是放在按积压伸缩的队列里，channel 只承载一个边沿信号。收到信号后调用
+// Pop 取件，并且必须接受 Pop 返回 false——信号会合并，存在虚假唤醒。
+func (s *Server) NotEmpty() <-chan struct{} {
+	return s.chanCall.NotEmpty()
+}
+
+// Pop 取出一条待处理的调用，队列为空时返回 ok=false。
+//
+// 取出的每一条 CallInfo 最终都必须传给 Exec（Skeleton.Serve 与本包测试的
+// 每一处消费都紧跟一次 Exec）：pending 计数在成功入队时 +1、在 Exec 完成时
+// -1，是 Close 排空循环判断"真的没有更多工作了"的唯一依据；只取不 Exec 会
+// 让计数永久多出一次，使 Close 失去终止条件而永久阻塞在排空循环里。
+func (s *Server) Pop() (*CallInfo, bool) {
+	return s.chanCall.Pop()
 }
 
 // Len 返回 RPC 调用队列当前的积压数量，用于监控和告警。
 func (s *Server) Len() int64 {
-	return int64(len(s.chanCall))
+	return int64(s.chanCall.Len())
 }
 
 // Cap 返回 RPC 调用队列的容量上限，与 Len 搭配即可算出水位（Len/Cap），
 // 用于在真正打满、开始丢消息之前就发出告警。
+//
+// 它是配置的硬上限，不随队列实际分配的槽位数变化：水位关心的是「离拒绝还有
+// 多远」，而不是「此刻分配了多少」。
 func (s *Server) Cap() int64 {
-	return int64(cap(s.chanCall))
+	return int64(s.chanCall.Cap())
 }
 
 // Register 注册消息处理函数，通过传入 message 实例的类型自动推导消息名。
@@ -263,12 +282,23 @@ func (s *Server) Close() {
 	timedOut := false
 drain:
 	for s.pending.Load() > 0 {
-		select {
-		case ci, ok := <-s.chanCall:
-			if !ok {
-				break drain
-			}
+		// 超时必须在这里显式检查，不能只靠下面 select 里的 ctx.Done()。
+		// 下面那个 select 只在队列**空**的时候才会走到，而一条不收敛的自投递
+		// 链条（handler 每次都往本模块再 Cast 一条）会让队列永远非空，
+		// 排空于是一直走 Pop 的快路径，超时分支一次都轮不上，Close 永久卡住。
+		if ctx.Err() != nil {
+			timedOut = true
+			break drain
+		}
+		// 先直接取，取不到再去等信号。NotEmpty 是**边沿**信号且会合并，
+		// 不能假定「队列里有多少条就会收到多少个信号」；上来就等信号会在
+		// 信号已被上一轮消费掉、而队列仍有存量时白等一轮。
+		if ci, ok := s.chanCall.Pop(); ok {
 			s.Exec(ci)
+			continue
+		}
+		select {
+		case <-s.chanCall.NotEmpty():
 		case <-ctx.Done():
 			timedOut = true
 			break drain
@@ -277,9 +307,10 @@ drain:
 
 	s.closed.Store(true)
 	// 关闭队列而不是只置 closed 标志：同步 Call 在队列满时是**阻塞**等待空位的，
-	// 若此刻恰好有调用方卡在那次发送上，只置标志它永远醒不过来；关闭会让那次
-	// 发送 panic，由 client.call 的 recover 转成错误返回给调用方。
-	close(s.chanCall)
+	// 若此刻恰好有调用方卡在那次等待上，只置标志它永远醒不过来。队列的 Close
+	// 会广播唤醒所有等待者，它们随后拿到 ErrServerClosed 正常返回——比过去
+	// 靠 close(chan) 触发 panic 再由 recover 兜回来干净得多。
+	s.chanCall.Close()
 
 	if timedOut {
 		slog.Error("chanrpc server close drain timeout, dropping remaining self-cast chain",
@@ -309,8 +340,8 @@ drain:
 //
 // 顺序与 Close 相反，先置 closed 再排空：Close 期间要允许 handler 的自投递
 // 继续入队，Abandon 不执行任何 handler，也就不会产生自投递，因此可以立刻
-// 拒绝新调用。close(chanCall) 让恰好阻塞在满队列发送上的调用方醒来
-// （由 client.call 的 recover 转成错误返回），随后的 range 读完缓冲区存量。
+// 拒绝新调用。队列的 Close 广播唤醒恰好阻塞在满队列上的调用方（它们拿到
+// ErrServerClosed 返回），随后的 Pop 循环读完存量。
 //
 // 与 Close 共用 closing 标志，因此两者互斥且各自幂等：一个 Server 只会被
 // 关闭一次，无论走的是哪条路径。
@@ -329,10 +360,14 @@ func (s *Server) Abandon() {
 	if s.chanCall == nil {
 		return
 	}
-	close(s.chanCall)
+	s.chanCall.Close()
 
 	var abandoned int
-	for ci := range s.chanCall {
+	for {
+		ci, ok := s.chanCall.Pop()
+		if !ok {
+			break
+		}
 		if ci == nil {
 			continue
 		}

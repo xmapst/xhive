@@ -85,7 +85,7 @@ func TestManagerOneShotCallbackPassesMetadataAndRemovesTimer(t *testing.T) {
 		t.Fatal("expected non-zero timer id")
 	}
 
-	ev := waitEvent(t, tm.Event(), 300*time.Millisecond)
+	ev := waitEvent(t, tm, 300*time.Millisecond)
 	if ev.Name() != "oneshot" {
 		t.Fatalf("event name = %q, want oneshot", ev.Name())
 	}
@@ -125,9 +125,10 @@ func TestManagerTickerReschedulesAndCancelStops(t *testing.T) {
 	deadline := time.After(500 * time.Millisecond)
 	for count.Load() < 2 {
 		select {
-		case ev, ok := <-tm.Event():
+		case <-tm.NotEmpty():
+			ev, ok := tm.Pop()
 			if !ok {
-				t.Fatal("event channel closed")
+				continue // 边沿信号存在虚假唤醒
 			}
 			ev.Callback()
 		case <-deadline:
@@ -138,7 +139,7 @@ func TestManagerTickerReschedulesAndCancelStops(t *testing.T) {
 	if tm.Find(id) != nil {
 		t.Fatal("ticker metadata should be removed after cancel")
 	}
-	assertNoEvent(t, tm.Event(), 80*time.Millisecond)
+	assertNoEvent(t, tm, 80*time.Millisecond)
 }
 
 func TestManagerTickerRescheduleKeepsStableInterval(t *testing.T) {

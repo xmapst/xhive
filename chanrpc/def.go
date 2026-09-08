@@ -197,10 +197,10 @@ func (r syncRet) send(ri *RetInfo) bool {
 // asyncRet 指向发起调用的 Client，用于把异步调用（AsyncCall）的响应投递回
 // 它的返回队列。
 //
-// send 非阻塞：队列满时丢弃本次响应，并把 pendingAsyncCall 减回来——该计数
-// 本应在 AsyncCallback 执行回调时才递减，响应既然已经丢了，回调永远不会执行，
-// 不在这里补上这一笔，Client.Close 就会一直等一个不会到来的回调，直到超时兜底
-// 才放弃。
+// send 非阻塞：队列满（或已关闭）时丢弃本次响应，并把 pendingAsyncCall 减
+// 回来——该计数本应在 AsyncCallback 执行回调时才递减，响应既然已经丢了，
+// 回调永远不会执行，不在这里补上这一笔，Client.Close 就会一直等一个不会到来
+// 的回调，直到超时兜底才放弃。
 //
 // 之所以持有 *Client 而不是仅仅持有那个 channel：丢弃与计数回滚本来就是同一
 // 件事的两半，只拿到 channel 就没法把计数修回去。
@@ -209,13 +209,11 @@ type asyncRet struct {
 }
 
 func (r asyncRet) send(ri *RetInfo) bool {
-	select {
-	case r.c.chanAsyncRet <- ri:
-		return true
-	default:
+	if err := r.c.chanAsyncRet.Push(ri); err != nil {
 		r.c.pendingAsyncCall.Add(-1)
 		return false
 	}
+	return true
 }
 
 // CallInfo 封装一次 RPC 调用的完整上下文信息。
@@ -296,8 +294,8 @@ func (ci *CallInfo) IsHeld() bool {
 //
 // 投递本身不会阻塞（retSink 的两种实现都不阻塞）：
 //   - syncRet 满/无人接收时返回 false，转化为 ErrRetDropped；
-//   - asyncRet 在调用方的返回队列已满时返回 false，同样转化为 ErrRetDropped；
-//     若该队列此前已被关闭，则表现为 panic，由下面的 recover 捕获并转化为 error。
+//   - asyncRet 在调用方的返回队列已满或已关闭时返回 false，同样转化为
+//     ErrRetDropped——队列返回错误而不是 panic，无需再靠 recover 兜底。
 //
 // 若 chanRet 为 nil（Cast 调用），直接返回 nil，不做任何操作。
 func (ci *CallInfo) ret(ri *RetInfo) (err error) {
@@ -352,6 +350,22 @@ func (ci *CallInfo) ID() uint32 {
 	return ci.id
 }
 
+// RequestAs 把 Request 断言为 T，类型不符（或 Request 为 nil）时返回 T 的
+// 零值和 false。
+//
+// 它和直接写 ci.Request.(T) 的差别只在安全性上。handler 里最省事的写法是
+// 裸断言——req := ci.Request.(pingReq)——类型一旦对不上就 panic 在业务代码
+// 里；带 ok 的两行版本安全，但每个 handler 都要重复一遍。收成方法之后，
+// 安全的那种写法和不安全的那种一样短。
+//
+// 泛型方法要 Go 1.27 才有。在那之前这个能力只能写成包级函数
+// RequestAs[T](ci)，那样它就离开了 CallInfo 自己的命名空间——而「把请求解成
+// 某个具体类型」显然是 CallInfo 自己的事。
+func (ci *CallInfo) RequestAs[T any]() (T, bool) {
+	v, ok := ci.Request.(T)
+	return v, ok
+}
+
 // RetInfo 封装 RPC 调用的响应数据，同时作为异步回调的上下文载体。
 type RetInfo struct {
 	Metadata map[string]any `json:"Metadata"` // 元数据
@@ -368,4 +382,14 @@ func (ri *RetInfo) ID() uint32 {
 		return 0
 	}
 	return ID(ri.Ack)
+}
+
+// AckAs 把 Ack 断言为 T，类型不符（或 Ack 为 nil）时返回 T 的零值和 false，
+// 与 CallInfo.RequestAs 对称。
+//
+// 回调里尤其值得用：AsyncCall 的回调先要看 ri.Err，再取 Ack，裸断言在错误
+// 响应上必定 panic（Err 非 nil 时 Ack 通常就是 nil）。
+func (ri *RetInfo) AckAs[T any]() (T, bool) {
+	v, ok := ri.Ack.(T)
+	return v, ok
 }

@@ -339,9 +339,9 @@ func TestStopDuringInitDoesNotRaceWithOnInit(t *testing.T) {
 	inInit := make(chan struct{})
 	slow := newTestModule("slow-init")
 	shared := map[string]int{}
-	var once sync.Once
+	markInInit := sync.OnceFunc(func() { close(inInit) })
 	slow.initHook = func() {
-		once.Do(func() { close(inInit) })
+		markInInit()
 		for i := range 200 {
 			shared["k"] = i // 与 OnDestroy 争抢的业务内存
 		}

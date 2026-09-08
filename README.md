@@ -39,7 +39,7 @@
 | Actor 模型 | 每个模块单 goroutine 串行处理事件，降低锁竞争和数据竞争风险。 |
 | 模块化生命周期 | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序），并严格逆序关闭；动态模块支持运行时加载和卸载。 |
 | ChanRPC | 进程内 RPC，支持 Cast、AsyncCall、Call、CallWithContext 四种调用语义。 |
-| 有界队列 | RPC、异步返回和定时器事件均使用有界的标准 channel：过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM。 |
+| 伸缩式有界队列 | RPC、异步返回和定时器事件都走同一套队列：容量按积压动态增长、随空闲收缩，同时保留硬性上限。过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM；空闲时也不会为一个用不上的上限预留内存。 |
 | 多级时间轮定时器 | 最小粒度 64ms，支持 Timer、Ticker、加速、延迟、改期和取消。 |
 | 时间跳变保护 | 系统时间回退时内部 tick 基准跟随回退，避免定时器停摆（重扫幂等，不会重复触发）；系统时间跳到未来时逐 tick 推进到当前时间，不跳过中间层级的降级。 |
 | 信号管理 | 默认处理 SIGINT/SIGTERM 优雅关闭；业务可注册 SIGHUP 等非保留信号。 |
@@ -50,7 +50,7 @@
 
 ## 安装
 
-要求 Go 1.26.3 或更高版本。
+要求 Go 1.27.1 或更高版本。
 
 ```bash
 go get github.com/xmapst/xhive
@@ -70,6 +70,7 @@ import "github.com/xmapst/xhive"
 package main
 
 import (
+	"errors"
 	"log/slog"
 	"time"
 
@@ -89,7 +90,10 @@ func NewPonger() *Ponger {
 
 func (m *Ponger) OnInit() error {
 	return m.RegisterChanRPC(&PingReq{}, func(ci *chanrpc.CallInfo) *chanrpc.RetInfo {
-		req := ci.Request.(*PingReq)
+		req, ok := ci.RequestAs[*PingReq]()
+		if !ok {
+			return &chanrpc.RetInfo{Err: errors.New("unexpected request type")}
+		}
 		slog.Info("ponger received ping", slog.Int("seq", req.Seq))
 		return &chanrpc.RetInfo{Ack: &PongAck{Seq: req.Seq}}
 	})
@@ -115,7 +119,10 @@ func (m *Pinger) OnInit() error {
 				slog.Error("ping failed", slog.Any("error", ri.Err))
 				return
 			}
-			ack := ri.Ack.(*PongAck)
+			ack, ok := ri.AckAs[*PongAck]()
+			if !ok {
+				return
+			}
 			slog.Info("pinger received pong", slog.Int("seq", ack.Seq))
 		})
 	})
@@ -190,9 +197,11 @@ type IModule interface {
 事件循环串行处理：
 
 1. `ctx.Done()`：模块停止信号。
-2. `timer.Event()`：定时器到期事件。
-3. `client.Event()`：异步 RPC 响应。
-4. `server.Event()`：RPC 请求。
+2. `timer.NotEmpty()`：定时器到期事件。
+3. `client.NotEmpty()`：异步 RPC 响应。
+4. `server.NotEmpty()`：RPC 请求。
+
+后三路的数据不流经 channel，channel 只承载一个「可能有事件」的边沿信号，取件靠紧跟其后的 `Pop()`。信号会合并，所以 `Pop()` 允许扑空；反过来只要队列非空，信号一定还在，不会丢唤醒。每次只 `Pop` 一条而不是醒来后循环排空，是为了不让一个慢 handler 长时间占住事件循环、拖垮 `ctx.Done()` 的响应和四路之间的公平性。
 
 常用方法：
 
@@ -208,14 +217,14 @@ type IModule interface {
 
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WithTimerChanLen(n)` | 1024 | 定时器操作队列与到期队列容量。 |
-| `WithServerChanLen(n)` | 4096 | ChanRPC 服务端队列容量。 |
-| `WithClientChanLen(n)` | 4096 | ChanRPC 客户端异步返回队列容量。 |
+| `WithTimerChanLen(n)` | 1024 | 定时器操作队列与到期队列的容量上限。 |
+| `WithServerChanLen(n)` | 4096 | ChanRPC 服务端队列容量上限。 |
+| `WithClientChanLen(n)` | 4096 | ChanRPC 客户端异步返回队列容量上限。 |
 | `WithStatCap(n)` | 8192 | 每类消息用于分位统计的最大采样数。 |
 | `WithCloseDrainTimeout(d)` | 30s | 停机时 ChanRPC 服务端排空自投递链条的超时上限，超时后放弃剩余部分直接完成关闭。 |
 | `WithClientCloseTimeout(d)` | 5s | 停机时 ChanRPC 客户端等待未处理异步回调排空的超时上限，超时后放弃剩余回调。 |
 
-前三项都是**硬性上限**。队列打满时的行为：
+前三项都是**硬性上限**，但**只封顶、不预留**：队列实际占用的内存随积压增长、随空闲收缩，调大上限不会让空闲模块多占一个字节。队列打满时的行为：
 
 | 队列 | 打满时 |
 | --- | --- |
@@ -225,7 +234,7 @@ type IModule interface {
 
 `WithStatCap(n)` 同样是硬上限，单个 key 采样数达到 n 后新样本不再计入分位统计。
 
-配合 `ChanRPC(name).Len()` 与 `Cap()` 做水位告警，在真正打满之前就能发现问题。
+配合 `ChanRPC(name).Len()` 与 `Cap()` 做水位告警，在真正打满之前就能发现问题。`Cap()` 返回的是配置的硬上限而非当前分配量——水位关心的是「离拒绝还有多远」。
 
 ### ChanRPC
 
@@ -245,6 +254,17 @@ Handler 响应语义：
 - 直接返回 `nil` 且未调用 `Hold`：框架补一个空包，避免同步 `Call` 挂死。
 - `hasRet` CAS 保证同一调用最多只发送一次响应；重复调用 `Replier.Ret` 会返回 `ErrAlreadyRet`。
 - handler panic 时框架仍会回包错误，即便已经调用 `Hold`。
+
+解包请求与响应：
+
+`CallInfo.RequestAs[T]()` 与 `RetInfo.AckAs[T]()` 是带 `ok` 的类型断言（Go 1.27 泛型方法），类型不符或字段本身为 nil 时返回 `T` 的零值和 `false`，不会 panic。回调里尤其该用 `AckAs`——`Err` 非 nil 时 `Ack` 通常就是 nil，裸断言必崩。
+
+```go
+req, ok := ci.RequestAs[*PingReq]()
+if !ok {
+    return &chanrpc.RetInfo{Err: errors.New("unexpected request type")}
+}
+```
 
 消息 ID 生成规则：
 
@@ -447,6 +467,8 @@ xhive/
 │   ├── def.go          # 消息 ID、CallInfo、RetInfo、CallOption、Hold/Replier
 │   ├── server.go       # ChanRPC 服务端
 │   └── client.go       # ChanRPC 客户端
+├── internal/
+│   └── queue/          # 动态扩缩容 + 硬上限的 FIFO 队列，上面三条队列的共同底座
 ├── timer/
 │   ├── dispatcher.go   # 多级时间轮调度器
 │   └── manager.go      # 业务层 Timer API
@@ -489,6 +511,7 @@ go test -race ./...
 - signal：保留信号、自定义信号、并发分发和 panic 隔离。
 - chanrpc：消息 ID、注册校验、Cast、AsyncCall、Call、metadata、`Hold` 延迟响应、panic 恢复、关闭语义、队列打满时的失败/阻塞/丢包与计数回滚。
 - timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、到期队列打满时的重试、Manager one-shot 和 ticker。
+- internal/queue：FIFO 顺序、扩容与收缩、打满即拒绝、阻塞入队的取消与唤醒、关闭后的拒绝与排空、出队后解除引用、边沿信号不丢唤醒、多生产者多消费者并发。
 - stat：分位统计、TopN、Reset、零值 key 忽略、并发 Add 和 Dump。
 
 ---
@@ -521,11 +544,35 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 ### 队列打满了会发生什么？
 
-队列全部有界，打满时的行为按调用语义区分（详见 [Skeleton](#skeleton) 一节的表格）：异步语义（`Cast`、`AsyncCall`）立即失败并返回 `ErrChanFull`，同步语义（`Call`、`CallWithContext`）阻塞等待空位形成背压，定时器到期事件则留在时间轮里下个 tick 重试、不丢失。
+队列容量全都有硬上限，打满时的行为按调用语义区分（详见 [Skeleton](#skeleton) 一节的表格）：异步语义（`Cast`、`AsyncCall`）立即失败并返回 `ErrChanFull`，同步语义（`Call`、`CallWithContext`）阻塞等待空位形成背压，定时器到期事件则留在时间轮里下个 tick 重试、不丢失。
 
-这是刻意的取舍。早期版本使用无界队列，生产者永不阻塞、永不失败，代价是消费端一旦跟不上，积压只表现为内存一路上涨，最终以 OOM 的形式在离现场很远的地方崩掉，中途没有任何可告警的信号。有界队列把同一个问题在发生的那一刻就暴露成一个带消息类型和水位的错误。
+这是刻意的取舍。早期版本使用无界队列，生产者永不阻塞、永不失败，代价是消费端一旦跟不上，积压只表现为内存一路上涨，最终以 OOM 的形式在离现场很远的地方崩掉，中途没有任何可告警的信号。有上限的队列把同一个问题在发生的那一刻就暴露成一个带消息类型和水位的错误。
 
 生产环境应通过包级 `Stats()`（汇总各模块 RPC 服务端队列长度）或 `ChanRPC(name).Len()` / `Cap()` 观测水位，在打满之前就限流、拆模块或告警。
+
+### 有上限的队列，为什么不用原生 channel？
+
+因为原生 channel 只能在「固定容量」和「无界」之间二选一，而这两个都不是我们要的。
+
+`hchan` 的缓冲区在 `make` 时一次性分配、此后永不增长。一个 `make(chan *CallInfo, 4096)` 的模块，哪怕一条消息都没有，也要先付出 32KB 常驻内存；元素含指针时，这段缓冲区还全程参与 GC 扫描。按每模块 server 4096 + client 4096 + timer 1024×2 算，空转就是 88KB，模块一多这笔固定开销很可观。反过来把队列做成无界的（早期的 `chanx`）又回到了上一个问题：消费端跟不上时只会一路吃内存直到 OOM。
+
+破局点在于：`select` 需要的只是一个**可等待的 channel**，它并不要求数据本身流经这个 channel。于是 `internal/queue` 把两者拆开——数据放在自己管理的 ring buffer 里，从 16 个槽位起按积压翻倍、按空闲减半；容量上限由入队时显式检查，达到上限即拒绝，与原生有界 channel 的「满」语义完全一致；另外用两个 `chan struct{}` 承载「非空」「非满」两个信号，让队列仍然能作为 `select` 的一路。
+
+两个信号的机制不同，各自对应一种用法：
+
+- **非空**是 `cap=1` 的边沿信号。信号会合并，所以消费方不能假设「一个信号对应一个元素」；`Pop` 在队列仍非空时把信号补回去，以此保证只要队列非空就一定还有信号在，不丢唤醒。
+- **非满**是广播：队列填满时换上一个新的未关闭通道，从满变回不满时 `close` 它，所有阻塞的生产者一次全醒。不用边沿信号，是因为它一次只能放行一个等待者，剩下的必须靠每个成功入队的生产者接力再发一个——接力只要在任何一条路径上被漏掉，其余生产者就会永久卡住，队列明明空着却没人能进。广播没有这个陷阱，而且稳态下（既不满也不空）这两个字段一次都不用碰。
+
+实测数字：
+
+| 指标 | 原生 channel | Queue |
+| --- | --- | --- |
+| 每个 `Skeleton` 常驻内存 | 93.5 KB | **3.2 KB** |
+| 1000 个模块 | 91.3 MB | **3.2 MB** |
+| 单次收发（队列常空） | 36 ns | 79 ns |
+| 单次收发（队列有积压） | 34 ns | **29 ns** |
+
+慢的那一栏是队列常空、每条消息都要真正唤醒一次 goroutine 的场景，原生 channel 在这里走 runtime 的直接交接快路径，而 Queue 要多付一次入队锁和一次出队锁。队列一旦有积压，`Pop` 补回的信号让消费者无需阻塞唤醒就能连续取件，反而比原生更快。模块负载越高越靠近后者。
 
 ### 模块的启动顺序怎么控制？
 

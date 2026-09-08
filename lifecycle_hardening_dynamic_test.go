@@ -293,8 +293,7 @@ func TestAddDynamicModulesRolledBackWhenShutdownStartsDuringInit(t *testing.T) {
 
 	initEntered := make(chan struct{})
 	releaseInit := make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(releaseInit) }) }
+	release := sync.OnceFunc(func() { close(releaseInit) })
 	t.Cleanup(release) // 任何一条 t.Fatal 路径都不会把 OnInit 永久挂住
 
 	// blocker 先被初始化（优先级更小），它的 OnInit 就是本用例的同步点。
@@ -412,8 +411,7 @@ func TestDynamicModuleInvisibleUntilReady(t *testing.T) {
 
 	initEntered := make(chan struct{})
 	releaseInit := make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(releaseInit) }) }
+	release := sync.OnceFunc(func() { close(releaseInit) })
 	t.Cleanup(release)
 
 	pending := newHDModule(name)
