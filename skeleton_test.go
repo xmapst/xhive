@@ -3,6 +3,7 @@ package xhive
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -200,9 +201,131 @@ func TestSkeletonTimerWrappersAndStat(t *testing.T) {
 }
 
 func TestSkeletonOptionsIgnoreNonPositiveValues(t *testing.T) {
-	s := NewSkeleton("defaults", WithTimerChanLen(0), WithServerChanLen(-1), WithClientChanLen(0), WithStatCap(-1))
-	if s.Name() != "defaults" || s.timer == nil || s.server == nil || s.client == nil || s.stat == nil {
+	s := NewSkeleton("defaults", WithTimerChanLen(0), WithServerChanLen(-1), WithClientChanLen(0), WithAsyncChanLen(-1), WithAsyncCloseTimeout(-1), WithStatCap(-1))
+	if s.Name() != "defaults" || s.timer == nil || s.server == nil || s.client == nil || s.async == nil || s.stat == nil {
 		t.Fatalf("skeleton not initialized correctly: %#v", s)
 	}
 	s.recordStat("x", 1)
+}
+
+// TestSkeletonAsyncGo 验证 AsyncGo 派发的 f 在独立 goroutine 执行，f 结束后
+// cb 在 Serve 的事件循环中被调用。
+func TestSkeletonAsyncGo(t *testing.T) {
+	s := NewSkeleton("async", WithTimerChanLen(8), WithStatCap(8))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		s.Serve(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		waitClosed(t, done, time.Second)
+	}()
+
+	var fRan atomic.Bool
+	cbDone := make(chan struct{})
+	s.AsyncGo("test-task", func() {
+		fRan.Store(true)
+	}, func() {
+		close(cbDone)
+	})
+
+	select {
+	case <-cbDone:
+		if !fRan.Load() {
+			t.Fatal("expected f to run before cb")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for AsyncGo callback")
+	}
+
+	if dump := s.DumpStat(10); !strings.Contains(dump, "test-task") {
+		t.Fatalf("DumpStat missing AsyncGo entry: %s", dump)
+	}
+}
+
+// TestSkeletonNewLinearContext 验证 Skeleton.NewLinearContext 返回的队列按
+// 提交顺序串行执行各任务的 f，且 cb 仍然在 Serve 的事件循环中被调用。
+func TestSkeletonNewLinearContext(t *testing.T) {
+	s := NewSkeleton("linear", WithTimerChanLen(8), WithStatCap(8))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		s.Serve(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		waitClosed(t, done, time.Second)
+	}()
+
+	lc := s.NewLinearContext()
+	const n = 20
+	var order []int
+	cbDone := make(chan struct{}, n)
+	for i := range n {
+		lc.Go(func() {
+			order = append(order, i)
+		}, func() {
+			cbDone <- struct{}{}
+		})
+	}
+
+	for range n {
+		select {
+		case <-cbDone:
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for LinearContext callback")
+		}
+	}
+
+	if len(order) != n {
+		t.Fatalf("expected %d executions, got %d", n, len(order))
+	}
+	for i, v := range order {
+		if v != i {
+			t.Fatalf("order broken at index %d: got %d, want %d", i, v, i)
+		}
+	}
+}
+
+// TestSkeletonCloseDrainsAsyncGo 验证 Serve 因 ctx 取消已经退出、但对应的 f
+// 是之后才结束的场景下，Skeleton.Close 依然会把这个迟到的回调排空执行。
+func TestSkeletonCloseDrainsAsyncGo(t *testing.T) {
+	s := NewSkeleton("async-close", WithTimerChanLen(8), WithStatCap(8))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		s.Serve(ctx)
+		close(done)
+	}()
+
+	release := make(chan struct{})
+	fDone := make(chan struct{})
+	var cbRan atomic.Bool
+	s.AsyncGo("slow-task", func() {
+		<-release
+		close(fDone)
+	}, func() {
+		cbRan.Store(true)
+	})
+
+	cancel()
+	waitClosed(t, done, time.Second)
+
+	// Serve 的事件循环此刻已经退出，f 才刚结束，其回调需要靠 Skeleton.Close
+	// 排空执行，而不是 Serve 的 select 循环。
+	close(release)
+	waitClosed(t, fDone, time.Second)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Skeleton Close err = %v", err)
+	}
+	if !cbRan.Load() {
+		t.Fatal("expected Skeleton.Close to drain the pending AsyncGo callback")
+	}
 }

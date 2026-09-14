@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xmapst/xhive/chanrpc"
+	"github.com/xmapst/xhive/internal/async"
 	"github.com/xmapst/xhive/stat"
 	"github.com/xmapst/xhive/timer"
 )
@@ -52,12 +53,34 @@ type ITimer interface {
 	CancelTimer(id int64)
 }
 
-// ISkeleton 模块骨架的抽象接口，聚合了跨模块 RPC 调用（IRPC）和定时器管理（ITimer）
-// 两个能力。业务模块通过组合 Skeleton（或实现 ISkeleton）获得完整的事件驱动能力，
-// 框架据此对模块进行统一调度与生命周期管理。
+// LinearContext 是模块本地异步任务的顺序保证队列，通过 Skeleton.NewLinearContext
+// 创建，见其说明。类型别名到 internal/async.LinearContext——用别名而不是重新定义
+// 一个同名类型，是为了让外部调用方可以直接用 xhive.LinearContext 声明变量/字段
+// 类型，而不需要（也不能，因为它在 internal/ 包下）直接 import 内部实现包。
+type LinearContext = async.LinearContext
+
+// IAsync 定义模块内的本地异步任务调度能力：把耗时或阻塞的操作放到独立 goroutine
+// 执行，完成后通过回调安全地把结果带回本模块的事件循环，无需加锁即可访问模块状态。
+// 与 IRPC.AsyncCall 的区别：AsyncCall 面向"调用其他模块的 Server"这种跨模块 RPC，
+// AsyncGo/NewLinearContext 面向"本模块内部把一段本地计算/阻塞 IO 挪出事件循环"，
+// 两者都遵循同一个"f 并发执行、cb 回到事件循环执行"的模式，只是目标不同。
+type IAsync interface {
+	// AsyncGo 在独立 goroutine 中执行 f，f 结束（或 panic）后 cb 在本模块事件循环
+	// 中执行。name 用于按类型统计 cb 的执行耗时（DumpStat），不参与调度逻辑。
+	AsyncGo(name string, f, cb func())
+	// NewLinearContext 创建一个和本模块共享同一份并发配额、保证顺序执行的本地
+	// 异步任务队列，见 LinearContext 的说明。
+	NewLinearContext() *LinearContext
+}
+
+// ISkeleton 模块骨架的抽象接口，聚合了跨模块 RPC 调用（IRPC）、定时器管理
+// （ITimer）和本地异步任务调度（IAsync）三个能力。业务模块通过组合 Skeleton
+// （或实现 ISkeleton）获得完整的事件驱动能力，框架据此对模块进行统一调度与
+// 生命周期管理。
 type ISkeleton interface {
 	IRPC
 	ITimer
+	IAsync
 }
 
 // Skeleton 模块骨架，将 ChanRPC（服务端/客户端）和定时器管理器整合为统一的事件驱动框架。
@@ -73,6 +96,7 @@ type Skeleton struct {
 	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
 	server *chanrpc.Server // ChanRPC 服务端，接收并路由来自其他模块的 RPC 调用
 	client *chanrpc.Client // ChanRPC 客户端，向其他模块发起 RPC 调用
+	async  *async.Scheduler // 本地异步任务调度器，见 IAsync.AsyncGo
 	stat   *stat.TPStats   // 消息耗时统计
 	name   string
 }
@@ -86,14 +110,17 @@ type skeletonOptions struct {
 	timerChanLen  int
 	serverChanLen int
 	clientChanLen int
+	asyncChanLen  int
 	statCap       int
-	// closeDrainTimeout/clientCloseTimeout 零值表示未显式设置：分别透传给
-	// chanrpc.WithCloseDrainTimeout/WithClientCloseTimeout 时对零值不生效
-	// （两者内部都是 d > 0 才覆盖），沿用 chanrpc 包自己的默认值（分别是
-	// chanrpc.defaultCloseDrainTimeout、defaultClientCloseTimeout），不需要
-	// 在这里重复一份默认值。
+	// closeDrainTimeout/clientCloseTimeout/asyncCloseTimeout 零值表示未显式
+	// 设置：分别透传给 chanrpc.WithCloseDrainTimeout/WithClientCloseTimeout/
+	// async.WithCloseTimeout 时对零值不生效（三者内部都是 d > 0 才覆盖），沿用
+	// 各自包自己的默认值（分别是 chanrpc.defaultCloseDrainTimeout、
+	// defaultClientCloseTimeout、async.defaultCloseTimeout），不需要在这里
+	// 重复一份默认值。
 	closeDrainTimeout  time.Duration
 	clientCloseTimeout time.Duration
+	asyncCloseTimeout  time.Duration
 }
 
 func defaultSkeletonOptions() skeletonOptions {
@@ -101,6 +128,7 @@ func defaultSkeletonOptions() skeletonOptions {
 		timerChanLen:  1024,
 		serverChanLen: 4096,
 		clientChanLen: 4096,
+		asyncChanLen:  1024,
 		statCap:       8192,
 	}
 }
@@ -139,6 +167,17 @@ func WithClientChanLen(n int) SkeletonOption {
 	}
 }
 
+// WithAsyncChanLen 自定义本地异步任务（AsyncGo）回调队列长度（有界队列的容量
+// 上限）。它同时也是同时允许存在的未完成异步任务数上限，见 internal/async.New
+// 的说明——这个值应当覆盖本模块可能同时在途的 AsyncGo 调用数。
+func WithAsyncChanLen(n int) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if n > 0 {
+			opts.asyncChanLen = n
+		}
+	}
+}
+
 // WithStatCap 自定义耗时统计容量。
 func WithStatCap(n int) SkeletonOption {
 	return func(opts *skeletonOptions) {
@@ -173,10 +212,22 @@ func WithClientCloseTimeout(d time.Duration) SkeletonOption {
 	}
 }
 
-// NewSkeleton 创建模块骨架，初始化 ChanRPC 和定时器组件。
+// WithAsyncCloseTimeout 自定义模块停机时等待未执行的本地异步任务（AsyncGo/
+// LinearContext）回调排空的超时上限，见 internal/async.Scheduler.Close 的说明。
+// 超时后强制清零、放弃剩余回调，避免某个回调永久阻塞导致停机永远卡住。d <= 0
+// 时该选项不生效，沿用 internal/async 包自己的默认值（5 秒）。
+func WithAsyncCloseTimeout(d time.Duration) SkeletonOption {
+	return func(opts *skeletonOptions) {
+		if d > 0 {
+			opts.asyncCloseTimeout = d
+		}
+	}
+}
+
+// NewSkeleton 创建模块骨架，初始化 ChanRPC、定时器和本地异步任务调度组件。
 //
 // 默认配置为：定时器事件通道 1024、ChanRPC 服务端队列 4096、
-// 客户端异步返回队列 4096、统计采样容量 8192。
+// 客户端异步返回队列 4096、本地异步任务回调队列 1024、统计采样容量 8192。
 //
 // 这些容量都是**硬性上限**：队列打满时，异步投递直接失败、同步调用阻塞等待，
 // 过载会在发生的那一刻就变成可观测的错误或等待，而不是把积压一路堆进内存
@@ -201,7 +252,8 @@ func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 			chanrpc.WithClientChanLen(cfg.clientChanLen),
 			chanrpc.WithClientCloseTimeout(cfg.clientCloseTimeout),
 		),
-		stat: stat.NewTPStats(cfg.statCap),
+		async: async.New(cfg.asyncChanLen, async.WithCloseTimeout(cfg.asyncCloseTimeout)),
+		stat:  stat.NewTPStats(cfg.statCap),
 	}
 	return s
 }
@@ -223,13 +275,14 @@ func (s *Skeleton) Priority() uint {
 // 要么跟着一起阻塞（同步 Call）。这正是有上限的取舍：把"处理不过来"这件事
 // 立刻暴露出来，而不是攒在内存里。
 //
-// 事件循环采用 select 多路复用以下四类事件，保证在单一 goroutine 内串行处理：
+// 事件循环采用 select 多路复用以下五类事件，保证在单一 goroutine 内串行处理：
 //  1. ctx.Done()：接收框架的停止信号，触发模块关闭流程
 //  2. timer.NotEmpty()：处理到期的定时器事件（执行注册的 timer.Handler，并自动续期 Ticker）
 //  3. client.NotEmpty()：处理本模块发起的异步 RPC 调用返回结果（执行注册的 Callback）
 //  4. server.NotEmpty()：处理其他模块发来的 RPC 调用请求（查找并执行已注册的 Handler）
+//  5. async.NotEmpty()：处理本模块通过 AsyncGo 派发的本地异步任务的回调
 //
-// 三条队列都不再把数据本身放进 channel——channel 只承载一个「可能有事件」的
+// 四条队列都不再把数据本身放进 channel——channel 只承载一个「可能有事件」的
 // 边沿信号，数据在按积压伸缩的队列里，因此每一路都是「收到信号 → Pop 一次」，
 // 且必须容忍 Pop 扑空（信号会合并，存在虚假唤醒）。
 //
@@ -284,6 +337,14 @@ func (s *Skeleton) Serve(ctx context.Context) {
 			startUs := time.Now().UnixMicro()
 			s.server.Exec(ci)
 			s.recordStat(ci.ID(), time.Now().UnixMicro()-startUs)
+		case <-s.async.NotEmpty():
+			cb, ok := s.async.Pop()
+			if !ok {
+				continue
+			}
+			// 耗时统计已经在 AsyncGo 包装的 cb 里做了（每个任务的统计桶名
+			// 不同），这里不再重复调用 recordStat。
+			s.async.Cb(cb)
 		}
 	}
 }
@@ -308,7 +369,13 @@ func (s *Skeleton) Ready() <-chan struct{} {
 //
 // s.client.Close 内部已经处理了"有 pending 异步调用需要排空"和"无 pending 直接关闭"
 // 两种情况（含超时兜底），这里调用一次即可，不需要在外层轮询 Idle。
+//
+// s.async.Close 必须排在 s.client.Close 之前：async 排空阶段执行的 cb 可能还要
+// 用 client 做最后的跨模块投递，必须在 client 关闭之前跑完——这与"OnDestroy
+// 要用 client 收尾、所以 client.Close 推迟到最后才调用"是完全对称的道理。
+// 代价是停机最坏耗时会叠加两者各自的排空超时。
 func (s *Skeleton) Close() error {
+	s.async.Close()
 	s.client.Close()
 	s.dumpStat(false)
 	return nil
@@ -442,4 +509,38 @@ func (s *Skeleton) CallWithContext(ctx context.Context, mod string, req any, opt
 // DumpStat 获取前 n 个处理耗时最长的消息。
 func (s *Skeleton) DumpStat(n int) string {
 	return s.stat.Dump(n)
+}
+
+// AsyncGo 在独立 goroutine 中执行 f，f 结束（或 panic）后 cb 在本模块事件
+// 循环中执行，可安全访问模块内部状态。
+//
+// 与 AsyncCall 的区别：AsyncCall 调用的是其他模块的 Server，AsyncGo 执行的
+// 是一段本模块内部的本地代码（例如耗时计算、阻塞 IO），两者的 f/cb 都遵循
+// 同一个"f 并发执行、cb 回到事件循环执行"的模式，只是被调用目标不同。
+//
+// name 用于在 DumpStat 里按类型统计 cb 的执行耗时；耗时统计放在 defer 里，
+// 即使 cb 内部 panic 也会先记账，再交给 internal/async.Scheduler.Cb 自身的
+// recover 兜底，行为对齐 AsyncCallback/Exec 的既有模式。
+func (s *Skeleton) AsyncGo(name string, f, cb func()) {
+	s.async.Go(f, func() {
+		startUs := time.Now().UnixMicro()
+		defer func() {
+			s.recordStat(name, time.Now().UnixMicro()-startUs)
+		}()
+		if cb != nil {
+			cb()
+		}
+	})
+}
+
+// NewLinearContext 创建一个保证顺序执行的本地异步任务队列：通过它提交的任务，
+// f 始终按提交顺序依次串行执行（不会并发执行），cb 仍然和 AsyncGo 一样回到
+// 本模块的事件循环里执行。适用于"多个本地异步步骤必须按先后顺序推进"的场景；
+// 不需要顺序保证时优先用更简单的 AsyncGo。
+//
+// 返回的 LinearContext 与本模块共享同一份并发配额（Skeleton 构造时通过
+// WithAsyncChanLen 设置的上限），不单独统计耗时——LinearContext.Go 没有 name
+// 参数，其 cb 的执行耗时不会计入 DumpStat。
+func (s *Skeleton) NewLinearContext() *LinearContext {
+	return s.async.NewLinearContext()
 }

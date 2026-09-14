@@ -19,6 +19,7 @@
   - [模块](#模块)
   - [Skeleton](#skeleton)
   - [ChanRPC](#chanrpc)
+  - [本地异步任务](#本地异步任务)
   - [Timer](#timer)
   - [Signal](#signal)
   - [TPStats](#tpstats)
@@ -39,7 +40,8 @@
 | Actor 模型 | 每个模块单 goroutine 串行处理事件，降低锁竞争和数据竞争风险。 |
 | 模块化生命周期 | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序），并严格逆序关闭；动态模块支持运行时加载和卸载。 |
 | ChanRPC | 进程内 RPC，支持 Cast、AsyncCall、Call、CallWithContext 四种调用语义。 |
-| 伸缩式有界队列 | RPC、异步返回和定时器事件都走同一套队列：容量按积压动态增长、随空闲收缩，同时保留硬性上限。过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM；空闲时也不会为一个用不上的上限预留内存。 |
+| 本地异步任务 | `AsyncGo` 把一段耗时/阻塞的本地操作挪到独立 goroutine 执行，回调安全带回事件循环；`NewLinearContext` 提供顺序保证的变体。 |
+| 伸缩式有界队列 | RPC、异步返回、定时器事件和本地异步任务回调都走同一套队列：容量按积压动态增长、随空闲收缩，同时保留硬性上限。过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM；空闲时也不会为一个用不上的上限预留内存。 |
 | 多级时间轮定时器 | 最小粒度 64ms，支持 Timer、Ticker、加速、延迟、改期和取消。 |
 | 时间跳变保护 | 系统时间回退时内部 tick 基准跟随回退，避免定时器停摆（重扫幂等，不会重复触发）；系统时间跳到未来时逐 tick 推进到当前时间，不跳过中间层级的降级。 |
 | 信号管理 | 默认处理 SIGINT/SIGTERM 优雅关闭；业务可注册 SIGHUP 等非保留信号。 |
@@ -191,6 +193,7 @@ type IModule interface {
 - ChanRPC 服务端。
 - ChanRPC 客户端。
 - Timer 管理器。
+- 本地异步任务调度器（见[本地异步任务](#本地异步任务)）。
 - TPStats 耗时统计。
 - 标准事件循环。
 
@@ -200,8 +203,9 @@ type IModule interface {
 2. `timer.NotEmpty()`：定时器到期事件。
 3. `client.NotEmpty()`：异步 RPC 响应。
 4. `server.NotEmpty()`：RPC 请求。
+5. `async.NotEmpty()`：本地异步任务（`AsyncGo`/`LinearContext`）的回调。
 
-后三路的数据不流经 channel，channel 只承载一个「可能有事件」的边沿信号，取件靠紧跟其后的 `Pop()`。信号会合并，所以 `Pop()` 允许扑空；反过来只要队列非空，信号一定还在，不会丢唤醒。每次只 `Pop` 一条而不是醒来后循环排空，是为了不让一个慢 handler 长时间占住事件循环、拖垮 `ctx.Done()` 的响应和四路之间的公平性。
+后四路的数据不流经 channel，channel 只承载一个「可能有事件」的边沿信号，取件靠紧跟其后的 `Pop()`。信号会合并，所以 `Pop()` 允许扑空；反过来只要队列非空，信号一定还在，不会丢唤醒。每次只 `Pop` 一条而不是醒来后循环排空，是为了不让一个慢 handler 长时间占住事件循环、拖垮 `ctx.Done()` 的响应和五路之间的公平性。
 
 常用方法：
 
@@ -209,6 +213,7 @@ type IModule interface {
 | --- | --- |
 | RPC 注册 | `RegisterChanRPC(msg, handler)` |
 | RPC 调用 | `Cast(mod, req)`、`AsyncCall(mod, req, cb)`、`Call(mod, req)`、`CallWithContext(ctx, mod, req)` |
+| 本地异步任务 | `AsyncGo(name, f, cb)`、`NewLinearContext()`（详见[本地异步任务](#本地异步任务)） |
 | 定时器 | `RegisterTimer`、`NewTimer`、`AccAbsTimer`、`AccPctTimer`、`DelayAbsTimer`、`DelayPctTimer`、`UpdateTimer`、`CancelTimer` |
 | 统计 | `DumpStat(n)` |
 | 模块接口默认实现 | `Name()`、`Priority()`、`Serve()`、`Ready()`、`ChanRPC()`、`Close()`；`Priority()` 返回 0，需要调整启动顺序时重写。 |
@@ -220,17 +225,20 @@ type IModule interface {
 | `WithTimerChanLen(n)` | 1024 | 定时器操作队列与到期队列的容量上限。 |
 | `WithServerChanLen(n)` | 4096 | ChanRPC 服务端队列容量上限。 |
 | `WithClientChanLen(n)` | 4096 | ChanRPC 客户端异步返回队列容量上限。 |
+| `WithAsyncChanLen(n)` | 1024 | 本地异步任务回调队列容量上限，同时也是同时允许存在的未完成任务数上限。 |
 | `WithStatCap(n)` | 8192 | 每类消息用于分位统计的最大采样数。 |
 | `WithCloseDrainTimeout(d)` | 30s | 停机时 ChanRPC 服务端排空自投递链条的超时上限，超时后放弃剩余部分直接完成关闭。 |
 | `WithClientCloseTimeout(d)` | 5s | 停机时 ChanRPC 客户端等待未处理异步回调排空的超时上限，超时后放弃剩余回调。 |
+| `WithAsyncCloseTimeout(d)` | 5s | 停机时等待未执行的本地异步任务回调排空的超时上限，超时后放弃剩余回调。 |
 
-前三项都是**硬性上限**，但**只封顶、不预留**：队列实际占用的内存随积压增长、随空闲收缩，调大上限不会让空闲模块多占一个字节。队列打满时的行为：
+前四项都是**硬性上限**，但**只封顶、不预留**：队列实际占用的内存随积压增长、随空闲收缩，调大上限不会让空闲模块多占一个字节。队列打满时的行为：
 
 | 队列 | 打满时 |
 | --- | --- |
 | 服务端调用队列 | `Cast` / `AsyncCall` 立即失败返回 `ErrChanFull`；`Call` / `CallWithContext` 阻塞等待空位（每 5s 打一条 warn，可由 `ctx` 取消）。 |
 | 客户端异步返回队列 | 服务端回包被丢弃并打 error 日志，对应回调不会执行，`pendingAsyncCall` 同步回滚。 |
 | 定时器到期队列 | 到期定时器留在时间轮第 0 层，后续 tick 持续重试投递，**不丢定时器**，只是通知延迟。 |
+| 本地异步任务回调队列 | 不会真正打满：队列容量与同时允许存在的未完成任务数上限被强制绑成同一个值，背压发生在更早的提交阶段——`AsyncGo`/`LinearContext.Go` 在途任务数已达上限时直接拒绝新任务并打 error 日志，见[本地异步任务](#本地异步任务)。 |
 
 `WithStatCap(n)` 同样是硬上限，单个 key 采样数达到 n 后新样本不再计入分位统计。
 
@@ -283,6 +291,33 @@ _ = m.AsyncCall("target", &Req{}, callback, chanrpc.WithMeta("trace_id", "abc"))
 - `Server.Close()` 不回包 `ErrServerClosed`，而是把队列中已排队的调用（含 handler 自投递）真正执行完再关闭队列；排空默认最多 30 秒（`WithCloseDrainTimeout` 可调），超时后丢弃剩余自投递链条。排空完成后再发起的调用才返回 `ErrServerClosed`。
 - `Client.Close()` 尽量消费未处理异步响应，默认最多等待 5 秒（`WithClientCloseTimeout` 可调）；超时后强制清零待处理计数，可能丢失部分未执行的回调。
 - `Call()` 是无限等待加 5 秒周期告警，不主动超时返回；需要超时兜底请改用 `CallWithContext`（`ErrCallTimeout` 仅为兼容保留，当前不会返回）。
+
+### 本地异步任务
+
+`internal/async` 提供一个轻量的本地异步任务调度器，`Skeleton` 内置了它——语义上是 `AsyncCall` 的本地版本：`AsyncCall` 调用的是别的模块的 `Server`，`AsyncGo`/`NewLinearContext` 执行的是本模块内部的一段代码，两者都遵循同一个「`f` 并发执行、`cb` 回到事件循环执行」的模式。
+
+| 方法 | 说明 |
+| --- | --- |
+| `AsyncGo(name, f, cb)` | `f` 在独立 goroutine 中执行，结束（或 panic）后 `cb` 在本模块事件循环中执行，可安全访问模块状态。`name` 用于 `DumpStat` 按类型统计 `cb` 的耗时。 |
+| `NewLinearContext()` | 返回一个 `*LinearContext`：通过它提交的任务，`f` 始终按提交顺序依次串行执行（不会并发），`cb` 仍然回到事件循环执行。多个本地异步步骤需要保证先后顺序时使用；不需要顺序保证时优先用更简单的 `AsyncGo`。 |
+
+`LinearContext` 与 `Skeleton` 共享同一份并发配额（`WithAsyncChanLen` 设置的上限），其 `Go(f, cb)` 没有 `name` 参数，耗时不计入 `DumpStat`。
+
+```go
+m.AsyncGo("load-config", func() {
+	// 耗时或阻塞操作，例如读文件、算哈希
+}, func() {
+	// 回到事件循环，可安全访问模块状态
+})
+
+lc := m.NewLinearContext()
+lc.Go(step1, onStep1Done)
+lc.Go(step2, onStep2Done) // 保证在 step1 之后才执行
+```
+
+设计上有一个核心不变量：内部回调队列的硬性容量与「同时允许存在的未完成任务数上限」被强制绑成同一个值，因此队列在正常情况下永远不会因为满而失败或阻塞——真正的背压发生在提交阶段，一旦在途任务数达到上限，`AsyncGo`/`LinearContext.Go` 直接拒绝新任务并打一条 error 日志，而不是让某个 goroutine 卡在向队列投递上。
+
+关闭语义与 `chanrpc.Client` 完全对称：`Skeleton.Close()` 会先排空未执行的本地异步回调，默认最多等待 5 秒（`WithAsyncCloseTimeout` 可调），超时后放弃剩余回调；这一步在 `client.Close()` **之前**执行，因为排空阶段跑的 `cb` 可能还要用 `client` 做最后的跨模块投递。
 
 ### Timer
 
@@ -361,7 +396,7 @@ err := xhive.RegisterSignal(func() {
 - `Count` 和 `Avg` 基于全部输入累计。
 - `nil`、空字符串、数字零值等无意义 key 会被忽略。
 
-Skeleton 会自动统计定时器事件、RPC 请求和异步 RPC 回调耗时。
+Skeleton 会自动统计定时器事件、RPC 请求、异步 RPC 回调和本地异步任务（`AsyncGo`）回调的耗时。
 
 ---
 
@@ -468,7 +503,8 @@ xhive/
 │   ├── server.go       # ChanRPC 服务端
 │   └── client.go       # ChanRPC 客户端
 ├── internal/
-│   └── queue/          # 动态扩缩容 + 硬上限的 FIFO 队列，上面三条队列的共同底座
+│   ├── go/             # 本地异步任务调度器（Go/LinearContext），Skeleton.AsyncGo/NewLinearContext 的底座
+│   └── queue/          # 动态扩缩容 + 硬上限的 FIFO 队列，上面各条队列的共同底座
 ├── timer/
 │   ├── dispatcher.go   # 多级时间轮调度器
 │   └── manager.go      # 业务层 Timer API
@@ -507,10 +543,11 @@ go test -race ./...
 当前测试覆盖重点：
 
 - app / module：静态与动态模块生命周期、状态流转、启动失败、优先级排序和 LIFO 逆序关闭。
-- skeleton：事件循环、RPC 包装、Timer 包装、统计记录和资源关闭。
+- skeleton：事件循环、RPC 包装、Timer 包装、本地异步任务（`AsyncGo`/`NewLinearContext`）、统计记录和资源关闭（含 Serve 已退出后 `Close` 排空迟到回调的场景）。
 - signal：保留信号、自定义信号、并发分发和 panic 隔离。
 - chanrpc：消息 ID、注册校验、Cast、AsyncCall、Call、metadata、`Hold` 延迟响应、panic 恢复、关闭语义、队列打满时的失败/阻塞/丢包与计数回滚。
 - timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、到期队列打满时的重试、Manager one-shot 和 ticker。
+- internal/async：并发提交、`LinearContext` 顺序保证（含并发提交方）、`Close` 正常排空与超时放弃、无消费者时回调队列不阻塞、panic 恢复。
 - internal/queue：FIFO 顺序、扩容与收缩、打满即拒绝、阻塞入队的取消与唤醒、关闭后的拒绝与排空、出队后解除引用、边沿信号不丢唤醒、多生产者多消费者并发。
 - stat：分位统计、TopN、Reset、零值 key 忽略、并发 Add 和 Dump。
 
@@ -525,6 +562,10 @@ go test -race ./...
 ### 什么时候用 AsyncCall，什么时候用 Call？
 
 优先使用 `AsyncCall`。它不会阻塞当前模块事件循环，回调也会回到当前模块事件循环中执行。`Call` 会阻塞当前模块，如果调用链形成环，会死锁；而且 `Call` 是无限等待，只会每 5s 打一条告警，不会自行超时返回。确实需要同步语义时，新代码应使用 `CallWithContext` 并传入带超时的 ctx，ctx 取消时立即返回携带 `ctx.Err()` 的 `RetInfo`。
+
+### AsyncGo 和 AsyncCall 有什么区别？
+
+`AsyncCall` 调用的是**别的模块**的 `Server`：请求经过对端的 ChanRPC 服务端排队、由对端的事件循环执行 handler，再把结果回传。`AsyncGo` 执行的是**本模块内部**的一段代码：`f` 直接在一个新起的 goroutine 里跑，不经过任何模块间路由。两者的共同点是回调（`cb`/`Callback`）都会回到发起方模块的事件循环里执行，可以安全访问模块状态；区别只在于要执行的代码跑在哪——别的模块用 `AsyncCall`，本模块内部想把一段耗时/阻塞代码挪出事件循环用 `AsyncGo`。需要保证多个本地异步步骤按顺序执行时，用 `NewLinearContext` 而不是多次调用 `AsyncGo`。
 
 ### Cast 失败会怎么样？
 
