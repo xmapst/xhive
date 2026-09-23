@@ -20,7 +20,7 @@ import (
 func TestPlaceholderSeqHasNoDataRace(t *testing.T) {
 	a := newApp()
 	base := newTestModule("base")
-	if !a.start(base) {
+	if a.start(base) != nil {
 		t.Fatal("start should succeed")
 	}
 	defer a.stop()
@@ -87,7 +87,7 @@ func TestPlaceholderSeqHasNoDataRace(t *testing.T) {
 func TestPlaceholderRolledBackCleanlyDuringShutdown(t *testing.T) {
 	a := newApp()
 	base := newTestModule("base")
-	if !a.start(base) {
+	if a.start(base) != nil {
 		t.Fatal("start should succeed")
 	}
 
@@ -172,7 +172,7 @@ func (m *lateServerModule) Close() error { return nil }
 func TestStatsSkipsPlaceholderDuringOnInit(t *testing.T) {
 	a := newApp()
 	base := newTestModule("base")
-	if !a.start(base) {
+	if a.start(base) != nil {
 		t.Fatal("start should succeed")
 	}
 	defer a.stop()
@@ -211,7 +211,7 @@ func TestStatsSkipsPlaceholderDuringOnInit(t *testing.T) {
 func TestPlaceholderNotResurrectedAfterDestroy(t *testing.T) {
 	a := newApp()
 	base := newTestModule("base")
-	if !a.start(base) {
+	if a.start(base) != nil {
 		t.Fatal("start should succeed")
 	}
 	defer a.stop()
@@ -331,7 +331,7 @@ func TestPlaceholderNotResurrectedAfterDestroy(t *testing.T) {
 func TestInitedBranchDoesNotWaitForServe(t *testing.T) {
 	a := newApp()
 	base := newTestModule("base")
-	if !a.start(base) {
+	if a.start(base) != nil {
 		t.Fatal("start should succeed")
 	}
 	defer a.stop()
@@ -414,7 +414,7 @@ func TestInitedBranchDoesNotWaitForServe(t *testing.T) {
 func TestNoOrphanWhenStopRunsDuringWaitReady(t *testing.T) {
 	a := newApp()
 	base := newTestModule("base")
-	if !a.start(base) {
+	if a.start(base) != nil {
 		t.Fatal("start should succeed")
 	}
 

@@ -145,7 +145,7 @@ func TestStopClaimedModuleIsNotResurrectedByStart(t *testing.T) {
 	m := newCasGateModule("claimed-during-init")
 	t.Cleanup(func() { casCloseOnce(m.releaseInit) })
 
-	startResult := make(chan bool, 1)
+	startResult := make(chan error, 1)
 	go func() { startResult <- a.start(m) }()
 
 	// 同步点一：OnInit 已经进入且尚未返回 ⇒ 应用状态为 AppStateInit，
@@ -166,8 +166,8 @@ func TestStopClaimedModuleIsNotResurrectedByStart(t *testing.T) {
 	close(m.releaseInit)
 
 	select {
-	case ok := <-startResult:
-		if ok {
+	case err := <-startResult:
+		if err == nil {
 			t.Fatal("start 在模块已被停机抢占后仍然返回 true")
 		}
 	case <-time.After(10 * time.Second):
@@ -227,7 +227,7 @@ func TestConcurrentStopIsSerialized(t *testing.T) {
 	m := newCasGateModule("blocked-in-init")
 	t.Cleanup(func() { casCloseOnce(m.releaseInit) })
 
-	startResult := make(chan bool, 1)
+	startResult := make(chan error, 1)
 	go func() { startResult <- a.start(m) }()
 	casWaitDone(t, m.initEntered, 5*time.Second, "OnInit 没有被调用")
 
@@ -264,8 +264,8 @@ func TestConcurrentStopIsSerialized(t *testing.T) {
 	close(m.releaseInit)
 	casWaitDone(t, stopFirstDone, 10*time.Second, "第一条 stop 没有收敛")
 	select {
-	case ok := <-startResult:
-		if ok {
+	case err := <-startResult:
+		if err == nil {
 			t.Fatal("start 在关闭已发起后仍然返回 true")
 		}
 	case <-time.After(10 * time.Second):
@@ -482,7 +482,7 @@ func TestServeStartRaceDoesNotSkipWait(t *testing.T) {
 	last.priority = 1
 	last.serveEntered = make(chan struct{})
 
-	startResult := make(chan bool, 1)
+	startResult := make(chan error, 1)
 	go func() { startResult <- a.start(blocked, last) }()
 
 	// 同步点：last 是 startServing 循环里的最后一个模块，它的 Serve 进入

@@ -32,7 +32,7 @@ func TestAppRegisterNilStatsNoRPCAndStopIdempotent(t *testing.T) {
 	if a.State() != AppStateNone {
 		t.Fatalf("stop before start state = %d, want none", a.State())
 	}
-	if !a.start() {
+	if a.start() != nil {
 		// 空启动应失败且仍保持 None，随后再次 stop 应保持幂等且不 panic。
 		if a.State() != AppStateNone {
 			t.Fatalf("empty start state = %d, want none", a.State())
@@ -49,12 +49,12 @@ func TestAppStartCannotStartTwiceAndStopOrder(t *testing.T) {
 	m1.destroyHook = func() { order <- "first" }
 	m2.destroyHook = func() { order <- "second" }
 
-	if !a.start(m1, m2) {
+	if a.start(m1, m2) != nil {
 		t.Fatal("start should succeed")
 	}
 	waitClosed(t, m1.runStarted, time.Second)
 	waitClosed(t, m2.runStarted, time.Second)
-	if a.start(newTestModule("again")) {
+	if a.start(newTestModule("again")) == nil {
 		t.Fatal("start twice should fail")
 	}
 
@@ -98,7 +98,7 @@ func TestOnDestroyCanCastToModuleShuttingDownLater(t *testing.T) {
 		source.Cast("sink", skeletonRPCReq{Value: "final flush"})
 	}
 
-	if !defaultApp.start(sink, source) {
+	if defaultApp.start(sink, source) != nil {
 		t.Fatal("start should succeed")
 	}
 	defaultApp.stop()

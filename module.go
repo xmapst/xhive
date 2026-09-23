@@ -85,7 +85,7 @@ const (
 	// 注意：**已停止的应用不支持再次启动。** stop 不重建 modules 里的 wrapper，
 	// 它们的 ctx 已被 cancel、模块自身的一次性资源（如 Skeleton.ready 这个只
 	// make 一次的 channel）也已消耗。start 会检查模块的生命周期状态并明确拒绝
-	// 重启，返回 false 而不是产出一个 Serve 立即退出的僵尸应用。
+	// 重启，返回 error 而不是产出一个 Serve 立即退出的僵尸应用。
 	// 需要"重启"时请新建模块实例与新的 app。
 	AppStateNone = iota
 	// AppStateInit 表示应用正在初始化，所有模块的 OnInit 正在按序执行。
@@ -506,16 +506,20 @@ func (a *app) Register(mods ...IModule) error {
 // SIGKILL 仅作为框架保留信号禁止业务注册，操作系统不会把它投递给进程处理。
 // 业务层可在 Run 调用前通过 RegisterSignal 覆盖默认处理器，或注册额外信号（如 SIGUSR1）。
 //
-// 同一个 app 上不允许并发或重入调用 Run。start 有多种返回 false 的原因，其中
+// 同一个 app 上不允许并发或重入调用 Run。start 有多种返回 error 的原因，其中
 // "应用已经启动"是一种**不该触发关闭**的失败：它什么都没改，只是拒绝了这次启动。
 // 但下面的 select 看到 errCh 就会无条件调 stopFn，把那个健康运行中的应用连同
 // 全部模块一起销毁掉；更糟的是关闭由第二个 Run 的 stopFn 完成，第一个 Run 的
 // stopped 永远不会被 close，它的 select 永久阻塞（通常就是 main goroutine）。
 // 因此这里直接拒绝第二次 Run，而不是让它走进那条会误伤的失败分支。
-func (a *app) Run(mods ...IModule) {
+//
+// 返回值：启动失败时返回 start 给出的失败原因（模块 OnInit 的 error 经 %w 包装，
+// 可用 errors.Is/As 解包），此时已启动的模块已被完整关闭；重入调用被拒绝时返回
+// 对应错误且不做任何改动；正常收到停机信号并完成优雅关闭时返回 nil。
+func (a *app) Run(mods ...IModule) error {
 	if !a.runInFlight.CompareAndSwap(false, true) {
 		slog.Error("application is already running, Run must not be called concurrently or reentrantly")
-		return
+		return fmt.Errorf("application is already running, Run must not be called concurrently or reentrantly")
 	}
 	defer a.runInFlight.Store(false)
 
@@ -527,21 +531,23 @@ func (a *app) Run(mods ...IModule) {
 
 	a.sm.Start(stopFn)
 
-	var errCh = make(chan bool, 1)
+	var errCh = make(chan error, 1)
 	go func() {
-		if !a.start(mods...) {
-			errCh <- true
+		if err := a.start(mods...); err != nil {
+			errCh <- err
 		}
 	}()
 
+	var err error
 	select {
-	case <-errCh:
-		slog.Error("app start failed")
+	case err = <-errCh:
+		slog.Error("app start failed", slog.Any("error", err))
 		stopFn()
 	case <-stopped:
 	}
 
 	a.sm.Stop()
+	return err
 }
 
 // start 按顺序初始化并启动所有已注册的模块。
@@ -549,12 +555,12 @@ func (a *app) Run(mods ...IModule) {
 // 执行流程：
 //  1. 状态检查 + 将 Run 参数中的模块追加到 modules 列表，两步在同一把写锁内完成，
 //     防止并发调用 Register/start 时出现 TOCTOU 竞态（支持 Register + Run 两种注册方式）
-//  2. 依次调用 OnInit，任一失败则中止启动并返回 false
+//  2. 依次调用 OnInit，任一失败则中止启动并返回描述失败原因的 error
 //  3. 为每个模块启动独立 goroutine 并运行 Serve
 //
 // 顶层 panic recover：捕获启动过程中的意外 panic，记录完整堆栈后以退出码 255 终止进程，
 // 防止进程在不确定状态下继续运行造成数据损坏。
-func (a *app) start(mods ...IModule) bool {
+func (a *app) start(mods ...IModule) error {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("application panic recovered", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
@@ -567,7 +573,7 @@ func (a *app) start(mods ...IModule) bool {
 	if currentState != AppStateNone {
 		a.Unlock()
 		slog.Error("application cannot start twice", slog.Int64("current_state", int64(currentState)))
-		return false
+		return fmt.Errorf("application cannot start twice, current state: %d", currentState)
 	}
 
 	for _, mod := range mods {
@@ -580,7 +586,7 @@ func (a *app) start(mods ...IModule) bool {
 	if moduleCount == 0 {
 		a.Unlock()
 		slog.Warn("no modules provided to start")
-		return false
+		return fmt.Errorf("no modules provided to start")
 	}
 
 	// 拒绝重启：stop 把应用状态复位为 AppStateNone，但它并不重建 modules 里的
@@ -594,7 +600,7 @@ func (a *app) start(mods ...IModule) bool {
 			a.Unlock()
 			slog.Error("application cannot restart, module already consumed its lifecycle",
 				slog.String("module", wrapper.Name()), slog.String("module_state", state.String()))
-			return false
+			return fmt.Errorf("application cannot restart, module %s already consumed its lifecycle (state: %s)", wrapper.Name(), state)
 		}
 	}
 
@@ -649,19 +655,19 @@ func (a *app) start(mods ...IModule) bool {
 	for _, wrapper := range staticModules {
 		if a.stopRequested.Load() {
 			slog.Warn("application start aborted by shutdown request", slog.String("module", wrapper.Name()))
-			return false
+			return fmt.Errorf("application start aborted by shutdown request before initializing module %s", wrapper.Name())
 		}
 		if !wrapper.advanceLifecycle(lifecycleRegistered, lifecycleIniting) {
 			slog.Warn("module already claimed by shutdown, start aborted",
 				slog.String("module", wrapper.Name()), slog.String("module_state", wrapper.lifecycleState().String()))
-			return false
+			return fmt.Errorf("application start aborted, module %s already claimed by shutdown", wrapper.Name())
 		}
 		if err := wrapper.OnInit(); err != nil {
 			// 推进失败说明 stop 已在 OnInit 期间接管了这个模块，它自己会收尾，
 			// 这里不再改状态；无论哪种情况启动都到此为止。
 			wrapper.advanceLifecycle(lifecycleIniting, lifecycleInitFailed)
 			slog.Error("module initialization failed", slog.String("module", wrapper.Name()), slog.Any("error", err))
-			return false
+			return fmt.Errorf("module %s initialization failed: %w", wrapper.Name(), err)
 		}
 		if !wrapper.advanceLifecycle(lifecycleIniting, lifecycleInited) {
 			// stop 在 OnInit 执行期间抢走了销毁权（它会跳过销毁以避开与 OnInit
@@ -669,7 +675,7 @@ func (a *app) start(mods ...IModule) bool {
 			// 它是"启动期收到停止信号"这条罕见路径上唯一的资源泄漏出口。
 			slog.Error("module claimed by shutdown while initializing, resources may leak",
 				slog.String("module", wrapper.Name()))
-			return false
+			return fmt.Errorf("module %s claimed by shutdown while initializing", wrapper.Name())
 		}
 	}
 
@@ -680,7 +686,7 @@ func (a *app) start(mods ...IModule) bool {
 	// 拉起 Serve，并用 lifecycleServing 覆盖掉它们的 lifecycleDestroyed。
 	if a.stopRequested.Load() {
 		slog.Warn("application start aborted by shutdown request before serving")
-		return false
+		return fmt.Errorf("application start aborted by shutdown request before serving")
 	}
 
 	// 所有模块初始化完成后，并发启动各自的 goroutine
@@ -688,7 +694,7 @@ func (a *app) start(mods ...IModule) bool {
 		if !a.startServing(wrapper, false) {
 			slog.Warn("application start aborted, module already claimed by shutdown",
 				slog.String("module", wrapper.Name()))
-			return false
+			return fmt.Errorf("application start aborted, module %s already claimed by shutdown", wrapper.Name())
 		}
 	}
 
@@ -699,7 +705,7 @@ func (a *app) start(mods ...IModule) bool {
 	for _, wrapper := range staticModules {
 		if !wrapper.waitReady() {
 			slog.Error("module serve exited before becoming ready", slog.String("module", wrapper.Name()))
-			return false
+			return fmt.Errorf("module %s serve exited before becoming ready", wrapper.Name())
 		}
 	}
 
@@ -709,12 +715,12 @@ func (a *app) start(mods ...IModule) bool {
 	if a.stopRequested.Load() || a.state.Load() != AppStateInit {
 		a.Unlock()
 		slog.Warn("application start aborted by shutdown request")
-		return false
+		return fmt.Errorf("application start aborted by shutdown request")
 	}
 	a.setState(AppStateRun)
 	a.Unlock()
 	slog.Info("application started successfully")
-	return true
+	return nil
 }
 
 // startServing 把模块推进到 lifecycleServing 并拉起它的事件循环 goroutine。

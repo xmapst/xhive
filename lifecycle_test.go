@@ -29,7 +29,7 @@ func TestStartFailureDestroysOnlyInitializedModules(t *testing.T) {
 		m.priority = uint(i)
 	}
 
-	if a.start(ok1, ok2, bad, never1, never2) {
+	if a.start(ok1, ok2, bad, never1, never2) == nil {
 		t.Fatal("start should fail")
 	}
 	// Run 在 start 返回 false 后调用 stop，这里直接复现该路径。
@@ -76,7 +76,7 @@ func TestStartFailureClosesServersOfNeverServedModules(t *testing.T) {
 		m.keepServerOpen = true
 	}
 
-	if a.start(sink, bad, never) {
+	if a.start(sink, bad, never) == nil {
 		t.Fatal("start should fail")
 	}
 	a.stop()
@@ -111,7 +111,7 @@ func TestShutdownContinuesAfterClosePanic(t *testing.T) {
 	second.priority = 1
 	second.closeHook = func() { panic("close panic") }
 
-	if !a.start(first, second) {
+	if a.start(first, second) != nil {
 		t.Fatal("start should succeed")
 	}
 	waitClosed(t, first.runStarted, time.Second)
@@ -133,7 +133,7 @@ func TestShutdownContinuesAfterClosePanic(t *testing.T) {
 // 会与事件循环并发读写同一批业务内存（Go 运行时 fatal，recover 拦不住）。
 func TestRemoveDynamicModuleWaitsForServeExitBeforeDestroy(t *testing.T) {
 	a := newApp()
-	if !a.start(newTestModule("anchor")) {
+	if a.start(newTestModule("anchor")) != nil {
 		t.Fatal("start should succeed")
 	}
 	defer a.stop()
@@ -263,7 +263,7 @@ func TestAddDynamicModulesRejectsDuplicateName(t *testing.T) {
 // 此刻 removeAllDynamicModules 已经跑过，登记进来的模块再也不会被关闭。
 func TestAddDynamicModulesRejectedAfterStop(t *testing.T) {
 	a := newApp()
-	if !a.start(newTestModule("anchor2")) {
+	if a.start(newTestModule("anchor2")) != nil {
 		t.Fatal("start should succeed")
 	}
 	a.stop()
@@ -312,14 +312,14 @@ func TestAddDynamicModulesDoesNotHangWhenServeExitsBeforeReady(t *testing.T) {
 func TestRestartAfterStopIsRefused(t *testing.T) {
 	a := newApp()
 	m := newTestModule("restart")
-	if !a.start(m) {
+	if a.start(m) != nil {
 		t.Fatal("first start should succeed")
 	}
 	a.stop()
 	if a.State() != AppStateNone {
 		t.Fatalf("state = %d, want AppStateNone", a.State())
 	}
-	if a.start() {
+	if a.start() == nil {
 		t.Fatal("restart must be refused")
 	}
 	if a.State() != AppStateNone {

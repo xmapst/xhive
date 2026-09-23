@@ -137,13 +137,15 @@ func TestRunRejectsReentrantCall(t *testing.T) {
 
 	// 第二次 Run：必须立刻被拒绝，而不是走进那条会误伤的失败分支。
 	intruder := newSSModule("run-intruder")
-	secondDone := make(chan struct{})
+	secondDone := make(chan error, 1)
 	go func() {
-		defer close(secondDone)
-		a.Run(intruder)
+		secondDone <- a.Run(intruder)
 	}()
 	select {
-	case <-secondDone:
+	case err := <-secondDone:
+		if err == nil {
+			t.Fatal("reentrant Run returned nil, want an error")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("reentrant Run did not return immediately")
 	}
@@ -225,7 +227,7 @@ func TestStopDuringInitUsesStartupSettleTimeout(t *testing.T) {
 		<-release
 	}
 
-	startDone := make(chan bool, 1)
+	startDone := make(chan error, 1)
 	go func() { startDone <- a.start(slow) }()
 	waitClosed(t, inInit, 5*time.Second)
 
@@ -263,8 +265,8 @@ func TestStopDuringInitUsesStartupSettleTimeout(t *testing.T) {
 	// 放行 OnInit：start 必须察觉关闭已经发生并报告失败，而不是继续拉起事件循环。
 	releaseInit()
 	select {
-	case ok := <-startDone:
-		if ok {
+	case err := <-startDone:
+		if err == nil {
 			t.Fatal("start reported success after the application had already been shut down")
 		}
 	case <-time.After(5 * time.Second):
@@ -323,7 +325,7 @@ func TestStopBeforeStartDoesNotStrandModules(t *testing.T) {
 		<-release
 	}
 
-	startDone := make(chan bool, 1)
+	startDone := make(chan error, 1)
 	go func() { startDone <- a.start(late) }()
 	waitClosed(t, inInit, 5*time.Second)
 
@@ -336,8 +338,8 @@ func TestStopBeforeStartDoesNotStrandModules(t *testing.T) {
 	// 现在才放行 OnInit，让 start 在"关闭已完成"之后继续往下跑。
 	releaseInit()
 	select {
-	case ok := <-startDone:
-		if ok {
+	case err := <-startDone:
+		if err == nil {
 			t.Fatal("start reported success after shutdown completed, leaving a zombie application")
 		}
 	case <-time.After(5 * time.Second):
@@ -369,7 +371,7 @@ func TestConcurrentStopIsIdempotent(t *testing.T) {
 	second := newSSModule("concurrent-second")
 	second.priority = 1
 
-	if !a.start(first, second) {
+	if a.start(first, second) != nil {
 		t.Fatal("start should succeed")
 	}
 	waitClosed(t, first.ready, 5*time.Second)

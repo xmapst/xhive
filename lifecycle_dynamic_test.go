@@ -345,7 +345,7 @@ func TestDynamicAndStaticShutdownOrder(t *testing.T) {
 		m.onEvent = record
 	}
 
-	if !a.start(staticLow, staticHigh) {
+	if a.start(staticLow, staticHigh) != nil {
 		t.Fatal("start should succeed")
 	}
 	if _, err := a.AddDynamicModules(highDyn); err != nil {

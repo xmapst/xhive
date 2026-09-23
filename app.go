@@ -26,8 +26,11 @@ func Register(mods ...IModule) error {
 // 适合在 main 函数中直接调用，是应用的主入口点。
 // SIGHUP 信号不会触发关闭，可用于通知应用重新加载配置（业务层自行监听处理）。
 // SIGKILL 不可被进程捕获，仅作为框架保留信号禁止业务注册。
-func Run(mods ...IModule) {
-	defaultApp.Run(mods...)
+//
+// 启动失败（如某个模块 OnInit 返回错误）或重复调用时返回非 nil error，
+// 正常收到退出信号并完成优雅关闭时返回 nil。
+func Run(mods ...IModule) error {
+	return defaultApp.Run(mods...)
 }
 
 // State 获取全局默认应用实例的当前运行状态。

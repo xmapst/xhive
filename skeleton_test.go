@@ -61,7 +61,7 @@ func TestSkeletonRegisterChanRPCAndRPCWrappers(t *testing.T) {
 			return &chanrpc.RetInfo{Ack: skeletonRPCAck{Value: req.Value + "-ack"}}
 		})
 	}
-	if !defaultApp.start(server) {
+	if defaultApp.start(server) != nil {
 		t.Fatal("default app start should succeed")
 	}
 

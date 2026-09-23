@@ -116,7 +116,7 @@ func TestAppRegisterStartStopStatsAndChanRPC(t *testing.T) {
 	if err := a.Register(m1); err != nil {
 		t.Fatalf("Register failed: %v", err)
 	}
-	if !a.start(m2) {
+	if a.start(m2) != nil {
 		t.Fatal("start should succeed")
 	}
 	waitClosed(t, m1.runStarted, time.Second)
@@ -148,7 +148,7 @@ func TestAppRegisterStartStopStatsAndChanRPC(t *testing.T) {
 
 func TestAppStartValidationAndInitFailure(t *testing.T) {
 	a := newApp()
-	if a.start() {
+	if a.start() == nil {
 		t.Fatal("start without modules should fail")
 	}
 	if a.State() != AppStateNone {
@@ -157,7 +157,7 @@ func TestAppStartValidationAndInitFailure(t *testing.T) {
 
 	bad := newTestModule("bad")
 	bad.initErr = errors.New("init failed")
-	if a.start(bad) {
+	if a.start(bad) == nil {
 		t.Fatal("start with init error should fail")
 	}
 	if bad.runCount.Load() != 0 {

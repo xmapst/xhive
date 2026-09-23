@@ -286,7 +286,7 @@ func TestAddDynamicModulesRolledBackWhenShutdownStartsDuringInit(t *testing.T) {
 
 	// 需要一个静态模块把应用推进到 AppStateRun，stop 才会真正走关闭流程。
 	anchor := newHDModule("hd-anchor")
-	if !a.start(anchor) {
+	if a.start(anchor) != nil {
 		t.Fatal("start should succeed")
 	}
 	hdWaitClosed(t, anchor.ready, "anchor Serve to start")

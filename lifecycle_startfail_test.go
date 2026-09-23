@@ -124,13 +124,15 @@ func TestRunStopsAfterInitFailure(t *testing.T) {
 	// Run 会注册 SIGINT/SIGTERM 处理器并阻塞，这里放到独立 goroutine 上跑，
 	// 既能验证"它自己会返回"，又不会在回归时把整个测试进程拖死。
 	// Run 返回前会调用 sm.Stop() 注销信号监听，测试结束后不留全局副作用。
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		a.Run(ok, bad, never)
-		close(done)
+		done <- a.Run(ok, bad, never)
 	}()
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, bad.initErr) {
+			t.Fatalf("Run 返回 %v，want 包装了 run-bad 的 OnInit 错误", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run 在 start 失败后没有自行返回（生产上就是 main goroutine 永久挂死）")
 	}
@@ -220,7 +222,7 @@ func TestStartFailureAbandonsBacklogWithoutRunningHandlers(t *testing.T) {
 	bad := newSkeletonTestModule("startfail-bad")
 	bad.onInit = func(*skeletonTestModule) error { return errors.New("boom") }
 
-	if defaultApp.start(peer, sink, source, bad) {
+	if defaultApp.start(peer, sink, source, bad) == nil {
 		t.Fatal("start 应当因为 bad 的 OnInit 失败而返回 false")
 	}
 
@@ -285,7 +287,7 @@ func TestStartFailureAbortsBeforeServing(t *testing.T) {
 		<-release
 	}
 
-	startResult := make(chan bool, 1)
+	startResult := make(chan error, 1)
 	go func() { startResult <- a.start(early, blocker) }()
 
 	// 等到 blocker 真正进入 OnInit：此刻 early 已 inited、blocker 停在 initing，
@@ -316,8 +318,8 @@ func TestStartFailureAbortsBeforeServing(t *testing.T) {
 	// 放行 OnInit，让 start 继续往下——它必须在拉起 Serve 之前中止。
 	close(release)
 	select {
-	case ok := <-startResult:
-		if ok {
+	case err := <-startResult:
+		if err == nil {
 			t.Fatal("start 应当在关闭完成后返回 false，而不是报告启动成功")
 		}
 	case <-time.After(10 * time.Second):
@@ -377,7 +379,7 @@ func TestAppStartInitFailureLeavesNoDestroyOnUninitialized(t *testing.T) {
 	a := newApp()
 
 	// 空启动：拒绝启动且不得改变状态（也不能留下 AppStateInit 这种中间态）。
-	if a.start() {
+	if a.start() == nil {
 		t.Fatal("没有任何模块时 start 应当失败")
 	}
 	if a.State() != AppStateNone {
@@ -394,7 +396,7 @@ func TestAppStartInitFailureLeavesNoDestroyOnUninitialized(t *testing.T) {
 	later := newStartFailModule("solo-later")
 	later.priority = 1 // 排在 bad 之后，OnInit 不该被调用
 
-	if a.start(bad, later) {
+	if a.start(bad, later) == nil {
 		t.Fatal("OnInit 失败时 start 应当失败")
 	}
 	if bad.initCount.Load() != 1 {

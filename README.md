@@ -74,6 +74,7 @@ package main
 import (
 	"errors"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/xmapst/xhive"
@@ -135,7 +136,10 @@ func (m *Pinger) OnInit() error {
 func (m *Pinger) OnDestroy() {}
 
 func main() {
-	xhive.Run(NewPonger(), NewPinger())
+	if err := xhive.Run(NewPonger(), NewPinger()); err != nil {
+		slog.Error("app exited with error", slog.Any("error", err))
+		os.Exit(1)
+	}
 }
 ```
 
@@ -467,7 +471,7 @@ _ = removed
 | API | 说明 |
 | --- | --- |
 | `Register(mods ...IModule) error` | 启动前注册静态模块。 |
-| `Run(mods ...IModule)` | 注册并启动应用，阻塞至收到退出信号并完成关闭。 |
+| `Run(mods ...IModule) error` | 注册并启动应用，阻塞至收到退出信号并完成关闭；启动失败或重复调用时返回 error。 |
 | `State() int32` | 返回当前应用状态。 |
 | `Stats() string` | 返回所有模块 RPC 队列积压统计。 |
 | `ChanRPC(name string) *chanrpc.Server` | 按模块名获取 ChanRPC 服务端。 |
