@@ -2,7 +2,7 @@
 
 > 基于 Actor 模型的轻量级 Go 应用框架，适用于游戏服务器、实时服务和事件驱动后台系统。
 
-[![Go Version](https://img.shields.io/badge/Go-1.26.3+-00ADD8?logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.27.1+-00ADD8?logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `xhive` 将一个进程拆分为多个模块。每个模块拥有独立 goroutine，并通过同一个事件循环串行处理 RPC 请求、异步 RPC 回调和定时器事件。模块之间只通过消息通信，模块内部状态天然隔离，通常无需为业务状态加锁。
@@ -25,7 +25,7 @@
   - [TPStats](#tpstats)
 - [应用生命周期](#应用生命周期)
 - [动态模块](#动态模块)
-- [包级 API](#包级-api)
+- [应用 API](#应用-api)
 - [目录结构](#目录结构)
 - [测试](#测试)
 - [常见问题](#常见问题)
@@ -35,18 +35,18 @@
 
 ## 核心特性
 
-| 特性 | 说明 |
-| --- | --- |
-| Actor 模型 | 每个模块单 goroutine 串行处理事件，降低锁竞争和数据竞争风险。 |
-| 模块化生命周期 | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序），并严格逆序关闭；动态模块支持运行时加载和卸载。 |
-| ChanRPC | 进程内 RPC，支持 Cast、AsyncCall、Call、CallWithContext 四种调用语义。 |
-| 本地异步任务 | `AsyncGo` 把一段耗时/阻塞的本地操作挪到独立 goroutine 执行，回调安全带回事件循环；`NewLinearContext` 提供顺序保证的变体。 |
-| 伸缩式有界队列 | RPC、异步返回、定时器事件和本地异步任务回调都走同一套队列：容量按积压动态增长、随空闲收缩，同时保留硬性上限。过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM；空闲时也不会为一个用不上的上限预留内存。 |
-| 多级时间轮定时器 | 最小粒度 64ms，支持 Timer、Ticker、加速、延迟、改期和取消。 |
-| 时间跳变保护 | 系统时间回退时内部 tick 基准跟随回退，避免定时器停摆（重扫幂等，不会重复触发）；系统时间跳到未来时逐 tick 推进到当前时间，不跳过中间层级的降级。 |
-| 信号管理 | 默认处理 SIGINT/SIGTERM 优雅关闭；业务可注册 SIGHUP 等非保留信号。 |
-| 耗时统计 | Skeleton 自动记录 RPC、异步回调和定时器处理耗时，每 15 分钟（附 30s~60s 随机抖动错峰）dump 一次 TP 分位，模块关闭时再 dump 最后一次。 |
-| 零外部依赖 | 仅依赖 Go 标准库。 |
+| 特性             | 说明                                                                                                                                                                                                                            |
+|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Actor 模型       | 每个模块单 goroutine 串行处理事件，降低锁竞争和数据竞争风险。                                                                                                                                                                   |
+| 模块化生命周期   | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序），并严格逆序关闭；动态模块支持运行时加载和卸载。                                                                                                                        |
+| ChanRPC          | 进程内 RPC，支持 Cast、AsyncCall、Call、CallWithContext 四种调用语义。                                                                                                                                                          |
+| 本地异步任务     | `AsyncGo` 把一段耗时/阻塞的本地操作挪到独立 goroutine 执行，回调安全带回事件循环；`NewLinearContext` 提供顺序保证的变体。                                                                                                       |
+| 伸缩式有界队列   | RPC、异步返回、定时器事件和本地异步任务回调都走同一套队列：容量按积压动态增长、随空闲收缩，同时保留硬性上限。过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM；空闲时也不会为一个用不上的上限预留内存。 |
+| 多级时间轮定时器 | 最小粒度 64ms，支持 Timer、Ticker、加速、延迟、改期和取消。                                                                                                                                                                     |
+| 时间跳变保护     | 系统时间回退时内部 tick 基准跟随回退，避免定时器停摆（重扫幂等，不会重复触发）；系统时间跳到未来时逐 tick 推进到当前时间，不跳过中间层级的降级。                                                                                |
+| 信号管理         | 默认处理 SIGINT/SIGTERM 优雅关闭；业务可注册 SIGHUP 等非保留信号。                                                                                                                                                              |
+| 耗时统计         | Skeleton 自动记录 RPC、异步回调和定时器处理耗时，每 15 分钟（附 30s~60s 随机抖动错峰）dump 一次 TP 分位，模块关闭时再 dump 最后一次。                                                                                           |
+| 零外部依赖       | 仅依赖 Go 标准库。                                                                                                                                                                                                              |
 
 ---
 
@@ -59,8 +59,13 @@ go get github.com/xmapst/xhive
 ```
 
 ```go
-import "github.com/xmapst/xhive"
+import (
+	"github.com/xmapst/xhive"
+	"github.com/xmapst/xhive/app"
+)
 ```
+
+根包 `xhive` 提供 `Skeleton`、`LinearContext` 和 `SafeGo` 等模块工具；`app` 包负责应用入口、模块生命周期和动态模块管理，模块接口为 `app.IModule`。`chanrpc`、`timer`、`signal` 和 `stat` 分别提供 RPC、定时器、信号管理和耗时统计组件。
 
 ---
 
@@ -78,6 +83,7 @@ import (
 	"time"
 
 	"github.com/xmapst/xhive"
+	"github.com/xmapst/xhive/app"
 	"github.com/xmapst/xhive/chanrpc"
 	"github.com/xmapst/xhive/timer"
 )
@@ -117,7 +123,7 @@ func (m *Pinger) OnInit() error {
 	m.RegisterTimer("tick", func(_ int64, _ map[string]string) {
 		m.seq++
 		seq := m.seq
-		_ = m.AsyncCall("ponger", &PingReq{Seq: seq}, func(ri *chanrpc.RetInfo) {
+		_ = m.AsyncCall(app.ChanRPC("ponger"), &PingReq{Seq: seq}, func(ri *chanrpc.RetInfo) {
 			if ri.Err != nil {
 				slog.Error("ping failed", slog.Any("error", ri.Err))
 				return
@@ -136,7 +142,7 @@ func (m *Pinger) OnInit() error {
 func (m *Pinger) OnDestroy() {}
 
 func main() {
-	if err := xhive.Run(NewPonger(), NewPinger()); err != nil {
+	if err := app.Run(NewPonger(), NewPinger()); err != nil {
 		slog.Error("app exited with error", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -165,7 +171,7 @@ func main() {
 
 ### 模块
 
-业务模块实现以下生命周期接口：
+业务模块实现 `app` 包中的 `app.IModule` 生命周期接口：
 
 ```go
 type IModule interface {
@@ -186,8 +192,8 @@ type IModule interface {
 
 1. 静态模块按 `Priority()` 升序执行 `OnInit`，同优先级时保留注册顺序（稳定排序）。
 2. 任一静态模块 `OnInit` 失败，应用启动失败。框架随后只对**已成功 `OnInit`** 的模块执行 `OnDestroy` → `Close`：`OnInit` 返回了 error 的模块（它必须在返回前自行回滚已分配的资源）、以及排在它之后一次都没被 `OnInit` 过的模块，都不会收到 `OnDestroy`/`Close`。
-3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`；进入事件循环后 `Ready()` 返回的 channel 会被关闭。框架只在两处等待该信号：`start` 等全部静态模块 `Ready` 后才把状态置为 `AppStateRun`，`AddDynamicModules` 等模块 `Ready` 后才把它放进动态模块表（在此之前 `ChanRPC(name)` 查不到它）。静态模块的 goroutine 是并发启动的，框架不会阻止已就绪模块向尚未就绪的模块发起调用；`Priority` 只决定 `OnInit` 的先后，不保证 `Serve` 就绪的先后。
-4. `OnDestroy` 用于释放业务资源。**静态模块与动态模块走同一条关闭路径**：`cancel` → 等待 `Serve` 退出（受关闭超时保护）→ `OnDestroy` → `Close`。此时事件循环已停，不能再对本模块自投递（见 `IModule.OnDestroy` 的说明），`Close` 释放出站 client 资源。动态模块由 `RemoveDynamicModule` 先把自己从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走上述同一流程。
+3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`；进入事件循环前关闭 `Ready()` 返回的 channel。框架只在两处等待该信号：`start` 等全部静态模块 `Ready` 后才把状态置为 `AppStateRun`，`AddDynamicModules` 等模块 `Ready` 后才将模块表中的占位条目标记为可见（在此之前 `ChanRPC(name)` 查不到它）。静态模块的 goroutine 是并发启动的，框架不会阻止已就绪模块向尚未就绪的模块发起调用；`Priority` 只决定 `OnInit` 的先后，不保证 `Serve` 就绪的先后。
+4. `OnDestroy` 用于释放业务资源。**静态模块与动态模块走同一条关闭路径**：`cancel` → 等待 `Serve` 退出（受关闭超时保护）→ `OnDestroy` → `Close`。此时事件循环已停，不能再对本模块自投递（见 `app.IModule.OnDestroy` 的说明），`Close` 释放出站 client 资源。动态模块由 `RemoveDynamicModule` 先把自己从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走上述同一流程。
 5. 逃出 `Serve` 主循环的 panic：静态模块记录堆栈后以退出码 `255` 终止进程，动态模块只记录日志；`start`（含静态模块 `OnInit`）期间的 panic 同样以 `255` 退出。`OnDestroy` 与 `Close` 期间的 panic 都由框架统一 recover，静态、动态模块都只记日志并继续后续关闭流程。
 
 ### Skeleton
@@ -213,51 +219,53 @@ type IModule interface {
 
 常用方法：
 
-| 分类 | 方法 |
-| --- | --- |
-| RPC 注册 | `RegisterChanRPC(msg, handler)` |
-| RPC 调用 | `Cast(mod, req)`、`AsyncCall(mod, req, cb)`、`Call(mod, req)`、`CallWithContext(ctx, mod, req)` |
-| 本地异步任务 | `AsyncGo(name, f, cb)`、`NewLinearContext()`（详见[本地异步任务](#本地异步任务)） |
-| 定时器 | `RegisterTimer`、`NewTimer`、`AccAbsTimer`、`AccPctTimer`、`DelayAbsTimer`、`DelayPctTimer`、`UpdateTimer`、`CancelTimer` |
-| 统计 | `DumpStat(n)` |
-| 模块接口默认实现 | `Name()`、`Priority()`、`Serve()`、`Ready()`、`ChanRPC()`、`Close()`；`Priority()` 返回 0，需要调整启动顺序时重写。 |
+| 分类             | 方法                                                                                                                          |
+|------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| RPC 注册         | `RegisterChanRPC(msg, handler)`                                                                                               |
+| RPC 调用         | `Cast(svr, req)`、`AsyncCall(svr, req, cb)`、`Call(svr, req)`、`CallWithContext(ctx, svr, req)`；`svr` 为 `*chanrpc.Server`。 |
+| 本地异步任务     | `AsyncGo(name, f, cb)`、`NewLinearContext()`（详见[本地异步任务](#本地异步任务)）                                             |
+| 定时器           | `RegisterTimer`、`NewTimer`、`AccAbsTimer`、`AccPctTimer`、`DelayAbsTimer`、`DelayPctTimer`、`UpdateTimer`、`CancelTimer`     |
+| 统计             | `DumpStat(n)`                                                                                                                 |
+| 模块接口默认实现 | `Name()`、`Priority()`、`Serve()`、`Ready()`、`ChanRPC()`、`Close()`；`Priority()` 返回 0，需要调整启动顺序时重写。           |
+
+RPC 方法直接接收目标服务端，由调用方完成模块寻址。使用默认应用时，可通过 `app.ChanRPC("ponger")` 查找；使用 `app.New()` 创建的应用时，应调用该实例的 `ChanRPC` 方法。也可以直接传入目标模块的 `ChanRPC()` 返回值。
 
 `NewSkeleton` 选项：
 
-| 选项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `WithTimerChanLen(n)` | 1024 | 定时器操作队列与到期队列的容量上限。 |
-| `WithServerChanLen(n)` | 4096 | ChanRPC 服务端队列容量上限。 |
-| `WithClientChanLen(n)` | 4096 | ChanRPC 客户端异步返回队列容量上限。 |
-| `WithAsyncChanLen(n)` | 1024 | 本地异步任务回调队列容量上限，同时也是同时允许存在的未完成任务数上限。 |
-| `WithStatCap(n)` | 8192 | 每类消息用于分位统计的最大采样数。 |
-| `WithCloseDrainTimeout(d)` | 30s | 停机时 ChanRPC 服务端排空自投递链条的超时上限，超时后放弃剩余部分直接完成关闭。 |
-| `WithClientCloseTimeout(d)` | 5s | 停机时 ChanRPC 客户端等待未处理异步回调排空的超时上限，超时后放弃剩余回调。 |
-| `WithAsyncCloseTimeout(d)` | 5s | 停机时等待未执行的本地异步任务回调排空的超时上限，超时后放弃剩余回调。 |
+| 选项                        | 默认值 | 说明                                                                            |
+|-----------------------------|--------|---------------------------------------------------------------------------------|
+| `WithTimerChanLen(n)`       | 1024   | 定时器操作队列与到期队列的容量上限。                                            |
+| `WithServerChanLen(n)`      | 4096   | ChanRPC 服务端队列容量上限。                                                    |
+| `WithClientChanLen(n)`      | 4096   | ChanRPC 客户端异步返回队列容量上限。                                            |
+| `WithAsyncChanLen(n)`       | 1024   | 本地异步任务回调队列容量上限，同时也是同时允许存在的未完成任务数上限。          |
+| `WithStatCap(n)`            | 8192   | 每类消息用于分位统计的最大采样数。                                              |
+| `WithCloseDrainTimeout(d)`  | 30s    | 停机时 ChanRPC 服务端排空自投递链条的超时上限，超时后放弃剩余部分直接完成关闭。 |
+| `WithClientCloseTimeout(d)` | 5s     | 停机时 ChanRPC 客户端等待未处理异步回调排空的超时上限，超时后放弃剩余回调。     |
+| `WithAsyncCloseTimeout(d)`  | 5s     | 停机时等待未执行的本地异步任务回调排空的超时上限，超时后放弃剩余回调。          |
 
 前四项都是**硬性上限**，但**只封顶、不预留**：队列实际占用的内存随积压增长、随空闲收缩，调大上限不会让空闲模块多占一个字节。队列打满时的行为：
 
-| 队列 | 打满时 |
-| --- | --- |
-| 服务端调用队列 | `Cast` / `AsyncCall` 立即失败返回 `ErrChanFull`；`Call` / `CallWithContext` 阻塞等待空位（每 5s 打一条 warn，可由 `ctx` 取消）。 |
-| 客户端异步返回队列 | 服务端回包被丢弃并打 error 日志，对应回调不会执行，`pendingAsyncCall` 同步回滚。 |
-| 定时器到期队列 | 到期定时器留在时间轮第 0 层，后续 tick 持续重试投递，**不丢定时器**，只是通知延迟。 |
+| 队列                 | 打满时                                                                                                                                                                                                                |
+|----------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 服务端调用队列       | `Cast` 立即记录 warn 并丢弃，`AsyncCall` 立即返回 `ErrChanFull`；`Call` / `CallWithContext` 阻塞等待空位（每 5s 打一条 warn，`CallWithContext` 可由 `ctx` 取消）。                                                    |
+| 客户端异步返回队列   | 服务端回包被丢弃并打 error 日志，对应回调不会执行，`pendingAsyncCall` 同步回滚。                                                                                                                                      |
+| 定时器到期队列       | 到期定时器留在时间轮第 0 层，后续 tick 持续重试投递，**不丢定时器**，只是通知延迟。                                                                                                                                   |
 | 本地异步任务回调队列 | 不会真正打满：队列容量与同时允许存在的未完成任务数上限被强制绑成同一个值，背压发生在更早的提交阶段——`AsyncGo`/`LinearContext.Go` 在途任务数已达上限时直接拒绝新任务并打 error 日志，见[本地异步任务](#本地异步任务)。 |
 
 `WithStatCap(n)` 同样是硬上限，单个 key 采样数达到 n 后新样本不再计入分位统计。
 
-配合 `ChanRPC(name).Len()` 与 `Cap()` 做水位告警，在真正打满之前就能发现问题。`Cap()` 返回的是配置的硬上限而非当前分配量——水位关心的是「离拒绝还有多远」。
+配合 `app.ChanRPC(name).Len()` 与 `Cap()` 做水位告警，在真正打满之前就能发现问题。`Cap()` 返回的是配置的硬上限而非当前分配量——水位关心的是「离拒绝还有多远」。
 
 ### ChanRPC
 
 `chanrpc` 是进程内 RPC 组件。
 
-| 方法 | 等待结果 | 说明 |
-| --- | --- | --- |
-| `Cast` | 否 | 单向投递，适合通知、日志和埋点。目标不存在（`ErrServerNil`）时静默丢弃，其余失败会打 warn 日志后丢弃。 |
-| `AsyncCall` | 否，结果走回调 | 推荐方式。回调在发起方模块事件循环中执行。 |
-| `Call` | 是 | 同步阻塞调用。调用链成环会死锁，应谨慎使用。 |
-| `CallWithContext` | 是 | 同 `Call`，但可通过 `ctx` 主动超时或取消等待，取消时返回携带 `ctx.Err()` 的 `RetInfo`。 |
+| 方法              | 等待结果       | 说明                                                                                                   |
+|-------------------|----------------|--------------------------------------------------------------------------------------------------------|
+| `Cast`            | 否             | 单向投递，适合通知、日志和埋点。目标不存在（`ErrServerNil`）时静默丢弃，其余失败会打 warn 日志后丢弃。 |
+| `AsyncCall`       | 否，结果走回调 | 推荐方式。回调在发起方模块事件循环中执行。                                                             |
+| `Call`            | 是             | 同步阻塞调用。调用链成环会死锁，应谨慎使用。                                                           |
+| `CallWithContext` | 是             | 同 `Call`，但可通过 `ctx` 主动超时或取消等待，取消时返回携带 `ctx.Err()` 的 `RetInfo`。                |
 
 Handler 响应语义：
 
@@ -287,7 +295,7 @@ if !ok {
 元数据示例（`WithMeta` 可多次调用叠加多个 key，元数据会随响应回传到 `RetInfo.Metadata`）：
 
 ```go
-_ = m.AsyncCall("target", &Req{}, callback, chanrpc.WithMeta("trace_id", "abc"))
+_ = m.AsyncCall(app.ChanRPC("target"), &Req{}, callback, chanrpc.WithMeta("trace_id", "abc"))
 ```
 
 关闭语义：
@@ -300,10 +308,10 @@ _ = m.AsyncCall("target", &Req{}, callback, chanrpc.WithMeta("trace_id", "abc"))
 
 `internal/async` 提供一个轻量的本地异步任务调度器，`Skeleton` 内置了它——语义上是 `AsyncCall` 的本地版本：`AsyncCall` 调用的是别的模块的 `Server`，`AsyncGo`/`NewLinearContext` 执行的是本模块内部的一段代码，两者都遵循同一个「`f` 并发执行、`cb` 回到事件循环执行」的模式。
 
-| 方法 | 说明 |
-| --- | --- |
-| `AsyncGo(name, f, cb)` | `f` 在独立 goroutine 中执行，结束（或 panic）后 `cb` 在本模块事件循环中执行，可安全访问模块状态。`name` 用于 `DumpStat` 按类型统计 `cb` 的耗时。 |
-| `NewLinearContext()` | 返回一个 `*LinearContext`：通过它提交的任务，`f` 始终按提交顺序依次串行执行（不会并发），`cb` 仍然回到事件循环执行。多个本地异步步骤需要保证先后顺序时使用；不需要顺序保证时优先用更简单的 `AsyncGo`。 |
+| 方法                   | 说明                                                                                                                                                                                                   |
+|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `AsyncGo(name, f, cb)` | `f` 在独立 goroutine 中执行，结束（或 panic）后 `cb` 在本模块事件循环中执行，可安全访问模块状态。`name` 用于 `DumpStat` 按类型统计 `cb` 的耗时。                                                       |
+| `NewLinearContext()`   | 返回一个 `*LinearContext`：通过它提交的任务，`f` 始终按提交顺序依次串行执行（不会并发），`cb` 仍然回到事件循环执行。多个本地异步步骤需要保证先后顺序时使用；不需要顺序保证时优先用更简单的 `AsyncGo`。 |
 
 `LinearContext` 与 `Skeleton` 共享同一份并发配额（`WithAsyncChanLen` 设置的上限），其 `Go(f, cb)` 没有 `name` 参数，耗时不计入 `DumpStat`。
 
@@ -370,24 +378,28 @@ m.NewTimer("heartbeat", time.Second, timer.WithTicker())
 
 ### Signal
 
+`signal` 包提供 `signal.Manager` 和处理函数类型 `signal.Trap`。`app.App` 内部使用 `signal.NewManager()` 创建信号管理器，在 `Run` 中启动监听，关闭应用后停止监听。
+
 框架默认信号行为：
 
-| 信号 | 行为 |
-| --- | --- |
-| SIGINT | 触发优雅关闭，框架保留，业务不可注册。 |
-| SIGTERM | 触发优雅关闭，框架保留，业务不可注册。 |
-| SIGKILL | 操作系统不可捕获；框架仅将其作为保留信号禁止业务注册。 |
-| SIGHUP | 默认记录日志并继续运行。仅当业务在 `Run` 之前注册过 SIGHUP 处理器时才不装该默认处理器；`Run` 之后（如模块 `OnInit` 中）注册的处理器是追加，默认日志行为仍会执行。 |
+| 信号    | 行为                                                                                                                                                              |
+|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| SIGINT  | 触发优雅关闭，框架保留，业务不可注册。                                                                                                                            |
+| SIGTERM | 触发优雅关闭，框架保留，业务不可注册。                                                                                                                            |
+| SIGKILL | 操作系统不可捕获；框架仅将其作为保留信号禁止业务注册。                                                                                                            |
+| SIGHUP  | 默认记录日志并继续运行。仅当业务在 `Run` 之前注册过 SIGHUP 处理器时才不装该默认处理器；`Run` 之后（如模块 `OnInit` 中）注册的处理器是追加，默认日志行为仍会执行。 |
 
 业务可注册非保留信号：
 
 ```go
-err := xhive.RegisterSignal(func() {
+err := app.RegisterSignal(func() {
 	slog.Info("reload config")
 }, syscall.SIGHUP)
 ```
 
 同一信号支持多个处理器。收到信号后，处理器并发执行并等待全部完成；单个处理器 panic 会被捕获。
+
+使用独立应用实例时，通过该实例的 `RegisterSignal` 方法注册。需要单独管理进程信号时，也可以直接使用 `signal.NewManager()` 及其 `Register`、`Start`、`Stop` 方法。
 
 ### TPStats
 
@@ -405,6 +417,8 @@ Skeleton 会自动统计定时器事件、RPC 请求、异步 RPC 回调和本�
 ---
 
 ## 应用生命周期
+
+以下状态常量均定义在 `app` 包中，可通过 `app.State()` 或应用实例的 `State()` 方法读取。
 
 ```text
 AppStateNone
@@ -428,8 +442,8 @@ AppStateNone
 2. 关闭所有动态模块。
 3. 按启动顺序（`Priority` 升序，同优先级保留注册顺序）整体逆序关闭静态模块（LIFO）。
 4. 每个模块先取消 context 并等待 goroutine 退出，再执行 `OnDestroy`，最后调用 `Close` 释放出站 client。只有 `OnInit` 成功返回过的模块参与这一步（启动中途失败时，未初始化的模块只会被关掉 ChanRPC 服务端，不收 `OnDestroy`/`Close`）。
-5. 单个模块关闭超时默认为 30 分钟，静态与动态模块同样受此保护；超时不强杀，仅记录错误日志，并跳过该模块的 `OnDestroy` 与 `Close`。
-6. 全部关闭后回到 `AppStateNone`。注意此时**不支持再次启动**——`start` 会检查模块生命周期状态并明确拒绝，需要重启请新建模块实例与新的 app。
+5. 等待单个模块 `Serve` 退出的超时默认为 30 分钟，静态与动态模块同样受此保护；超时不强杀，仅记录错误日志，并跳过该模块的 `OnDestroy` 与 `Close`。通过 `app.New(app.WithShutdownTimeout(d))` 可为新应用实例调整该超时；它不限制 `OnDestroy` 和 `Close` 自身的执行时间。
+6. 全部关闭后回到 `AppStateNone`。注意此时**不支持再次启动**——`start` 会检查模块生命周期状态并明确拒绝，需要重启请新建模块实例与新的 `app.App`。
 7. 关闭若发生在启动尚未完成时（例如启动期收到 SIGTERM），框架先等 `start` 收敛（默认上限 5 秒，独立于模块关闭超时）再开始销毁，避免 `OnDestroy` 与仍在执行的 `OnInit` 并发读写同一批业务内存；超时兜底放行时，仍在 `OnInit` 中的那个模块会被跳过销毁（它的资源由 `OnInit` 自己负责，框架会记一条 error）。
 
 ---
@@ -439,9 +453,10 @@ AppStateNone
 动态模块适合运行时启停的功能，例如活动玩法、临时任务或调试模块。
 
 ```go
-results, err := xhive.AddDynamicModules(NewActivityModule())
+results, err := app.AddDynamicModules(NewActivityModule())
 if err != nil {
-	// err 非 nil 仅表示至少一个模块初始化失败，逐个模块的结果见 results
+	// err 可能表示模块添加失败，也可能表示应用正在关闭、整批添加被拒绝。
+	slog.Error("dynamic modules add failed", slog.Any("error", err))
 	for _, r := range results {
 		if r.Err != nil {
 			slog.Error("dynamic module init failed", slog.String("module", r.Name), slog.Any("error", r.Err))
@@ -450,46 +465,63 @@ if err != nil {
 	return err
 }
 
-names := xhive.DynamicModules()
+names := app.DynamicModules()
 _ = names
 
-removed := xhive.RemoveDynamicModule("activity")
+removed := app.RemoveDynamicModule("activity")
 _ = removed
 ```
 
 动态模块特性：
 
-- `AddDynamicModules` 按 `Priority` 升序（同优先级保留传参顺序）依次执行 `OnInit`，成功后启动 `Serve`，并等待模块 `Ready()` 后才登记到动态模块表。重名模块会被直接拒绝，不会覆盖已有模块；应用已进入关闭流程后调用会整体拒绝，避免登记出无人负责关闭的模块。
+- `AddDynamicModules` 按 `Priority` 升序（同优先级保留传参顺序）依次执行 `OnInit`，成功后启动 `Serve`，并等待模块 `Ready()` 后才对 RPC 寻址、统计和模块列表公开。初始化前先在动态模块表中占住名称，重名模块会被直接拒绝，不会覆盖已有模块；应用已进入关闭流程后调用会整体拒绝，避免登记出无人负责关闭的模块。
 - `RemoveDynamicModule` 先把模块从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走与静态模块完全相同的关闭路径：取消 context → 等待 goroutine 退出（受关闭超时保护）→ `OnDestroy` → `Close`。并发卸载同名模块时只有一个调用方会执行销毁。返回值表示销毁是否**真的完整走完**：模块不存在返回 `false`，等待 goroutine 退出超时、框架跳过 `OnDestroy`/`Close` 时同样返回 `false`——此时资源并未释放，且模块已被摘出模块表，不要立刻用同名模块重新加载。
 - 动态模块 `Serve`、`OnDestroy` 与 `Close` 中的 panic 会被捕获，不会退出进程；`OnInit` 在调用方 goroutine 上同步执行，其 panic 不被框架捕获。
 - 批量添加中途失败时，已经启动的动态模块不会自动回滚；`OnInit` 失败的那个模块不会收到 `OnDestroy`/`Close`（须由 `OnInit` 自行回滚），与静态模块语义一致。
 
 ---
 
-## 包级 API
+## 应用 API
 
-| API | 说明 |
-| --- | --- |
-| `Register(mods ...IModule) error` | 启动前注册静态模块。 |
-| `Run(mods ...IModule) error` | 注册并启动应用，阻塞至收到退出信号并完成关闭；启动失败或重复调用时返回 error。 |
-| `State() int32` | 返回当前应用状态。 |
-| `Stats() string` | 返回所有模块 RPC 队列积压统计。 |
-| `ChanRPC(name string) *chanrpc.Server` | 按模块名获取 ChanRPC 服务端。 |
-| `DynamicModules() []string` | 返回当前动态模块名称列表。 |
-| `AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResult, err error)` | 运行时添加并启动动态模块；`results` 逐个给出模块的成功/失败结果，`err` 非 nil 仅表示至少一个模块初始化失败。 |
-| `RemoveDynamicModule(name string) bool` | 同步卸载动态模块。 |
-| `RegisterSignal(trap SignalTrap, sigs ...os.Signal) error` | 注册非保留信号处理器。 |
-| `SafeGo(fn func())` | 在独立 goroutine 中执行 `fn`，自动捕获其中的 panic。 |
-| `SafeGoContext(ctx context.Context, fn func(ctx context.Context))` | 语义同 `SafeGo`；启动时若 `ctx` 已取消则跳过执行，执行中不主动中断 `fn`。 |
+`app` 包的 `Register`、`Run`、`State` 等函数操作同一个默认应用实例。需要独立实例或自定义关闭超时时，使用 `app.New(opts ...app.AppOption) *app.App`，随后调用实例上的同名方法；包级函数仍操作默认实例。
+
+例如，使用快速开始中的 `Ponger` 创建独立应用：
+
+```go
+application := app.New(app.WithShutdownTimeout(time.Minute))
+if err := application.Run(NewPonger()); err != nil {
+	slog.Error("app exited with error", slog.Any("error", err))
+}
+```
+
+| API                                                                                            | 说明                                                                                           |
+|------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `app.New(opts ...app.AppOption) *app.App`                                                      | 创建独立应用实例，可传入 `app.WithShutdownTimeout(d)`。                                        |
+| `app.Register(mods ...app.IModule) error`                                                      | 启动前注册静态模块。                                                                           |
+| `app.Run(mods ...app.IModule) error`                                                           | 注册并启动应用，阻塞至收到退出信号并完成关闭；启动失败或重复调用时返回 error。                 |
+| `app.State() int32`                                                                            | 返回当前应用状态。                                                                             |
+| `app.Stats() string`                                                                           | 返回所有模块 RPC 队列积压统计。                                                                |
+| `app.ChanRPC(name string) *chanrpc.Server`                                                     | 按模块名获取 ChanRPC 服务端。                                                                  |
+| `app.DynamicModules() []string`                                                                | 返回当前动态模块名称列表。                                                                     |
+| `app.AddDynamicModules(mods ...app.IModule) (results []app.AddDynamicModuleResult, err error)` | 添加并启动动态模块；`results` 给出逐个模块的结果，模块添加失败或关闭期间整批拒绝时返回 error。 |
+| `app.RemoveDynamicModule(name string) bool`                                                    | 同步卸载动态模块。                                                                             |
+| `app.RegisterSignal(trap signal.Trap, sigs ...os.Signal) error`                                | 注册非保留信号处理器。                                                                         |
+
+根包的 goroutine 工具：
+
+| API                                                                      | 说明                                                                            |
+|--------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| `xhive.SafeGo(fn func())`                                                | 在独立 goroutine 中执行 `fn`，自动捕获其中的 panic。                            |
+| `xhive.SafeGoContext(ctx context.Context, fn func(ctx context.Context))` | 语义同 `xhive.SafeGo`；启动时若 `ctx` 已取消则跳过执行，执行中不主动中断 `fn`。 |
 
 状态常量：
 
-| 常量 | 说明 |
-| --- | --- |
-| `AppStateNone` | 应用未启动或已完全停止；已停止的应用**不支持再次启动**。 |
-| `AppStateInit` | 应用正在初始化。 |
-| `AppStateRun` | 应用运行中。 |
-| `AppStateStop` | 应用正在关闭。 |
+| 常量               | 说明                                                     |
+|--------------------|----------------------------------------------------------|
+| `app.AppStateNone` | 应用未启动或已完全停止；已停止的应用**不支持再次启动**。 |
+| `app.AppStateInit` | 应用正在初始化。                                         |
+| `app.AppStateRun`  | 应用运行中。                                             |
+| `app.AppStateStop` | 应用正在关闭。                                           |
 
 ---
 
@@ -497,18 +529,21 @@ _ = removed
 
 ```text
 xhive/
-├── app.go              # 包级 API
-├── module.go           # IModule、app 核心结构、模块生命周期
-├── skeleton.go         # Skeleton 事件循环
-├── signal.go           # SignalManager
+├── skeleton.go         # Skeleton、RPC/Timer/Async 接口与事件循环
 ├── safego.go           # SafeGo / SafeGoContext，带 panic 恢复的 goroutine
+├── app/
+│   ├── def.go          # 默认应用的包级 API、应用状态、AppOption
+│   ├── app.go          # App、New、应用启停与动态模块管理
+│   └── module.go       # IModule、模块生命周期状态与运行时包装
 ├── chanrpc/
 │   ├── def.go          # 消息 ID、CallInfo、RetInfo、CallOption、Hold/Replier
 │   ├── server.go       # ChanRPC 服务端
 │   └── client.go       # ChanRPC 客户端
 ├── internal/
-│   ├── go/             # 本地异步任务调度器（Go/LinearContext），Skeleton.AsyncGo/NewLinearContext 的底座
+│   ├── async/          # Scheduler / LinearContext，Skeleton.AsyncGo/NewLinearContext 的底座
 │   └── queue/          # 动态扩缩容 + 硬上限的 FIFO 队列，上面各条队列的共同底座
+├── signal/
+│   └── signal.go       # Manager / Trap，进程信号注册与分发
 ├── timer/
 │   ├── dispatcher.go   # 多级时间轮调度器
 │   └── manager.go      # 业务层 Timer API
@@ -546,14 +581,13 @@ go test -race ./...
 
 当前测试覆盖重点：
 
-- app / module：静态与动态模块生命周期、状态流转、启动失败、优先级排序和 LIFO 逆序关闭。
-- skeleton：事件循环、RPC 包装、Timer 包装、本地异步任务（`AsyncGo`/`NewLinearContext`）、统计记录和资源关闭（含 Serve 已退出后 `Close` 排空迟到回调的场景）。
-- signal：保留信号、自定义信号、并发分发和 panic 隔离。
 - chanrpc：消息 ID、注册校验、Cast、AsyncCall、Call、metadata、`Hold` 延迟响应、panic 恢复、关闭语义、队列打满时的失败/阻塞/丢包与计数回滚。
 - timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、到期队列打满时的重试、Manager one-shot 和 ticker。
 - internal/async：并发提交、`LinearContext` 顺序保证（含并发提交方）、`Close` 正常排空与超时放弃、无消费者时回调队列不阻塞、panic 恢复。
 - internal/queue：FIFO 顺序、扩容与收缩、打满即拒绝、阻塞入队的取消与唤醒、关闭后的拒绝与排空、出队后解除引用、边沿信号不丢唤醒、多生产者多消费者并发。
 - stat：分位统计、TopN、Reset、零值 key 忽略、并发 Add 和 Dump。
+
+根包 `xhive`、`app` 和 `signal` 当前没有测试文件。
 
 ---
 
@@ -589,11 +623,11 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 ### 队列打满了会发生什么？
 
-队列容量全都有硬上限，打满时的行为按调用语义区分（详见 [Skeleton](#skeleton) 一节的表格）：异步语义（`Cast`、`AsyncCall`）立即失败并返回 `ErrChanFull`，同步语义（`Call`、`CallWithContext`）阻塞等待空位形成背压，定时器到期事件则留在时间轮里下个 tick 重试、不丢失。
+队列容量全都有硬上限，打满时的行为按调用语义区分（详见 [Skeleton](#skeleton) 一节的表格）：`Cast` 立即记录 warn 并丢弃，`AsyncCall` 立即返回 `ErrChanFull`，同步语义（`Call`、`CallWithContext`）阻塞等待空位形成背压，定时器到期事件则留在时间轮里下个 tick 重试、不丢失。
 
 这是刻意的取舍。早期版本使用无界队列，生产者永不阻塞、永不失败，代价是消费端一旦跟不上，积压只表现为内存一路上涨，最终以 OOM 的形式在离现场很远的地方崩掉，中途没有任何可告警的信号。有上限的队列把同一个问题在发生的那一刻就暴露成一个带消息类型和水位的错误。
 
-生产环境应通过包级 `Stats()`（汇总各模块 RPC 服务端队列长度）或 `ChanRPC(name).Len()` / `Cap()` 观测水位，在打满之前就限流、拆模块或告警。
+生产环境应通过 `app.Stats()`（汇总各模块 RPC 服务端队列长度）或 `app.ChanRPC(name).Len()` / `Cap()` 观测水位；使用独立应用时调用该实例的同名方法。在打满之前就限流、拆模块或告警。
 
 ### 有上限的队列，为什么不用原生 channel？
 
@@ -610,18 +644,18 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 实测数字：
 
-| 指标 | 原生 channel | Queue |
-| --- | --- | --- |
-| 每个 `Skeleton` 常驻内存 | 93.5 KB | **3.2 KB** |
-| 1000 个模块 | 91.3 MB | **3.2 MB** |
-| 单次收发（队列常空） | 36 ns | 79 ns |
-| 单次收发（队列有积压） | 34 ns | **29 ns** |
+| 指标                     | 原生 channel | Queue      |
+|--------------------------|--------------|------------|
+| 每个 `Skeleton` 常驻内存 | 93.5 KB      | **3.2 KB** |
+| 1000 个模块              | 91.3 MB      | **3.2 MB** |
+| 单次收发（队列常空）     | 36 ns        | 79 ns      |
+| 单次收发（队列有积压）   | 34 ns        | **29 ns**  |
 
 慢的那一栏是队列常空、每条消息都要真正唤醒一次 goroutine 的场景，原生 channel 在这里走 runtime 的直接交接快路径，而 Queue 要多付一次入队锁和一次出队锁。队列一旦有积压，`Pop` 补回的信号让消费者无需阻塞唤醒就能连续取件，反而比原生更快。模块负载越高越靠近后者。
 
 ### 模块的启动顺序怎么控制？
 
-由 `IModule.Priority() uint` 决定：值越小越早初始化，优先级相同时保留注册顺序（静态模块为 `Register`/`Run` 的传参顺序，动态模块为 `AddDynamicModules` 的传参顺序）。关闭顺序与启动顺序完全相反（LIFO），保证被依赖模块最后销毁。内嵌 `Skeleton` 时 `Priority` 默认返回 0，需要靠后启动的模块自行覆盖该方法。
+由 `app.IModule.Priority() uint` 决定：值越小越早初始化，优先级相同时保留注册顺序（静态模块为 `Register`/`Run` 的传参顺序，动态模块为 `AddDynamicModules` 的传参顺序）。关闭顺序与启动顺序完全相反（LIFO），保证被依赖模块最后销毁。内嵌 `Skeleton` 时 `Priority` 默认返回 0，需要靠后启动的模块自行覆盖该方法。
 
 ### 动态模块和静态模块有什么区别？
 
@@ -629,7 +663,7 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 ### 模块关闭超时了会怎样？
 
-框架等待单个模块 `Serve` 退出的上限是 30 分钟，静态模块与动态模块（含 `RemoveDynamicModule` 卸载）都受这一保护。超时后不强杀，但会记录一条 error 并跳过该模块的 `OnDestroy` 和 client 释放——此时事件循环仍在运行，调 `OnDestroy` 会与它并发读写同一批业务内存，触发 Go 运行时不可 recover 的 fatal。因此 `Serve` 必须能及时响应 `ctx.Done()`，否则依赖 `OnDestroy` 的落地逻辑整段不会执行。
+框架等待单个模块 `Serve` 退出的上限默认是 30 分钟，可通过 `app.New(app.WithShutdownTimeout(d))` 为新应用实例调整；静态模块与动态模块（含 `RemoveDynamicModule` 卸载）都受这一保护。超时后不强杀，但会记录一条 error 并跳过该模块的 `OnDestroy` 和 client 释放——此时事件循环仍在运行，调 `OnDestroy` 会与它并发读写同一批业务内存，触发 Go 运行时不可 recover 的 fatal。因此 `Serve` 必须能及时响应 `ctx.Done()`，否则依赖 `OnDestroy` 的落地逻辑整段不会执行。
 
 注意该超时只覆盖"等待模块 goroutine 退出"这一步，覆盖不到 `OnDestroy` 自身的执行。所以 `OnDestroy` 里跨模块投递请用 `Cast`/`AsyncCall` 或带超时的 `CallWithContext`，不要用同步 `Call`：启动中途失败时对端的事件循环可能一次都没跑过，回包永远不会产生，同步 `Call` 会让整个停机流程永久卡住。
 

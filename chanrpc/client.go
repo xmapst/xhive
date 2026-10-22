@@ -129,11 +129,11 @@ func (c *Client) IsClosed() bool {
 //
 // 将 nil 检查、关闭状态检查、消息名解析等公共逻辑收敛到此处，
 // 避免在 Call/AsyncCall/Cast 三处入口中分散重复相同的校验代码。
-func (c *Client) check(s *Server, request any) (uint32, error) {
-	if s == nil {
+func (c *Client) check(svr *Server, request any) (uint32, error) {
+	if svr == nil {
 		return 0, ErrServerNil
 	}
-	if s.IsClosed() {
+	if svr.IsClosed() {
 		return 0, ErrServerClosed
 	}
 	if c.IsClosed() {
@@ -148,15 +148,15 @@ func (c *Client) check(s *Server, request any) (uint32, error) {
 
 // Call 向指定 Server 发起同步 RPC 调用，阻塞等待处理结果后返回。
 //
-// 等价于 CallWithContext(context.Background(), s, request, opts...)：
+// 等价于 CallWithContext(context.Background(), svr, request, opts...)：
 // 不支持通过 ctx 主动取消等待，仅通过周期告警日志诊断长时间未响应的调用。
 // 保留该方法是为了兼容既有调用方，新代码建议直接使用 CallWithContext
 // 以获得真正的超时/取消能力。
 //
 // 警告：在事件循环中使用 Call 会阻塞本模块对其他消息的处理；
 // 若对端模块同时向本模块发起 Call，则形成循环等待（死锁），生产环境应优先使用 AsyncCall。
-func (c *Client) Call(s *Server, request any, opts ...CallOption) *RetInfo {
-	return c.CallWithContext(context.Background(), s, request, opts...)
+func (c *Client) Call(svr *Server, request any, opts ...CallOption) *RetInfo {
+	return c.CallWithContext(context.Background(), svr, request, opts...)
 }
 
 // CallWithContext 向指定 Server 发起同步 RPC 调用，阻塞等待处理结果、
@@ -179,8 +179,8 @@ func (c *Client) Call(s *Server, request any, opts ...CallOption) *RetInfo {
 //
 // 警告：在事件循环中使用 CallWithContext 会阻塞本模块对其他消息的处理；
 // 若对端模块同时向本模块发起 Call，则形成循环等待（死锁），生产环境应优先使用 AsyncCall。
-func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, opts ...CallOption) *RetInfo {
-	id, err := c.check(s, request)
+func (c *Client) CallWithContext(ctx context.Context, svr *Server, request any, opts ...CallOption) *RetInfo {
+	id, err := c.check(svr, request)
 	if err != nil {
 		slog.Warn("chanrpc sync call failed", slog.Any("id", id), slog.Any("error", err))
 		return &RetInfo{Err: err}
@@ -188,7 +188,7 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 	o := c.applyOpts(opts...)
 
 	chanRet := newSyncRet()
-	err = c.call(ctx, s, &CallInfo{
+	err = c.call(ctx, svr, &CallInfo{
 		id:       id,
 		Request:  request,
 		chanRet:  chanRet,
@@ -223,12 +223,12 @@ func (c *Client) CallWithContext(ctx context.Context, s *Server, request any, op
 // 投递是非阻塞的：对端队列已满时立即返回 ErrChanFull，不阻塞本模块的事件循环。
 // 这一点与同步 Call 相反——同步调用方本来就在等结果，多等一会儿入队是合理的；
 // 异步调用方还要继续处理别的消息，为一次投递把整个事件循环停下来得不偿失。
-func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...CallOption) error {
+func (c *Client) AsyncCall(svr *Server, request any, callback Callback, opts ...CallOption) error {
 	if callback == nil {
 		return ErrCallbackNil
 	}
 
-	id, err := c.check(s, request)
+	id, err := c.check(svr, request)
 	if err != nil {
 		slog.Warn("chanrpc async call failed", slog.Any("id", id), slog.Any("error", err))
 		return err
@@ -239,7 +239,7 @@ func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...Ca
 	// 而回包丢弃路径（asyncRet.send）会把计数减回来。先入队后加一存在一个窗口，
 	// 会让计数先减到 -1 再加回 0，Close 的排空判断据此提前收工。
 	c.pendingAsyncCall.Add(1)
-	err = c.call(context.Background(), s, &CallInfo{
+	err = c.call(context.Background(), svr, &CallInfo{
 		id:       id,
 		Request:  request,
 		chanRet:  asyncRet{c}, // 共享异步回调队列，回调由事件循环统一消费
@@ -262,8 +262,8 @@ func (c *Client) AsyncCall(s *Server, request any, callback Callback, opts ...Ca
 // 与 AsyncCall 的本质区别：CallInfo 中 chanRet 和 callback 均为 nil，
 // Server 处理后直接丢弃结果，不产生任何回调开销。
 // 对 ErrServerNil 不打 warn 日志：允许对端模块尚未就绪时静默丢弃，避免大量误报。
-func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
-	id, err := c.check(s, request)
+func (c *Client) Cast(svr *Server, request any, opts ...CallOption) {
+	id, err := c.check(svr, request)
 	if err != nil {
 		if !errors.Is(err, ErrServerNil) {
 			slog.Warn("chanrpc cast failed", slog.Any("id", id), slog.Any("error", err))
@@ -272,7 +272,7 @@ func (c *Client) Cast(s *Server, request any, opts ...CallOption) {
 	}
 	o := c.applyOpts(opts...)
 
-	err = c.call(context.Background(), s, &CallInfo{
+	err = c.call(context.Background(), svr, &CallInfo{
 		id:       id,
 		Request:  request,
 		metadata: o.metadata,
@@ -389,7 +389,7 @@ func (c *Client) PendingCount() int64 {
 
 // call 将 CallInfo 投递到 Server 的调用队列。
 //
-// 入队前先给 s.pending 加一、失败再回滚：这是 Server.Close 判断排空是否真正
+// 入队前先给 svr.pending 加一、失败再回滚：这是 Server.Close 判断排空是否真正
 // 见底的唯一依据，见 Server.Close 的说明。之所以传 *Server 而不是直接传
 // chanCall，就是为了能在这里摸到 pending 这个计数——两者本该是同一件事的
 // 一体两面（“投给这个 Server 的队列”和“这个 Server 记一笔待办”），拆成两个
@@ -415,11 +415,11 @@ func (c *Client) PendingCount() int64 {
 // 都直接消费 call 的返回值，那个补包是多余的；对异步调用它还有害——补进去的
 // RetInfo 会被事件循环当成一次正常回包消费掉，AsyncCallback 减一次
 // pendingAsyncCall，AsyncCall 自己在失败分支上又减一次，计数就被减穿了。
-func (c *Client) call(ctx context.Context, s *Server, ci *CallInfo, block bool) (err error) {
-	if s == nil {
+func (c *Client) call(ctx context.Context, svr *Server, ci *CallInfo, block bool) (err error) {
+	if svr == nil {
 		return ErrServerNil
 	}
-	if s.chanCall == nil {
+	if svr.chanCall == nil {
 		return ErrCallChannelNil
 	}
 	if ci == nil {
@@ -438,17 +438,17 @@ func (c *Client) call(ctx context.Context, s *Server, ci *CallInfo, block bool) 
 			slog.Warn("chanrpc call panic", slog.String("req_type", reqType), slog.Any("error", err))
 		}
 		if !enqueued {
-			s.pending.Add(-1) // 没进队列，把上面预加的那一笔撤销
+			svr.pending.Add(-1) // 没进队列，把上面预加的那一笔撤销
 		}
 	}()
 
 	// 先加后投：入队成功的那一刻 Server 就可能已经取走并 Exec 完成（pending 减一），
 	// 若此时这边还没来得及加一，计数会先掉到 -1，Close 的排空循环据此提前收工。
-	s.pending.Add(1)
+	svr.pending.Add(1)
 
 	// 队列有空位时两种模式的行为完全一致，先走一次非阻塞尝试把这条共同的
 	// 快路径走完，免得为一个用不上的告警 ticker 付出分配与调度开销。
-	err = s.chanCall.Push(ci)
+	err = svr.chanCall.Push(ci)
 	switch {
 	case err == nil:
 		enqueued = true
@@ -461,7 +461,7 @@ func (c *Client) call(ctx context.Context, s *Server, ci *CallInfo, block bool) 
 
 	if !block {
 		return fmt.Errorf("%w: id=%d type=%s len=%d cap=%d",
-			ErrChanFull, ci.id, reqType, s.chanCall.Len(), s.chanCall.Cap())
+			ErrChanFull, ci.id, reqType, svr.chanCall.Len(), svr.chanCall.Cap())
 	}
 
 	// 阻塞模式下仍然周期性告警：队列打满是个需要被看见的事故，
@@ -472,18 +472,18 @@ func (c *Client) call(ctx context.Context, s *Server, ci *CallInfo, block bool) 
 	defer tick.Stop()
 	for {
 		select {
-		case <-s.chanCall.NotFull():
+		case <-svr.chanCall.NotFull():
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-tick.C:
 			slog.Warn("chanrpc call blocked on full server channel",
-				slog.String("req_type", reqType), slog.Int("len", s.chanCall.Len()), slog.Int("cap", s.chanCall.Cap()))
+				slog.String("req_type", reqType), slog.Int("len", svr.chanCall.Len()), slog.Int("cap", svr.chanCall.Cap()))
 			continue
 		}
 
-		// NotFull 是边沿信号，醒来不代表一定有位置（可能被别的生产者抢先），
+		// NotFull 通过关闭通道广播唤醒等待者，醒来不代表一定有位置（可能被别的生产者抢先），
 		// 因此必须重试 Push 并接受它仍然返回 ErrFull。
-		err = s.chanCall.Push(ci)
+		err = svr.chanCall.Push(ci)
 		switch {
 		case err == nil:
 			enqueued = true

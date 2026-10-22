@@ -81,7 +81,7 @@ func WithCloseTimeout(d time.Duration) Option {
 // 会 clamp 成 1，若不回读、直接把原始（可能 <=0 的）max 存进 pendingMax，
 // 两者就会不相等，上面这条不变量从一开始就不成立。
 //
-// 不提供运行时调整上限的方法：队列容量在构造时就固定分配，事后调大
+// 不提供运行时调整上限的方法：队列的硬性容量上限在构造时确定，事后调大
 // pendingMax 会立刻打破上面的不变量，调小则没有实际收益，索性只在构造时
 // 一次定死。
 func New(max int, opts ...Option) *Scheduler {

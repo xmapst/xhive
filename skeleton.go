@@ -1,3 +1,5 @@
+// Package xhive 提供 Actor 模块骨架、定时器与 RPC 调用封装、本地异步任务和 goroutine 工具。
+// 应用入口与模块生命周期由 app 包管理，Skeleton 的 RPC 方法直接接收 *chanrpc.Server。
 package xhive
 
 import (
@@ -12,7 +14,8 @@ import (
 	"github.com/xmapst/xhive/timer"
 )
 
-// IRPC 定义跨模块 RPC 调用的接口，提供四种调用语义覆盖不同并发场景。
+// IRPC 定义面向 *chanrpc.Server 的 RPC 调用接口，提供四种调用语义覆盖不同并发场景。
+// 调用方负责获取目标服务端，Skeleton 提供此接口的实现。
 //
 // 调用模式对比：
 //   - Cast：单向投递，无响应，吞吐最高，适合通知/事件
@@ -21,16 +24,16 @@ import (
 //   - CallWithContext：同 Call，但支持通过 ctx 主动取消/超时等待
 type IRPC interface {
 	// Cast 单向消息投递，不等待结果，适合日志上报、事件通知等不需要响应的场景。
-	Cast(mod string, req any, opts ...chanrpc.CallOption)
+	Cast(svr *chanrpc.Server, req any, opts ...chanrpc.CallOption)
 	// Call 同步 RPC 调用，阻塞等待对端处理完成并返回结果。
 	// 警告：若调用链形成环（A→B→A），将导致死锁，生产环境应优先使用 AsyncCall。
-	Call(mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo
+	Call(svr *chanrpc.Server, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo
 	// CallWithContext 同 Call，但允许通过 ctx（如 context.WithTimeout）主动
 	// 放弃等待，ctx 被取消时立即返回携带 ctx.Err() 的 RetInfo，而非无限等待。
-	CallWithContext(ctx context.Context, mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo
+	CallWithContext(ctx context.Context, svr *chanrpc.Server, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo
 	// AsyncCall 异步 RPC 调用，立即返回，结果通过 cb 回调在调用方 goroutine 处理。
 	// 回调在事件循环中串行执行，可安全访问模块内部状态，无需加锁。
-	AsyncCall(mod string, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error
+	AsyncCall(svr *chanrpc.Server, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error
 }
 
 // ITimer 定义定时器管理接口，支持一次性定时器和周期性 Ticker 的完整生命周期管理。
@@ -73,10 +76,8 @@ type IAsync interface {
 	NewLinearContext() *LinearContext
 }
 
-// ISkeleton 模块骨架的抽象接口，聚合了跨模块 RPC 调用（IRPC）、定时器管理
-// （ITimer）和本地异步任务调度（IAsync）三个能力。业务模块通过组合 Skeleton
-// （或实现 ISkeleton）获得完整的事件驱动能力，框架据此对模块进行统一调度与
-// 生命周期管理。
+// ISkeleton 聚合 RPC 调用（IRPC）、定时器管理（ITimer）和本地异步任务调度（IAsync）
+// 三个能力，由 *Skeleton 实现。应用的模块生命周期接口由 app.IModule 定义。
 type ISkeleton interface {
 	IRPC
 	ITimer
@@ -90,20 +91,20 @@ type ISkeleton interface {
 // 彻底消除模块内部的并发竞争，开发者无需为访问模块状态加任何锁，极大降低了复杂度。
 //
 // 使用方式：业务模块内嵌 Skeleton，重写 OnInit 注册处理函数，重写 OnDestroy 清理资源，
-// 无需重写 Serve 和 ChanRPC（Skeleton 已提供默认实现）。
+// 即可实现 app.IModule；Serve 和 ChanRPC 等方法由 Skeleton 提供默认实现。
 type Skeleton struct {
-	ready  chan struct{}   // 在 select 循环即将开始时关闭
-	timer  *timer.Manager  // 定时器管理器，负责创建、调度和取消定时任务
-	server *chanrpc.Server // ChanRPC 服务端，接收并路由来自其他模块的 RPC 调用
-	client *chanrpc.Client // ChanRPC 客户端，向其他模块发起 RPC 调用
+	ready  chan struct{}    // 在 select 循环即将开始时关闭
+	timer  *timer.Manager   // 定时器管理器，负责创建、调度和取消定时任务
+	server *chanrpc.Server  // ChanRPC 服务端，接收并路由来自其他模块的 RPC 调用
+	client *chanrpc.Client  // ChanRPC 客户端，向其他模块发起 RPC 调用
 	async  *async.Scheduler // 本地异步任务调度器，见 IAsync.AsyncGo
-	stat   *stat.TPStats   // 消息耗时统计
+	stat   *stat.TPStats    // 消息耗时统计
 	name   string
 }
 
 const timerKindDumpStat = "TimerKindDumpStat"
 
-// SkeletonOption 用于自定义 Skeleton 内部各组件的队列初始容量与停机超时。
+// SkeletonOption 用于自定义 Skeleton 内部各组件的队列容量上限、统计采样容量与停机超时。
 type SkeletonOption func(*skeletonOptions)
 
 type skeletonOptions struct {
@@ -258,7 +259,7 @@ func NewSkeleton(name string, opts ...SkeletonOption) *Skeleton {
 	return s
 }
 
-// Name 返回模块名称，实现 IModule.Name 接口。
+// Name 返回模块名称，实现 app.IModule.Name。
 func (s *Skeleton) Name() string {
 	return s.name
 }
@@ -270,7 +271,7 @@ func (s *Skeleton) Priority() uint {
 
 // Serve 启动模块事件循环，阻塞至 ctx 被取消（即框架调用 cancel）。
 //
-// 事件循环必须持续消费这三个队列——它们的容量都有硬上限，事件循环一旦被某个
+// 事件循环必须持续消费这四个队列——它们的容量都有硬上限，事件循环一旦被某个
 // 耗时 handler 或某次同步 Call 卡住，上游要么开始丢消息（Cast/AsyncCall）、
 // 要么跟着一起阻塞（同步 Call）。这正是有上限的取舍：把"处理不过来"这件事
 // 立刻暴露出来，而不是攒在内存里。
@@ -300,7 +301,7 @@ func (s *Skeleton) Serve(ctx context.Context) {
 		s.scheduleDumpTimer()
 	})
 	s.scheduleDumpTimer()
-	close(s.ready) // 通知框架：事件循环即将进入 select，ChanRPC 现在可以安全接收消息
+	close(s.ready) // 通知应用管理器：本模块已完成准备，即将进入事件循环
 	for {
 		select {
 		case <-ctx.Done():
@@ -349,7 +350,8 @@ func (s *Skeleton) Serve(ctx context.Context) {
 	}
 }
 
-// Ready 返回就绪信号 channel，框架在此 channel 关闭后才允许其他模块向本模块发起调用。
+// Ready 返回 Serve 进入事件循环前关闭的就绪信号 channel。
+// app 包等待所有静态模块就绪后标记应用运行，动态模块就绪后才允许按名称寻址。
 func (s *Skeleton) Ready() <-chan struct{} {
 	return s.ready
 }
@@ -364,8 +366,8 @@ func (s *Skeleton) Ready() <-chan struct{} {
 // 访问业务状态且仍能对外投递 → 最后才收掉 client"这条时序。
 //
 // dumpStat(false) 中 reset 传 false：整个 s.stat 实例即将随 Skeleton 一起被丢弃，
-// 没有必要再执行一次 Reset 清空样本（与 commonCb 中周期性 dump 后需要 reset=true
-// 以便继续统计下一小时的场景不同，这里是"最后一瞥"，reset 与否不影响后续行为）。
+// 没有必要再执行一次 Reset 清空样本；每 15 分钟的定时统计则使用 reset=true，
+// 为下一轮采样清空统计数据。
 //
 // s.client.Close 内部已经处理了"有 pending 异步调用需要排空"和"无 pending 直接关闭"
 // 两种情况（含超时兜底），这里调用一次即可，不需要在外层轮询 Idle。
@@ -418,7 +420,7 @@ func (s *Skeleton) recordStat(name any, costUs int64) {
 	}
 }
 
-// RegisterTimer 注册指定 kind 类型的定时器处理函数，通常在 OnInit 中调用完成所有注册。
+// RegisterTimer 注册指定 name 的定时器处理函数，通常在 OnInit 中调用完成所有注册。
 func (s *Skeleton) RegisterTimer(name string, handler timer.Handler) {
 	s.timer.Register(name, handler)
 }
@@ -458,7 +460,7 @@ func (s *Skeleton) CancelTimer(id int64) {
 	s.timer.Cancel(id)
 }
 
-// ChanRPC 返回模块的 ChanRPC 服务端，供框架注册到模块映射表，以及外部模块通过 ChanRPC 获取后投递消息。
+// ChanRPC 返回模块的 ChanRPC 服务端，供 app 包按模块名寻址，或直接传给其他模块的 RPC 方法。
 func (s *Skeleton) ChanRPC() *chanrpc.Server {
 	return s.server
 }
@@ -470,40 +472,39 @@ func (s *Skeleton) RegisterChanRPC(msg any, f chanrpc.Handler) error {
 	return s.server.Register(msg, f)
 }
 
-// AsyncCall 向指定模块发起异步 RPC 调用，结果通过 cb 回调在本模块事件循环中执行。
+// AsyncCall 向 svr 发起异步 RPC 调用，结果通过 cb 回调在本模块事件循环中执行。
+//
+// svr 由调用方提供，可来自目标模块的 ChanRPC()、app.ChanRPC(name)
+// 或独立应用实例的 ChanRPC(name)；Skeleton 不负责按模块名查找服务端。
 //
 // 回调在 Serve 的 select 循环中消费 client.NotEmpty()/Pop() 时执行，
 // 与模块其他事件处理串行，无并发问题，可安全访问模块内部状态。
-func (s *Skeleton) AsyncCall(mod string, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error {
-	server := defaultApp.ChanRPC(mod)
-	return s.client.AsyncCall(server, req, cb, opts...)
+func (s *Skeleton) AsyncCall(svr *chanrpc.Server, req any, cb chanrpc.Callback, opts ...chanrpc.CallOption) error {
+	return s.client.AsyncCall(svr, req, cb, opts...)
 }
 
-// Cast 向指定模块投递单向消息，不等待响应，适合日志记录、事件通知等无需确认的场景。
-func (s *Skeleton) Cast(mod string, req any, opts ...chanrpc.CallOption) {
-	server := defaultApp.ChanRPC(mod)
-	s.client.Cast(server, req, opts...)
+// Cast 向 svr 投递单向消息，不等待响应，适合日志记录、事件通知等无需确认的场景。
+func (s *Skeleton) Cast(svr *chanrpc.Server, req any, opts ...chanrpc.CallOption) {
+	s.client.Cast(svr, req, opts...)
 }
 
-// Call 向指定模块发起同步 RPC 调用，阻塞当前模块的事件处理直到收到响应。
+// Call 向 svr 发起同步 RPC 调用，阻塞当前模块的事件处理直到收到响应。
 //
 // 危险提示：Call 会阻塞本模块对其他消息的处理；
 // 若 A 调用 B，同时 B 也在等待 A 的响应，则形成死锁，需通过仔细的调用关系分析来规避。
 // 在事件循环中应优先使用 AsyncCall，仅在调用关系明确单向且不存在环路时才使用 Call。
-func (s *Skeleton) Call(mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo {
-	server := defaultApp.ChanRPC(mod)
-	return s.client.Call(server, req, opts...)
+func (s *Skeleton) Call(svr *chanrpc.Server, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo {
+	return s.client.Call(svr, req, opts...)
 }
 
-// CallWithContext 向指定模块发起同步 RPC 调用，语义与 Call 相同，
+// CallWithContext 向 svr 发起同步 RPC 调用，语义与 Call 相同，
 // 但允许通过 ctx（如 context.WithTimeout）主动放弃等待：
 // ctx 被取消时立即返回携带 ctx.Err() 的 RetInfo，而不必依赖 Call 固定的
 // "无限等待 + 周期告警"策略。适合调用方明确需要超时兜底的场景。
 //
 // 危险提示同 Call：会阻塞本模块对其他消息的处理，仅在确认无循环调用时使用。
-func (s *Skeleton) CallWithContext(ctx context.Context, mod string, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo {
-	server := defaultApp.ChanRPC(mod)
-	return s.client.CallWithContext(ctx, server, req, opts...)
+func (s *Skeleton) CallWithContext(ctx context.Context, svr *chanrpc.Server, req any, opts ...chanrpc.CallOption) *chanrpc.RetInfo {
+	return s.client.CallWithContext(ctx, svr, req, opts...)
 }
 
 // DumpStat 获取前 n 个处理耗时最长的消息。
