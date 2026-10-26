@@ -37,7 +37,7 @@ func Run(mods ...IModule) error {
 
 // State 获取全局默认应用实例的当前运行状态。
 //
-// 返回值为 AppStateNone/AppStateInit/AppStateRun/AppStateStop 之一，
+// 返回值为 StateNone/AppStateInit/AppStateRun/AppStateStop 之一，
 // 可用于在关闭信号处理逻辑中判断当前是否可以安全发起操作。
 func State() int32 {
 	return defaultApp.State()
@@ -108,20 +108,20 @@ func RegisterSignal(trap signal.Trap, sigs ...os.Signal) error {
 }
 
 const (
-	// AppStateNone 表示应用未启动或已完全停止。
+	// StateNone 表示应用未启动或已完全停止。
 	//
 	// 注意：**已停止的应用不支持再次启动。** stop 不重建 modules 里的 wrapper，
 	// 它们的 ctx 已被 cancel、模块自身的一次性资源（如 Ready 返回的就绪
 	// channel）也已消耗。start 会检查模块的生命周期状态并明确拒绝
 	// 重启，返回 error 而不是产出一个 Serve 立即退出的僵尸应用。
 	// 需要"重启"时请新建模块实例与新的 App。
-	AppStateNone = iota
-	// AppStateInit 表示应用正在初始化，所有模块的 OnInit 正在按序执行。
-	AppStateInit
-	// AppStateRun 表示应用运行中，所有模块已成功启动并处于活跃状态。
-	AppStateRun
-	// AppStateStop 表示应用正在优雅关闭，模块正按逆序依次停止。
-	AppStateStop
+	StateNone = iota
+	// StateInit 表示应用正在初始化，所有模块的 OnInit 正在按序执行。
+	StateInit
+	// StateRun 表示应用运行中，所有模块已成功启动并处于活跃状态。
+	StateRun
+	// StateStop 表示应用正在优雅关闭，模块正按逆序依次停止。
+	StateStop
 )
 
 const (
@@ -153,17 +153,17 @@ const (
 	defaultStartupSettleTimeout = 5 * time.Second
 )
 
-// AppOption 用于自定义 New 创建的 App 实例。
+// Option 用于自定义 New 创建的 App 实例。
 //
 // 选项仅影响传给 New 的那个实例，不改变包级函数使用的默认应用。
-type AppOption func(*App)
+type Option func(*App)
 
 // WithShutdownTimeout 自定义关闭时等待单个模块 Serve 退出的最大时间，传给 New 使用。
 //
 // 超时后记录错误日志并跳过该模块的 OnDestroy 和 Close，不会强制终止其 goroutine。
 // 此选项不限制 OnDestroy 和 Close 自身的执行时间。
 // d <= 0 时该选项不生效，沿用 defaultShutdownTimeout。
-func WithShutdownTimeout(d time.Duration) AppOption {
+func WithShutdownTimeout(d time.Duration) Option {
 	return func(a *App) {
 		if d > 0 {
 			a.shutdownTimeout = d

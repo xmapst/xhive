@@ -35,7 +35,7 @@ type IModule interface {
 	// Serve 执行模块主循环，应监听 ctx.Done() 并在收到取消信号时退出。
 	Serve(ctx context.Context)
 	// Ready 返回就绪信号 channel，应在 Serve 进入事件循环前关闭。
-	// 所有静态模块就绪后应用才进入 AppStateRun；动态模块就绪后才对 ChanRPC 可见。
+	// 所有静态模块就绪后应用才进入 StateRun；动态模块就绪后才对 ChanRPC 可见。
 	// 此信号不限制静态模块之间在启动期间提前投递消息。
 	Ready() <-chan struct{}
 	// OnDestroy 执行模块销毁，在模块 goroutine 完全退出之后调用，负责释放所有资源。

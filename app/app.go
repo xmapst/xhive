@@ -22,7 +22,7 @@ import (
 // 并发安全说明：
 //   - modules 切片与 state 共用同一把 RWMutex 保护：Register/start 需要在
 //     持锁状态下原子地完成"检查状态 + 追加模块"，避免两个操作分离时出现
-//     TOCTOU 竞态（例如并发调用 Register 与 Run 时都读到 AppStateNone）
+//     TOCTOU 竞态（例如并发调用 Register 与 Run 时都读到 StateNone）
 //   - dynamicModules 使用 sync.Map，原生支持并发增删改查
 //   - 信号注册与分发由 signal.Manager 内部的 RWMutex 保护
 type App struct {
@@ -34,24 +34,24 @@ type App struct {
 	shutdownTimeout time.Duration    // 单个模块优雅关闭的最大等待时间，可通过 WithShutdownTimeout 自定义
 	startupSettle   time.Duration    // stop 等待仍在进行的 start 收敛的最大时间，见 defaultStartupSettleTimeout
 	state           atomic.Int32     // 应用全局状态，读写均在持锁状态下进行，Stats/State 对外仍以原子读保证快照一致
-	stopRequested   atomic.Bool      // stop 已被请求；start 在各阶段之间检查它并中止启动，避免关闭完成后又把状态改回 AppStateRun
+	stopRequested   atomic.Bool      // stop 已被请求；start 在各阶段之间检查它并中止启动，避免关闭完成后又把状态改回 StateRun
 	runInFlight     atomic.Bool      // Run 正在执行；同一个 App 上不允许并发 Run，见 Run 的说明
 	sync.RWMutex                     // 保护 modules 切片，并使状态变更与 modules 写入保持原子性
 }
 
-// New 创建新的应用框架实例，初始状态为 AppStateNone。
+// New 创建新的应用框架实例，初始状态为 StateNone。
 //
 // opts 可配置该实例的关闭行为，例如 WithShutdownTimeout；nil 选项会被忽略。
 // 返回实例与包级函数使用的 defaultApp 独立，模块注册、RPC 寻址及信号注册
 // 应通过同一个实例的方法完成。
-func New(opts ...AppOption) *App {
+func New(opts ...Option) *App {
 	a := &App{
 		sm:              signal.NewManager(),
 		modules:         make([]*moduleWrapper, 0),
 		shutdownTimeout: defaultShutdownTimeout,
 		startupSettle:   defaultStartupSettleTimeout,
 	}
-	a.setState(AppStateNone)
+	a.setState(StateNone)
 	for _, opt := range opts {
 		if opt != nil {
 			opt(a)
@@ -167,13 +167,13 @@ func (a *App) getChanRPCDynamic(name string) *chanrpc.Server {
 // 若应用已处于运行或停止状态则返回错误，防止运行时并发修改 modules 切片引发数据竞争。
 //
 // 状态检查与追加操作在同一把写锁内完成（而非分离为"先读状态、再加锁追加"），
-// 避免 Register 与 Run 并发调用时，两个 goroutine 都读到 AppStateNone
+// 避免 Register 与 Run 并发调用时，两个 goroutine 都读到 StateNone
 // 后同时进入各自的追加/启动流程，产生 TOCTOU 竞态。
 func (a *App) Register(mods ...IModule) error {
 	a.Lock()
 	defer a.Unlock()
 
-	if a.state.Load() != AppStateNone {
+	if a.state.Load() != StateNone {
 		return fmt.Errorf("application is already running")
 	}
 
@@ -257,7 +257,7 @@ func (a *App) start(mods ...IModule) error {
 
 	a.Lock()
 	currentState := a.state.Load()
-	if currentState != AppStateNone {
+	if currentState != StateNone {
 		a.Unlock()
 		slog.Error("application cannot start twice", slog.Int64("current_state", int64(currentState)))
 		return fmt.Errorf("application cannot start twice, current state: %d", currentState)
@@ -318,7 +318,7 @@ func (a *App) start(mods ...IModule) error {
 	})
 	staticModules := slices.Clone(a.modules)
 
-	a.setState(AppStateInit)
+	a.setState(StateInit)
 	// 向 stop 公示"启动进行中"：stop 观察到 AppStateInit 时会先等这个 channel
 	// 关闭，把关闭动作串到启动之后，避免 OnDestroy 与仍在执行的 OnInit 并发。
 	a.stopRequested.Store(false)
@@ -400,12 +400,12 @@ func (a *App) start(mods ...IModule) error {
 	a.Lock()
 	// 启动尾声再确认一次：期间若已收到关闭请求，绝不能把一个正在/已经关闭的
 	// 应用重新标记为 AppStateRun。
-	if a.stopRequested.Load() || a.state.Load() != AppStateInit {
+	if a.stopRequested.Load() || a.state.Load() != StateInit {
 		a.Unlock()
 		slog.Warn("application start aborted by shutdown request")
 		return fmt.Errorf("application start aborted by shutdown request")
 	}
-	a.setState(AppStateRun)
+	a.setState(StateRun)
 	a.Unlock()
 	slog.Info("application started successfully")
 	return nil
@@ -488,12 +488,12 @@ func (a *App) serveModule(wrapper *moduleWrapper, dynamic bool) {
 func (a *App) stop() {
 	a.Lock()
 	currentState := a.state.Load()
-	if currentState == AppStateStop {
+	if currentState == StateStop {
 		a.Unlock()
 		slog.Warn("application already stopping")
 		return
 	}
-	if currentState == AppStateNone {
+	if currentState == StateNone {
 		a.Unlock()
 		slog.Warn("application is not running")
 		return
@@ -505,7 +505,7 @@ func (a *App) stop() {
 	// 刷两遍 "shutdown initiated/complete" 日志，还会让外部观察到的 State()
 	// 出现 None → Stop → None 的抖动。闸门与状态置位原子化之后，
 	// 第二次 stop 在入口就被 "already stopping" 挡住。
-	a.setState(AppStateStop)
+	a.setState(StateStop)
 	// 向 start 公示关闭意图，再决定是否需要等它跑完。
 	a.stopRequested.Store(true)
 	startDone := a.startDone
@@ -521,7 +521,7 @@ func (a *App) stop() {
 	// 这里刻意用 startupSettle 而不是 shutdownTimeout：等的是 OnInit 收敛（秒级），
 	// 不是模块落盘（可能很久）。复用 30 分钟的 shutdownTimeout 会让"启动期收到
 	// SIGTERM"退化成半小时空等，见 defaultStartupSettleTimeout 的说明。
-	if currentState == AppStateInit && startDone != nil {
+	if currentState == StateInit && startDone != nil {
 		timer := time.NewTimer(a.startupSettle)
 		select {
 		case <-startDone:
@@ -554,7 +554,7 @@ func (a *App) stop() {
 	a.removeAllDynamicModules()
 
 	a.Lock()
-	a.setState(AppStateNone)
+	a.setState(StateNone)
 	a.Unlock()
 	slog.Info("application shutdown complete")
 }
