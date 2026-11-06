@@ -188,6 +188,8 @@ type IModule interface {
 
 通常不需要手写完整接口，推荐内嵌 `*xhive.Skeleton`，只实现 `OnInit` 和 `OnDestroy`。
 
+模块名称必须在同一个 `App` 内唯一，静态模块与动态模块共享名称空间，并且名称在模块生命周期内保持不变。`Register` 和 `Run` 在初始化前整批检查名称，冲突时返回错误且不追加本批模块；`AddDynamicModules` 拒绝冲突模块并继续处理其余模块。不同 `App` 可以使用相同的模块名。
+
 生命周期约定：
 
 1. 静态模块按 `Priority()` 升序执行 `OnInit`，同优先级时保留注册顺序（稳定排序）。

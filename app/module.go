@@ -14,7 +14,8 @@ import (
 // 拥有独立的 goroutine、RPC 服务端和定时器管理器。
 // 模块之间通过 ChanRPC 通信，天然隔离内部状态，无需跨模块加锁。
 type IModule interface {
-	// Name 返回模块唯一名称，用于日志标识和跨模块 RPC 寻址。
+	// Name 返回模块在同一 App 内的唯一名称，用于日志标识和跨模块 RPC 寻址。
+	// 名称须在注册前确定，生命周期内保持不变；静态、动态模块共享同一名称空间。
 	Name() string
 	// Priority 返回模块启动优先级，值越小越早初始化；优先级相同时保留注册/添加顺序
 	// （静态模块为 Register/Run 的注册顺序，动态模块为 AddDynamicModules 传参顺序），
@@ -170,6 +171,7 @@ func (l moduleLifecycle) String() string {
 // (Priority, seq) 排序重建真实的添加顺序。静态模块始终为零值，未参与排序。
 type moduleWrapper struct {
 	IModule
+	name      string // 登记时固定名称，名称校验与 RPC 寻址始终使用同一个值
 	ctx       context.Context
 	cancel    context.CancelFunc
 	exited    chan struct{}
@@ -177,6 +179,10 @@ type moduleWrapper struct {
 	lifecycle atomic.Int32 // moduleLifecycle，零值即 lifecycleRegistered
 	visible   atomic.Bool  // 动态模块是否已完成登记、可被 ChanRPC 寻址，见 AddDynamicModules
 	seq       uint64
+}
+
+func (w *moduleWrapper) Name() string {
+	return w.name
 }
 
 // lifecycleState 原子读取模块当前生命周期状态。
@@ -251,8 +257,8 @@ func (w *moduleWrapper) waitReady() bool {
 //
 // Register、start 和 AddDynamicModules 共用此构造逻辑，
 // 确保静态与动态模块的 context、退出信号及初始生命周期状态一致。
-func newModuleWrapper(mod IModule) *moduleWrapper {
-	wrapper := &moduleWrapper{IModule: mod, exited: make(chan struct{})}
+func newModuleWrapper(mod IModule, name string) *moduleWrapper {
+	wrapper := &moduleWrapper{IModule: mod, name: name, exited: make(chan struct{})}
 	wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
 	return wrapper
 }

@@ -24,6 +24,7 @@ import (
 //     持锁状态下原子地完成"检查状态 + 追加模块"，避免两个操作分离时出现
 //     TOCTOU 竞态（例如并发调用 Register 与 Run 时都读到 StateNone）
 //   - dynamicModules 使用 sync.Map，原生支持并发增删改查
+//     新增动态模块时还须持有同一把写锁检查静态模块，保证整个 App 内名称唯一
 //   - 信号注册与分发由 signal.Manager 内部的 RWMutex 保护
 type App struct {
 	sm              *signal.Manager
@@ -165,6 +166,8 @@ func (a *App) getChanRPCDynamic(name string) *chanrpc.Server {
 //
 // 静态模块在应用整个生命周期中持续运行，不支持热卸载。
 // 若应用已处于运行或停止状态则返回错误，防止运行时并发修改 modules 切片引发数据竞争。
+// 模块名称必须在本 App 的静态、动态模块之间唯一；整批校验通过后才追加，
+// 任一名称冲突都会返回错误，不会留下部分注册的模块。
 //
 // 状态检查与追加操作在同一把写锁内完成（而非分离为"先读状态、再加锁追加"），
 // 避免 Register 与 Run 并发调用时，两个 goroutine 都读到 StateNone
@@ -177,13 +180,39 @@ func (a *App) Register(mods ...IModule) error {
 		return fmt.Errorf("application is already running")
 	}
 
-	for _, mod := range mods {
+	return a.registerModulesLocked(mods...)
+}
+
+// registerModulesLocked 校验整批静态模块的名称，再一次性登记。
+// 调用方必须持有 a 的写锁；动态模块的名称占位也使用该锁，避免两类注册并发重名。
+func (a *App) registerModulesLocked(mods ...IModule) error {
+	seen := make(map[string]struct{}, len(a.modules)+len(mods))
+	for _, wrapper := range a.modules {
+		seen[wrapper.Name()] = struct{}{}
+	}
+
+	names := make([]string, len(mods))
+	for i, mod := range mods {
 		if mod == nil {
 			continue
 		}
-		a.modules = append(a.modules, newModuleWrapper(mod))
+		name := mod.Name()
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("module %q already exists", name)
+		}
+		// 尚在初始化、还不能被 ChanRPC 寻址的动态模块也占有名称。
+		if _, exists := a.dynamicModules.Load(name); exists {
+			return fmt.Errorf("module %q already exists", name)
+		}
+		seen[name] = struct{}{}
+		names[i] = name
 	}
 
+	for i, mod := range mods {
+		if mod != nil {
+			a.modules = append(a.modules, newModuleWrapper(mod, names[i]))
+		}
+	}
 	return nil
 }
 
@@ -263,11 +292,9 @@ func (a *App) start(mods ...IModule) error {
 		return fmt.Errorf("application cannot start twice, current state: %d", currentState)
 	}
 
-	for _, mod := range mods {
-		if mod == nil {
-			continue
-		}
-		a.modules = append(a.modules, newModuleWrapper(mod))
+	if err := a.registerModulesLocked(mods...); err != nil {
+		a.Unlock()
+		return err
 	}
 	moduleCount := len(a.modules)
 	if moduleCount == 0 {
@@ -816,6 +843,7 @@ type AddDynamicModuleResult struct {
 //   - 支持通过 RemoveDynamicModule 单独卸载，不影响其他模块
 //   - 模块按 Priority 升序初始化，同优先级时保留传入 mods 的参数顺序（稳定排序），
 //     任一失败不会中止后续模块的初始化尝试（已成功初始化的模块不会因后面某个模块失败而回滚）
+//   - 名称必须在本 App 的静态、动态模块之间唯一；冲突模块不会执行 OnInit 或 Serve
 //
 // 返回值为每个非 nil 模块的处理结果列表，调用方可据此精确判断哪些模块
 // 成功、哪些失败及失败原因；若全部成功，err 为 nil，否则 err 汇总了
@@ -841,7 +869,7 @@ func (a *App) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 		}
 		// 复用 newModuleWrapper，而不是手工拼装：wrapper 新增字段（exited、
 		// lifecycle）时不必记得在这里同步一遍，这正是该构造函数存在的意义。
-		wrappers = append(wrappers, newModuleWrapper(mod))
+		wrappers = append(wrappers, newModuleWrapper(mod, mod.Name()))
 	}
 
 	// 动态模块同样按 Priority 稳定排序：同优先级时保留传入顺序，
@@ -864,7 +892,8 @@ func (a *App) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 		// 后写入的那个静默覆盖前一个：被覆盖的 wrapper 从此再无任何引用能触及，
 		// cancel 永不调用、goroutine 连同 LockOSThread 绑定的系统线程永久驻留、
 		// OnDestroy/Close 永不执行，而两个同名模块还在同时对外服务。
-		// LoadOrStore 把"检查 + 占位"合成一个原子操作，彻底消掉这个窗口。
+		// reserveDynamicModule 在同一把 App 写锁内检查静态模块并完成动态占位，
+		// 与 Register/start 互斥，同时防住两类模块之间的名称冲突。
 		//
 		// 占位期间模块尚未就绪，靠 wrapper.visible 挡住对外可见性，
 		// 语义仍是"等模块 Ready 之后 ChanRPC(name) 才查得到它"（见 getChanRPCDynamic）。
@@ -876,9 +905,9 @@ func (a *App) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 		// 内部的相对排序，不要求连续。
 		wrapper.seq = a.dynSeq.Add(1)
 
-		if _, loaded := a.dynamicModules.LoadOrStore(name, wrapper); loaded {
+		if reserveErr := a.reserveDynamicModule(wrapper); reserveErr != nil {
 			wrapper.cancel()
-			fail(fmt.Errorf("dynamic module %q already exists", name))
+			fail(reserveErr)
 			continue
 		}
 
@@ -977,6 +1006,24 @@ func (a *App) AddDynamicModules(mods ...IModule) (results []AddDynamicModuleResu
 		err = fmt.Errorf("dynamic modules init failed: %s", strings.Join(failedNames, ", "))
 	}
 	return results, err
+}
+
+// reserveDynamicModule 将静态名称检查与动态名称占位放在同一临界区。
+// 只在登记期间持锁，业务 OnInit/Serve 不在锁内执行。
+func (a *App) reserveDynamicModule(wrapper *moduleWrapper) error {
+	a.Lock()
+	defer a.Unlock()
+
+	name := wrapper.Name()
+	for _, static := range a.modules {
+		if static.Name() == name {
+			return fmt.Errorf("module %q already exists", name)
+		}
+	}
+	if _, loaded := a.dynamicModules.LoadOrStore(name, wrapper); loaded {
+		return fmt.Errorf("module %q already exists", name)
+	}
+	return nil
 }
 
 // RemoveDynamicModule 同步移除并销毁指定名称的动态模块。

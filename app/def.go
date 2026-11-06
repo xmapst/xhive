@@ -17,6 +17,7 @@ var defaultApp = New()
 // Register 向全局默认应用实例注册静态模块。
 //
 // 必须在 Run 调用之前完成注册。若应用已处于运行状态则返回错误。
+// 模块名称须在本 App 内唯一（包含动态模块）；名称冲突时整批注册失败。
 // 运行中需要动态增减模块请使用 AddDynamicModules 和 RemoveDynamicModule。
 func Register(mods ...IModule) error {
 	return defaultApp.Register(mods...)
@@ -31,6 +32,7 @@ func Register(mods ...IModule) error {
 //
 // 启动失败（如某个模块 OnInit 返回错误）或重复调用时返回非 nil error，
 // 正常收到退出信号并完成优雅关闭时返回 nil。
+// 模块名称冲突会在初始化前返回错误，包含与 Register 或动态加载模块的冲突。
 func Run(mods ...IModule) error {
 	return defaultApp.Run(mods...)
 }
@@ -80,7 +82,7 @@ func DynamicModules() []string {
 // 需要单独处理 err。
 //
 // 两项拒绝规则：
-//   - 名称已被占用的模块会被拒绝，不会覆盖已有模块（此前是静默覆盖，
+//   - 名称已被静态或动态模块占用时会被拒绝，不会覆盖已有模块（此前是静默覆盖，
 //     被覆盖的模块从此无人可达，goroutine 与资源永久泄漏）；
 //   - 应用已经开始关闭（或已关闭）时整批拒绝，避免登记出无人负责销毁的模块。
 //     初始化期间才开始关闭的模块会被就地回滚（执行 OnDestroy → Close）并计为失败。
