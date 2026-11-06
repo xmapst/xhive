@@ -19,7 +19,7 @@ type IModule interface {
 	Name() string
 	// Priority 返回模块启动优先级，值越小越早初始化；优先级相同时保留注册/添加顺序
 	// （静态模块为 Register/Run 的注册顺序，动态模块为 AddDynamicModules 传参顺序），
-	// 关闭顺序与之完全相反（LIFO）。
+	// 关闭顺序与之完全相反（LIFO）。值在登记时固定，初始化时不得修改。
 	Priority() uint
 	// OnInit 执行模块初始化。静态模块失败时终止应用启动；
 	// 动态模块失败记录在 AddDynamicModules 的结果中，并继续尝试后续模块。
@@ -40,6 +40,7 @@ type IModule interface {
 	// 此信号不限制静态模块之间在启动期间提前投递消息。
 	Ready() <-chan struct{}
 	// OnDestroy 执行模块销毁，在模块 goroutine 完全退出之后调用，负责释放所有资源。
+	// 需要在事件循环中排空的模块可实现 StopPreparer，由框架先于取消 Serve 调用。
 	//
 	// **调用前提：OnInit 已经成功返回。** 框架为每个模块维护显式的生命周期
 	// 状态，只对 OnInit 成功的模块调用 OnDestroy；OnInit 从未被调用、
@@ -70,7 +71,7 @@ type IModule interface {
 	// 见 xhive.Skeleton.Close 的说明。
 	//
 	// 与 OnDestroy 成对：只有收到过 OnDestroy 的模块才会收到 Close。
-	// 其中的 panic 由框架 recover 并记录日志，不会中断其余模块的关闭流程。
+	// 其中的 panic 转为清理错误，不会中断其余模块的关闭流程。
 	Close() error
 }
 
@@ -109,7 +110,7 @@ const (
 	lifecycleRegistered moduleLifecycle = iota
 	// lifecycleIniting OnInit 正在执行且尚未返回。
 	// 此状态下模块内存正被 OnInit 所在的 goroutine 写入，
-	// 关闭流程绝不能并发调用 OnDestroy，只能放弃销毁（理由同 shutdownModule 的超时分支）。
+	// 关闭流程通过 initDone 等待初始化实际返回，不能并发调用 OnDestroy。
 	lifecycleIniting
 	// lifecycleInitFailed OnInit 返回了 error。
 	// 按 IModule.OnInit 的契约，OnInit 必须在返回 error 之前自行回滚已分配的部分资源，
@@ -127,7 +128,7 @@ const (
 	// 该状态使"销毁权"具有唯一归属：并发的 stop / RemoveDynamicModule 只有一个能进入销毁流程。
 	lifecycleDestroying
 	// lifecycleDestroyed OnDestroy 与 Close 均已完整执行完毕，模块不可再使用。
-	// 关闭超时被跳过销毁的模块停在 lifecycleDestroying，不会进入本状态。
+	// 仍在初始化或排空的模块保持 lifecycleDestroying，超时不提前进入本状态。
 	lifecycleDestroyed
 )
 
@@ -155,10 +156,9 @@ func (l moduleLifecycle) String() string {
 
 // moduleWrapper 为 IModule 附加框架运行时所需的控制元数据。
 //
-// ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 Serve 应退出主循环；
-// wg 用于等待模块 goroutine 完全退出，保证关闭流程可同步等待完成。
+// ctx/cancel 构成模块停止信号通道：框架通过调用 cancel 通知模块 Serve 应退出主循环。
 //
-// exited 在 serveModule 返回时关闭，用于把"模块 goroutine 已经结束"这件事
+// exited 在 Serve 及框架异常处理返回后关闭，用于把"模块 goroutine 已经结束"这件事
 // 变成可 select 的信号：等待就绪只看 Ready() 是不够的，Serve 若在 close(ready)
 // 之前 panic 或提前 return，ready 永远不会被关闭，等待方会永久挂死。
 //
@@ -167,19 +167,27 @@ func (l moduleLifecycle) String() string {
 //
 // seq 仅动态模块使用：sync.Map.Range 不保证遍历顺序，removeAllDynamicModules
 // 无法像静态模块那样直接依赖切片下标复原"同优先级按 Add 调用顺序"这一约定，
-// 因此在 AddDynamicModules 成功启动时记录一个单调递增序号，倒序关闭时以
+// 因此在 AddDynamicModules 登记名称之前分配一个单调递增序号，倒序关闭时以
 // (Priority, seq) 排序重建真实的添加顺序。静态模块始终为零值，未参与排序。
 type moduleWrapper struct {
-	IModule
-	name      string // 登记时固定名称，名称校验与 RPC 寻址始终使用同一个值
-	ctx       context.Context
-	cancel    context.CancelFunc
-	exited    chan struct{}
-	wg        sync.WaitGroup
-	lifecycle atomic.Int32 // moduleLifecycle，零值即 lifecycleRegistered
-	visible   atomic.Bool  // 动态模块是否已完成登记、可被 ChanRPC 寻址，见 AddDynamicModules
-	seq       uint64
+	IModule                         // 业务模块实例；App 管理其生命周期，模块自身管理业务状态
+	priority     uint               // 构造时固定的优先级，避免排序时读取仍在初始化的业务字段
+	initDone     chan struct{}      // 已开始的 OnInit 结束后由初始化方关闭，清理方据此等待初始化完成
+	initErr      error              // 初始化方写入的结果；清理方必须等待 initDone 关闭后读取
+	shutdownOnce sync.Once          // 合并并发关闭请求，确保每个实例只启动一次后台清理
+	shutdownDone chan struct{}      // 后台清理完成的屏障；动态模块的名称占位释放后才关闭
+	shutdownErr  error              // 后台清理任务写入的最终错误；等待 shutdownDone 关闭后才能读取
+	retiring     atomic.Bool        // 是否已进入关闭流程；立即停止对外寻址，清理完成前仍保留动态名称占位
+	name         string             // 登记时固定名称，名称校验与 RPC 寻址始终使用同一个值
+	ctx          context.Context    // 传给 Serve 的独立生命周期，不随卸载等待者的超时而取消
+	cancel       context.CancelFunc // 框架停止流程调用的取消函数，通知 Serve 退出
+	exited       chan struct{}      // Serve 与框架异常处理结束后的退出信号，不代表资源清理完成
+	lifecycle    atomic.Int32       // moduleLifecycle；启动方通过 CAS 推进，清理方接管后置为销毁状态
+	visible      atomic.Bool        // 动态模块就绪标记；仅为 true 且 retiring 为 false 时可被外部寻址
+	seq          uint64             // 动态名称登记前分配的不可变序号，用于同优先级模块的逆序关闭；静态模块为 0
 }
+
+func (w *moduleWrapper) Priority() uint { return w.priority }
 
 func (w *moduleWrapper) Name() string {
 	return w.name
@@ -202,23 +210,15 @@ func (w *moduleWrapper) setLifecycle(state moduleLifecycle) {
 // advanceLifecycle 仅当模块当前正处于 from 状态时，才把它推进到 to，
 // 返回是否推进成功。
 //
-// 启动路径全程用它而不是 setLifecycle，是为了让"销毁权"真正独占：
-// 启动期收到停止信号时，stop 会对仍在 OnInit 的模块 claimShutdown
-// （Initing → Destroying）并跳过销毁；此刻 OnInit 若返回 nil，用
-// setLifecycle 直写就会把 Destroying 覆盖成 Inited——模块从此停在一个
-// "资源已分配、框架必须销毁"的状态上，而 stop 的 LIFO 循环早已走过它，
-// 再也不会有人来销毁，OnDestroy/Close 永远不执行。
-// 用 CAS 推进则会失败，调用方据此知道模块已被接管，就此收手。
+// 停机可在 OnInit 期间接管状态并等待 initDone；CAS 防止启动方把已接管的
+// Destroying 覆盖回 Inited 或 Serving。推进失败后清理由停止路径继续负责。
 func (w *moduleWrapper) advanceLifecycle(from, to moduleLifecycle) bool {
 	return w.lifecycle.CompareAndSwap(int32(from), int32(to))
 }
 
 // claimShutdown 通过 CAS 抢占模块的销毁权，返回抢占前的状态。
 //
-// 返回 lifecycleDestroying / lifecycleDestroyed 表示销毁权已被别的调用方
-// 拿走（重复 stop、stop 与 RemoveDynamicModule 并发、并发卸载同名动态模块），
-// 调用方必须直接返回，不得再执行 OnDestroy——这使"每个模块的 OnDestroy 与
-// Close 至多各执行一次"成为结构性保证，而不再依赖外层 sync.Once 与 App 状态闸门。
+// shutdownOnce 保证只有一个后台清理任务调用它；CAS 同时阻止启动方继续推进状态。
 func (w *moduleWrapper) claimShutdown() moduleLifecycle {
 	for {
 		state := w.lifecycleState()
@@ -231,34 +231,12 @@ func (w *moduleWrapper) claimShutdown() moduleLifecycle {
 	}
 }
 
-// waitReady 等待模块事件循环就绪，同时监视 Serve goroutine 是否已经退出。
-//
-// 返回 false 表示 goroutine 已经结束而 ready 从未被关闭——Serve 在
-// close(ready) 之前 panic 或提前 return 时就是这种情况。只 select ready 会让
-// 调用方永久阻塞：静态路径因 serveModule 的 os.Exit(255) 掩盖了这一点，
-// 动态路径的 panic 不退出进程，直接表现为 AddDynamicModules 调用方卡死。
-func (w *moduleWrapper) waitReady() bool {
-	select {
-	case <-w.Ready():
-		return true
-	case <-w.exited:
-		// goroutine 已退出，但它可能是在关闭 ready 之后才正常返回的，
-		// 两个 channel 同时就绪时 select 会随机选一个，这里补一次确定性判定。
-		select {
-		case <-w.Ready():
-			return true
-		default:
-			return false
-		}
-	}
-}
-
 // newModuleWrapper 构造 moduleWrapper 并初始化其停止信号 context。
 //
 // Register、start 和 AddDynamicModules 共用此构造逻辑，
 // 确保静态与动态模块的 context、退出信号及初始生命周期状态一致。
 func newModuleWrapper(mod IModule, name string) *moduleWrapper {
-	wrapper := &moduleWrapper{IModule: mod, name: name, exited: make(chan struct{})}
+	wrapper := &moduleWrapper{IModule: mod, name: name, priority: mod.Priority(), exited: make(chan struct{}), initDone: make(chan struct{}), shutdownDone: make(chan struct{})}
 	wrapper.ctx, wrapper.cancel = context.WithCancel(context.Background())
 	return wrapper
 }

@@ -24,6 +24,8 @@
   - [Signal](#signal)
   - [TPStats](#tpstats)
 - [应用生命周期](#应用生命周期)
+  - [通过 context 嵌入运行](#通过-context-嵌入运行)
+  - [预停机接口](#预停机接口)
 - [动态模块](#动态模块)
 - [应用 API](#应用-api)
 - [目录结构](#目录结构)
@@ -38,13 +40,14 @@
 | 特性             | 说明                                                                                                                                                                                                                            |
 |------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Actor 模型       | 每个模块单 goroutine 串行处理事件，降低锁竞争和数据竞争风险。                                                                                                                                                                   |
-| 模块化生命周期   | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序），并严格逆序关闭；动态模块支持运行时加载和卸载。                                                                                                                        |
+| 模块化生命周期   | 静态模块按 `Priority` 升序初始化（同优先级保留注册顺序）；支持预停机排空、动态加载与卸载，清理完成前保留模块名称和依赖。 |
 | ChanRPC          | 进程内 RPC，支持 Cast、AsyncCall、Call、CallWithContext 四种调用语义。                                                                                                                                                          |
 | 本地异步任务     | `AsyncGo` 把一段耗时/阻塞的本地操作挪到独立 goroutine 执行，回调安全带回事件循环；`NewLinearContext` 提供顺序保证的变体。                                                                                                       |
 | 伸缩式有界队列   | RPC、异步返回、定时器事件和本地异步任务回调都走同一套队列：容量按积压动态增长、随空闲收缩，同时保留硬性上限。过载在打满的那一刻就变成可观测的失败或等待，而不是把积压堆进内存直到 OOM；空闲时也不会为一个用不上的上限预留内存。 |
 | 多级时间轮定时器 | 最小粒度 64ms，支持 Timer、Ticker、加速、延迟、改期和取消。                                                                                                                                                                     |
 | 时间跳变保护     | 系统时间回退时内部 tick 基准跟随回退，避免定时器停摆（重扫幂等，不会重复触发）；系统时间跳到未来时逐 tick 推进到当前时间，不跳过中间层级的降级。                                                                                |
-| 信号管理         | 默认处理 SIGINT/SIGTERM 优雅关闭；业务可注册 SIGHUP 等非保留信号。                                                                                                                                                              |
+| 应用入口         | `Run` 处理 SIGINT/SIGTERM 并优雅关闭；`RunContext` 由外部 context 控制，适合嵌入已有服务。 |
+| 信号管理         | 使用 `Run` 时默认监听进程信号；业务可注册 SIGHUP 等非保留信号。 |
 | 耗时统计         | Skeleton 自动记录 RPC、异步回调和定时器处理耗时，每 15 分钟（附 30s~60s 随机抖动错峰）dump 一次 TP 分位，模块关闭时再 dump 最后一次。                                                                                           |
 | 零外部依赖       | 仅依赖 Go 标准库。                                                                                                                                                                                                              |
 
@@ -192,11 +195,11 @@ type IModule interface {
 
 生命周期约定：
 
-1. 静态模块按 `Priority()` 升序执行 `OnInit`，同优先级时保留注册顺序（稳定排序）。
+1. 静态模块按 `Priority()` 升序执行 `OnInit`，同优先级时保留注册顺序（稳定排序）。名称和优先级在登记时固定，不能在初始化中修改。
 2. 任一静态模块 `OnInit` 失败，应用启动失败。框架随后只对**已成功 `OnInit`** 的模块执行 `OnDestroy` → `Close`：`OnInit` 返回了 error 的模块（它必须在返回前自行回滚已分配的资源）、以及排在它之后一次都没被 `OnInit` 过的模块，都不会收到 `OnDestroy`/`Close`。
-3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`；进入事件循环前关闭 `Ready()` 返回的 channel。框架只在两处等待该信号：`start` 等全部静态模块 `Ready` 后才把状态置为 `AppStateRun`，`AddDynamicModules` 等模块 `Ready` 后才将模块表中的占位条目标记为可见（在此之前 `ChanRPC(name)` 查不到它）。静态模块的 goroutine 是并发启动的，框架不会阻止已就绪模块向尚未就绪的模块发起调用；`Priority` 只决定 `OnInit` 的先后，不保证 `Serve` 就绪的先后。
-4. `OnDestroy` 用于释放业务资源。**静态模块与动态模块走同一条关闭路径**：`cancel` → 等待 `Serve` 退出（受关闭超时保护）→ `OnDestroy` → `Close`。此时事件循环已停，不能再对本模块自投递（见 `app.IModule.OnDestroy` 的说明），`Close` 释放出站 client 资源。动态模块由 `RemoveDynamicModule` 先把自己从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走上述同一流程。
-5. 逃出 `Serve` 主循环的 panic：静态模块记录堆栈后以退出码 `255` 终止进程，动态模块只记录日志；`start`（含静态模块 `OnInit`）期间的 panic 同样以 `255` 退出。`OnDestroy` 与 `Close` 期间的 panic 都由框架统一 recover，静态、动态模块都只记日志并继续后续关闭流程。
+3. `Serve` 在模块独立 goroutine 中运行，应响应 `ctx.Done()`；进入事件循环前关闭模块 `Ready()` 返回的 channel。全部静态模块就绪后，应用进入 `StateRun` 并关闭 `App.Ready()`；动态模块就绪后才对 RPC 寻址、统计和模块列表公开。每次等待模块就绪默认最多 30 秒，可通过 `WithStartupTimeout` 调整；该选项不限制 `OnInit`。静态模块的 goroutine 并发启动，框架不会阻止已就绪模块向尚未就绪的模块发起调用；`Priority` 只决定 `OnInit` 的先后，不保证 `Serve` 就绪的先后。
+4. 静态模块与动态模块共用关闭路径：已就绪模块先执行可选的 `PrepareStop`，再取消 context → 等待 `Serve` **实际退出** → `OnDestroy` → `Close`。`OnDestroy` 中事件循环已停，不能再对本模块自投递；`Close` 释放出站 client 等资源。动态卸载开始后立即停止对外寻址，但名称保留到清理完成。详见[应用生命周期](#应用生命周期)和[动态模块](#动态模块)。
+5. 默认情况下，应用启动期间或静态模块 `Serve` 中的 panic 会以退出码 `255` 终止进程；使用 `WithPanicExit(false)` 后转为错误，并有序清理。静态模块未经框架取消就提前退出（包括正常返回）也会触发应用关闭并返回错误。动态模块 `Serve` 的 panic 只记录日志；动态 `OnInit` 的 panic 默认向调用方传播，关闭 panic 退出策略后转为添加失败。`OnDestroy` 与 `Close` 的 panic 转为清理错误，不中断其他模块的清理；`Run`、`RunContext` 或等待卸载的调用方会收到相应错误。
 
 ### Skeleton
 
@@ -380,7 +383,7 @@ m.NewTimer("heartbeat", time.Second, timer.WithTicker())
 
 ### Signal
 
-`signal` 包提供 `signal.Manager` 和处理函数类型 `signal.Trap`。`app.App` 内部使用 `signal.NewManager()` 创建信号管理器，在 `Run` 中启动监听，关闭应用后停止监听。
+`signal` 包提供 `signal.Manager` 和处理函数类型 `signal.Trap`。`app.App` 内部使用 `signal.NewManager()` 创建信号管理器，在 `Run` 中启动监听，关闭应用后停止监听。`RunContext` 不启动信号监听，由调用方通过 context 控制应用生命周期。
 
 框架默认信号行为：
 
@@ -423,30 +426,83 @@ Skeleton 会自动统计定时器事件、RPC 请求、异步 RPC 回调和本�
 以下状态常量均定义在 `app` 包中，可通过 `app.State()` 或应用实例的 `State()` 方法读取。
 
 ```text
-AppStateNone
-    │ Run
+StateNone
+    │ Run / RunContext
     ▼
-AppStateInit
-    │ 所有静态模块 OnInit 成功        │ 任一 OnInit 失败
+StateInit
+    │ 所有静态模块 OnInit 成功且就绪  │ 启动失败
     ▼                                │
-AppStateRun                          │
-    │ 收到 SIGINT / SIGTERM          │
+StateRun（关闭 App.Ready）            │
+    │ 退出信号 / context 取消         │
+    │ / 静态模块异常退出              │
     ▼                                ▼
-AppStateStop
-    │ 关闭动态模块，再逆序关闭静态模块
+StateStop
+    │ 冻结静态控制入口 → 关闭动态模块 → 逆序关闭静态模块
     ▼
-AppStateNone
+StateNone
 ```
 
 关闭流程：
 
-1. 进入 `AppStateStop`。
-2. 关闭所有动态模块。
-3. 按启动顺序（`Priority` 升序，同优先级保留注册顺序）整体逆序关闭静态模块（LIFO）。
-4. 每个模块先取消 context 并等待 goroutine 退出，再执行 `OnDestroy`，最后调用 `Close` 释放出站 client。只有 `OnInit` 成功返回过的模块参与这一步（启动中途失败时，未初始化的模块只会被关掉 ChanRPC 服务端，不收 `OnDestroy`/`Close`）。
-5. 等待单个模块 `Serve` 退出的超时默认为 30 分钟，静态与动态模块同样受此保护；超时不强杀，仅记录错误日志，并跳过该模块的 `OnDestroy` 与 `Close`。通过 `app.New(app.WithShutdownTimeout(d))` 可为新应用实例调整该超时；它不限制 `OnDestroy` 和 `Close` 自身的执行时间。
-6. 全部关闭后回到 `AppStateNone`。注意此时**不支持再次启动**——`start` 会检查模块生命周期状态并明确拒绝，需要重启请新建模块实例与新的 `app.App`。
-7. 关闭若发生在启动尚未完成时（例如启动期收到 SIGTERM），框架先等 `start` 收敛（默认上限 5 秒，独立于模块关闭超时）再开始销毁，避免 `OnDestroy` 与仍在执行的 `OnInit` 并发读写同一批业务内存；超时兜底放行时，仍在 `OnInit` 中的那个模块会被跳过销毁（它的资源由 `OnInit` 自己负责，框架会记一条 error）。
+1. 进入 `StateStop`，拒绝新增动态模块。
+2. 对已经就绪且实现 `Quiescer` 的静态模块，按逆启动顺序执行 `Quiesce`，先冻结创建、修改或启停动态模块的控制入口。
+3. 完整关闭所有动态模块，包括仍在初始化或后台清理的实例；按优先级和登记序号倒序等待它们清理完成。
+4. 按启动顺序（`Priority` 升序，同优先级保留注册顺序）整体逆序关闭静态模块。已启动且就绪的模块若实现 `StopPreparer`，先执行 `PrepareStop`；成功后才取消 context、等待 `Serve` 实际退出，再执行 `OnDestroy` → `Close`。只对 `OnInit` 成功返回过的模块执行 `OnDestroy`/`Close`，未运行的服务端队列则由框架关闭并拒绝积压请求。
+5. 单次排空和退出等待默认 30 分钟，可通过 `WithShutdownTimeout` 调整。等待超时后记录告警并继续等待，**不会跳过清理、释放名称或提前关闭依赖**。该时间也用作每次预停机调用的 context 超时；钩子必须主动响应 context，框架不会强杀 goroutine，也不限制 `OnDestroy`、`Close` 自身的执行时间。
+6. 启动过程中收到停止请求时，框架先等待启动收敛（默认最多 5 秒），随后进入各模块的清理屏障。仍在执行的 `OnInit` 必须实际返回后才能继续清理，避免初始化与销毁并发；成功后销毁，失败则按 `OnInit` 契约自行回滚。等待期间保留它所依赖的模块。
+7. 全部清理完成后回到 `StateNone`，`Run`/`RunContext` 返回运行和清理错误的汇总；正常关闭返回 nil。同一个 `App` 不允许并发或重入运行，**停止后也不支持再次启动**，需要重启时新建应用和模块实例。
+
+### 通过 context 嵌入运行
+
+以下代码使用快速开始中的 `NewPonger`，由宿主控制退出，无需注册进程信号：
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+application := app.New(
+	app.WithOSThreadLock(false),
+	app.WithPanicExit(false),
+	app.WithStartupTimeout(10*time.Second),
+	app.WithShutdownTimeout(time.Minute),
+)
+done := make(chan error, 1)
+go func() {
+	done <- application.RunContext(ctx, NewPonger())
+}()
+
+select {
+case <-application.Ready():
+	slog.Info("application ready")
+case err := <-done:
+	// 启动失败时 Ready 可能不会关闭，必须同时等待运行结果。
+	return err
+}
+
+// 宿主需要停止应用时取消 context，并等待实际清理完成。
+cancel()
+return <-done
+```
+
+这段代码应放在返回 `error` 的函数内，并导入 `context`、`log/slog` 和 `time`。context 在调用前已取消时，`RunContext` 直接返回 `ctx.Err()`；运行期间取消用于发起关闭，正常清理完成后返回 nil。`App.Ready()` 是一次性启动信号，不代表应用此后一直可用，运行期间仍需观察 `done`。
+
+### 预停机接口
+
+模块可按需实现两个可选接口，无需修改 `IModule`：
+
+```go
+type Quiescer interface {
+	Quiesce(context.Context) error
+}
+
+type StopPreparer interface {
+	PrepareStop(context.Context) error
+}
+```
+
+`Quiesce` 用于静态控制模块冻结入口；动态模块仍依赖的共享服务应在 `PrepareStop` 中排空，避免过早关闭。`PrepareStop` 执行期间，框架尚未取消该模块的 `Serve`，可以通过事件循环停止生产者、等待回执和持久化剩余工作。若 `Serve` 已经异常退出，钩子也必须能等待后台任务结束。
+
+钩子由框架的关闭流程调用，不在业务事件循环内执行；涉及模块状态时应通过消息把操作交给状态所有者，不能直接并发读写业务字段。两个钩子都必须响应传入 context，并支持重复调用：返回错误或发生 panic 后，框架会限频记录告警并重试，直到成功；在此之前不会继续销毁该模块及后续依赖。
 
 ---
 
@@ -477,15 +533,26 @@ _ = removed
 动态模块特性：
 
 - `AddDynamicModules` 按 `Priority` 升序（同优先级保留传参顺序）依次执行 `OnInit`，成功后启动 `Serve`，并等待模块 `Ready()` 后才对 RPC 寻址、统计和模块列表公开。初始化前先在动态模块表中占住名称，重名模块会被直接拒绝，不会覆盖已有模块；应用已进入关闭流程后调用会整体拒绝，避免登记出无人负责关闭的模块。
-- `RemoveDynamicModule` 先把模块从模块表原子摘除（此后 `ChanRPC(name)` 立刻查不到它），再走与静态模块完全相同的关闭路径：取消 context → 等待 goroutine 退出（受关闭超时保护）→ `OnDestroy` → `Close`。并发卸载同名模块时只有一个调用方会执行销毁。返回值表示销毁是否**真的完整走完**：模块不存在返回 `false`，等待 goroutine 退出超时、框架跳过 `OnDestroy`/`Close` 时同样返回 `false`——此时资源并未释放，且模块已被摘出模块表，不要立刻用同名模块重新加载。
-- 动态模块 `Serve`、`OnDestroy` 与 `Close` 中的 panic 会被捕获，不会退出进程；`OnInit` 在调用方 goroutine 上同步执行，其 panic 不被框架捕获。
+- `RemoveDynamicModule` 开始卸载后停止对外寻址，并等待清理完成，等待上限为 `WithShutdownTimeout`。模块不存在、尚未就绪、等待超时或清理出错时返回 `false`。超时只结束调用方等待，后台仍继续清理，名称保留到清理实际结束；此期间同名添加会被拒绝。
+- 实例方法 `RemoveDynamicModuleContext(ctx, name)` 允许调用方指定等待期限：已不存在的模块返回 nil，未就绪且尚未进入清理的模块返回错误；等待期间 context 取消则返回 `ctx.Err()`。重复或并发卸载同一实例会等待同一次清理，不会重复销毁。动态启动等待就绪失败后也由后台清理接管，不能因添加失败就提前复用名称。
+- 动态模块 `Serve` 中的 panic 会被捕获并记录，不退出进程；`OnDestroy` 与 `Close` 的 panic 转为清理错误。`OnInit` 在调用方 goroutine 上同步执行，默认向调用方传播 panic；`WithPanicExit(false)` 将其转为该模块添加失败。
 - 批量添加中途失败时，已经启动的动态模块不会自动回滚；`OnInit` 失败的那个模块不会收到 `OnDestroy`/`Close`（须由 `OnInit` 自行回滚），与静态模块语义一致。
+
+需要区分卸载失败原因或重试等待时，使用同一应用实例：
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+if err := application.RemoveDynamicModuleContext(ctx, "activity"); err != nil {
+	slog.Error("dynamic module removal incomplete", slog.Any("error", err))
+}
+```
 
 ---
 
 ## 应用 API
 
-`app` 包的 `Register`、`Run`、`State` 等函数操作同一个默认应用实例。需要独立实例或自定义关闭超时时，使用 `app.New(opts ...app.AppOption) *app.App`，随后调用实例上的同名方法；包级函数仍操作默认实例。
+`app` 包的 `Register`、`Run`、`State` 等函数操作同一个默认应用实例。需要独立实例或自定义选项时，使用 `app.New(opts ...app.Option) *app.App`，随后调用实例上的方法；包级函数仍操作默认实例。`RunContext`、`Ready` 和 `RemoveDynamicModuleContext` 仅提供实例方法，不能通过包级函数调用；独立应用内的 RPC 寻址也应使用该实例的 `ChanRPC`。
 
 例如，使用快速开始中的 `Ponger` 创建独立应用：
 
@@ -498,16 +565,30 @@ if err := application.Run(NewPonger()); err != nil {
 
 | API                                                                                            | 说明                                                                                           |
 |------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| `app.New(opts ...app.AppOption) *app.App`                                                      | 创建独立应用实例，可传入 `app.WithShutdownTimeout(d)`。                                        |
+| `app.New(opts ...app.Option) *app.App`                                                         | 创建独立应用实例，选项仅影响该实例。 |
 | `app.Register(mods ...app.IModule) error`                                                      | 启动前注册静态模块。                                                                           |
-| `app.Run(mods ...app.IModule) error`                                                           | 注册并启动应用，阻塞至收到退出信号并完成关闭；启动失败或重复调用时返回 error。                 |
+| `app.Run(mods ...app.IModule) error`                                                           | 注册并启动应用、监听进程信号，关闭完成后返回；启动、运行或清理失败时返回 error。 |
+| `(*app.App).RunContext(ctx context.Context, mods ...app.IModule) error`                         | 由 context 控制运行，不监听进程信号，等待有序清理完成后返回。 |
+| `(*app.App).Ready() <-chan struct{}`                                                          | 全部静态模块就绪并进入 `StateRun` 后关闭的一次性信号。 |
 | `app.State() int32`                                                                            | 返回当前应用状态。                                                                             |
 | `app.Stats() string`                                                                           | 返回所有模块 RPC 队列积压统计。                                                                |
 | `app.ChanRPC(name string) *chanrpc.Server`                                                     | 按模块名获取 ChanRPC 服务端。                                                                  |
-| `app.DynamicModules() []string`                                                                | 返回当前动态模块名称列表。                                                                     |
+| `app.DynamicModules() []string`                                                                | 返回已就绪且未进入卸载的动态模块名称列表。 |
 | `app.AddDynamicModules(mods ...app.IModule) (results []app.AddDynamicModuleResult, err error)` | 添加并启动动态模块；`results` 给出逐个模块的结果，模块添加失败或关闭期间整批拒绝时返回 error。 |
-| `app.RemoveDynamicModule(name string) bool`                                                    | 同步卸载动态模块。                                                                             |
+| `app.RemoveDynamicModule(name string) bool`                                                    | 卸载动态模块，在关闭等待上限内完成且无清理错误时返回 true。 |
+| `(*app.App).RemoveDynamicModuleContext(ctx context.Context, name string) error`                | 等待动态模块清理，context 超时后后台清理继续；模块已不存在时返回 nil。 |
 | `app.RegisterSignal(trap signal.Trap, sigs ...os.Signal) error`                                | 注册非保留信号处理器。                                                                         |
+
+构造选项：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `app.WithStartupTimeout(d)` | 30 秒 | 每次等待模块 `Ready` 的上限，不限制 `OnInit`。 |
+| `app.WithShutdownTimeout(d)` | 30 分钟 | 预停机调用的 context 期限、退出等待的告警周期，以及 `RemoveDynamicModule` 的等待上限；全应用关闭持续等待实际清理完成。 |
+| `app.WithOSThreadLock(enabled)` | true | 是否为每个模块的 `Serve` 绑定专用 OS 线程；纯 Go 服务可关闭。 |
+| `app.WithPanicExit(enabled)` | true | 是否在应用启动或静态 `Serve` panic 时终止进程；false 时返回错误并有序清理，动态 `OnInit` panic 转为添加失败。 |
+
+两个超时选项收到 `d <= 0` 时不覆盖已有配置。卸载调用的 context 只限制等待者；`RunContext` 在取消后仍等待清理完成，预停机 context 则需要钩子主动响应。它们都不能强制终止业务代码。
 
 根包的 goroutine 工具：
 
@@ -520,10 +601,10 @@ if err := application.Run(NewPonger()); err != nil {
 
 | 常量               | 说明                                                     |
 |--------------------|----------------------------------------------------------|
-| `app.AppStateNone` | 应用未启动或已完全停止；已停止的应用**不支持再次启动**。 |
-| `app.AppStateInit` | 应用正在初始化。                                         |
-| `app.AppStateRun`  | 应用运行中。                                             |
-| `app.AppStateStop` | 应用正在关闭。                                           |
+| `app.StateNone` | 应用未启动或已完全停止；已停止的应用**不支持再次启动**。 |
+| `app.StateInit` | 应用正在初始化。 |
+| `app.StateRun`  | 所有静态模块就绪，应用运行中。 |
+| `app.StateStop` | 应用正在关闭。 |
 
 ---
 
@@ -534,8 +615,9 @@ xhive/
 ├── skeleton.go         # Skeleton、RPC/Timer/Async 接口与事件循环
 ├── safego.go           # SafeGo / SafeGoContext，带 panic 恢复的 goroutine
 ├── app/
-│   ├── def.go          # 默认应用的包级 API、应用状态、AppOption
+│   ├── def.go          # 默认应用的包级 API、应用状态、Option
 │   ├── app.go          # App、New、应用启停与动态模块管理
+│   ├── context.go      # context 入口、就绪通知、预停机接口与清理屏障
 │   └── module.go       # IModule、模块生命周期状态与运行时包装
 ├── chanrpc/
 │   ├── def.go          # 消息 ID、CallInfo、RetInfo、CallOption、Hold/Replier
@@ -583,13 +665,14 @@ go test -race ./...
 
 当前测试覆盖重点：
 
+- app：名称唯一性、并发注册、启动失败、context 取消、控制入口冻结与动态模块排空顺序、初始化与关闭交接、卸载和启动超时期间的名称保留、依赖存活、预停机重试、异常退出和 panic 返回。
 - chanrpc：消息 ID、注册校验、Cast、AsyncCall、Call、metadata、`Hold` 延迟响应、panic 恢复、关闭语义、队列打满时的失败/阻塞/丢包与计数回滚。
 - timer：时间轮放置、tick 推进、时钟前移和后移、取消、更新、同 ID 替换、到期队列打满时的重试、Manager one-shot 和 ticker。
 - internal/async：并发提交、`LinearContext` 顺序保证（含并发提交方）、`Close` 正常排空与超时放弃、无消费者时回调队列不阻塞、panic 恢复。
 - internal/queue：FIFO 顺序、扩容与收缩、打满即拒绝、阻塞入队的取消与唤醒、关闭后的拒绝与排空、出队后解除引用、边沿信号不丢唤醒、多生产者多消费者并发。
 - stat：分位统计、TopN、Reset、零值 key 忽略、并发 Add 和 Dump。
 
-根包 `xhive`、`app` 和 `signal` 当前没有测试文件。
+根包 `xhive` 和 `signal` 当前没有测试文件。
 
 ---
 
@@ -657,17 +740,17 @@ Ticker 续期以上次 deadline 为基准，而不是以当前时间为基准，
 
 ### 模块的启动顺序怎么控制？
 
-由 `app.IModule.Priority() uint` 决定：值越小越早初始化，优先级相同时保留注册顺序（静态模块为 `Register`/`Run` 的传参顺序，动态模块为 `AddDynamicModules` 的传参顺序）。关闭顺序与启动顺序完全相反（LIFO），保证被依赖模块最后销毁。内嵌 `Skeleton` 时 `Priority` 默认返回 0，需要靠后启动的模块自行覆盖该方法。
+由 `app.IModule.Priority() uint` 决定，名称和优先级在登记时固定：值越小越早初始化，优先级相同时保留注册顺序（静态模块为 `Register`/`Run` 的传参顺序，动态模块为单次 `AddDynamicModules` 的传参顺序）。应用关闭时先冻结静态控制入口，再关闭全部动态模块，最后逆序关闭静态模块；动态模块内部按优先级和登记序号倒序关闭。共享依赖应作为较早启动的静态模块。内嵌 `Skeleton` 时 `Priority` 默认返回 0，需要靠后初始化的模块自行覆盖该方法；它不保证各模块 `Serve` 就绪的先后。
 
 ### 动态模块和静态模块有什么区别？
 
-静态模块随应用启停，不支持运行时卸载，逃出 `Serve` 主循环的 panic 会以退出码 `255` 终止进程。动态模块支持运行时加载和卸载，同样位置的 panic 只记录日志。两者的 ChanRPC handler、异步回调、定时器回调、`OnDestroy` 和 `Close` 都由框架各自 recover，只记录日志（handler panic 还会回包错误），不会退出进程。
+静态模块随应用启停，不支持运行时卸载；`Serve` panic 默认以退出码 `255` 终止进程，`WithPanicExit(false)` 时触发有序关闭并返回错误。动态模块支持运行时加载和卸载，`Serve` panic 只记录日志。两者的 ChanRPC handler、异步回调和定时器回调中的 panic 由组件捕获，handler panic 还会回包错误；`OnDestroy` 和 `Close` panic 转为清理错误，并继续清理其他模块。
 
 ### 模块关闭超时了会怎样？
 
-框架等待单个模块 `Serve` 退出的上限默认是 30 分钟，可通过 `app.New(app.WithShutdownTimeout(d))` 为新应用实例调整；静态模块与动态模块（含 `RemoveDynamicModule` 卸载）都受这一保护。超时后不强杀，但会记录一条 error 并跳过该模块的 `OnDestroy` 和 client 释放——此时事件循环仍在运行，调 `OnDestroy` 会与它并发读写同一批业务内存，触发 Go 运行时不可 recover 的 fatal。因此 `Serve` 必须能及时响应 `ctx.Done()`，否则依赖 `OnDestroy` 的落地逻辑整段不会执行。
+默认每 30 分钟记录退出等待告警，可通过 `app.New(app.WithShutdownTimeout(d))` 调整。全应用关闭会继续等待模块实际退出，清理完成前保留名称和依赖，不会强杀 goroutine，也不会跳过 `OnDestroy`/`Close`。`RemoveDynamicModule` 等待超时返回 false，`RemoveDynamicModuleContext` 在调用方 context 取消时返回 `ctx.Err()`；两者都不会终止后台清理，后续卸载请求可继续等待同一次清理。
 
-注意该超时只覆盖"等待模块 goroutine 退出"这一步，覆盖不到 `OnDestroy` 自身的执行。所以 `OnDestroy` 里跨模块投递请用 `Cast`/`AsyncCall` 或带超时的 `CallWithContext`，不要用同步 `Call`：启动中途失败时对端的事件循环可能一次都没跑过，回包永远不会产生，同步 `Call` 会让整个停机流程永久卡住。
+`Serve` 必须及时响应 `ctx.Done()`，预停机钩子必须响应传入 context，否则停机可能持续等待。关闭超时也不限制 `OnDestroy`/`Close` 自身执行时间。`OnDestroy` 里跨模块投递请用 `Cast`/`AsyncCall` 或带超时的 `CallWithContext`，不要用无限等待的同步 `Call`：启动中途失败时对端事件循环可能尚未运行。需要本模块事件循环参与的回执和排空，应在 `PrepareStop` 中完成。
 
 ### 延迟响应如何使用？
 
