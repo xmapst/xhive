@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -129,21 +128,23 @@ func (c *Client) IsClosed() bool {
 //
 // 将 nil 检查、关闭状态检查、消息名解析等公共逻辑收敛到此处，
 // 避免在 Call/AsyncCall/Cast 三处入口中分散重复相同的校验代码。
-func (c *Client) check(svr *Server, request any) (uint32, error) {
-	if svr == nil {
-		return 0, ErrServerNil
-	}
-	if svr.IsClosed() {
-		return 0, ErrServerClosed
-	}
-	if c.IsClosed() {
-		return 0, ErrClientClosed
-	}
+func (c *Client) check(svr *Server, request any) (uint32, string, error) {
+	name := Name(request)
 	id := ID(request)
 	if id == 0 {
-		return 0, ErrInvalidMsgType
+		return 0, name, ErrInvalidMsgType
 	}
-	return id, nil
+	if svr == nil {
+		return id, name, ErrServerNil
+	}
+	if svr.IsClosed() {
+		return id, name, ErrServerClosed
+	}
+	if c.IsClosed() {
+		return id, name, ErrClientClosed
+	}
+
+	return id, name, nil
 }
 
 // Call 向指定 Server 发起同步 RPC 调用，阻塞等待处理结果后返回。
@@ -180,9 +181,13 @@ func (c *Client) Call(svr *Server, request any, opts ...CallOption) *RetInfo {
 // 警告：在事件循环中使用 CallWithContext 会阻塞本模块对其他消息的处理；
 // 若对端模块同时向本模块发起 Call，则形成循环等待（死锁），生产环境应优先使用 AsyncCall。
 func (c *Client) CallWithContext(ctx context.Context, svr *Server, request any, opts ...CallOption) *RetInfo {
-	id, err := c.check(svr, request)
+	id, name, err := c.check(svr, request)
 	if err != nil {
-		slog.Warn("chanrpc sync call failed", slog.Any("id", id), slog.Any("error", err))
+		slog.Warn("chanrpc sync call failed",
+			slog.Any("id", id),
+			slog.String("name", name),
+			slog.Any("error", err),
+		)
 		return &RetInfo{Err: err}
 	}
 	o := c.applyOpts(opts...)
@@ -190,12 +195,17 @@ func (c *Client) CallWithContext(ctx context.Context, svr *Server, request any, 
 	chanRet := newSyncRet()
 	err = c.call(ctx, svr, &CallInfo{
 		id:       id,
+		name:     name,
 		Request:  request,
 		chanRet:  chanRet,
 		metadata: o.metadata,
 	}, true)
 	if err != nil {
-		slog.Warn("chanrpc sync call failed", slog.Any("id", id), slog.Any("error", err))
+		slog.Warn("chanrpc sync call failed",
+			slog.Any("id", id),
+			slog.String("name", name),
+			slog.Any("error", err),
+		)
 		return &RetInfo{Err: err}
 	}
 
@@ -206,10 +216,17 @@ func (c *Client) CallWithContext(ctx context.Context, svr *Server, request any, 
 		case ri := <-chanRet:
 			return ri
 		case <-ctx.Done():
-			slog.Warn("chanrpc call canceled", slog.Any("id", id), slog.Any("error", ctx.Err()))
+			slog.Warn("chanrpc call canceled",
+				slog.Any("id", id),
+				slog.String("name", name),
+				slog.Any("error", ctx.Err()),
+			)
 			return &RetInfo{Err: ctx.Err()}
 		case <-tick.C:
-			slog.Warn("chanrpc call timeout", slog.Any("id", id))
+			slog.Warn("chanrpc call timeout",
+				slog.Any("id", id),
+				slog.String("name", name),
+			)
 		}
 	}
 }
@@ -228,9 +245,13 @@ func (c *Client) AsyncCall(svr *Server, request any, callback Callback, opts ...
 		return ErrCallbackNil
 	}
 
-	id, err := c.check(svr, request)
+	id, name, err := c.check(svr, request)
 	if err != nil {
-		slog.Warn("chanrpc async call failed", slog.Any("id", id), slog.Any("error", err))
+		slog.Warn("chanrpc async call failed",
+			slog.Any("id", id),
+			slog.String("name", name),
+			slog.Any("error", err),
+		)
 		return err
 	}
 	o := c.applyOpts(opts...)
@@ -241,6 +262,7 @@ func (c *Client) AsyncCall(svr *Server, request any, callback Callback, opts ...
 	c.pendingAsyncCall.Add(1)
 	err = c.call(context.Background(), svr, &CallInfo{
 		id:       id,
+		name:     name,
 		Request:  request,
 		chanRet:  asyncRet{c}, // 共享异步回调队列，回调由事件循环统一消费
 		callback: callback,
@@ -248,7 +270,11 @@ func (c *Client) AsyncCall(svr *Server, request any, callback Callback, opts ...
 	}, false)
 	if err != nil {
 		c.pendingAsyncCall.Add(-1)
-		slog.Warn("chanrpc async call failed", slog.Any("id", id), slog.Any("error", err))
+		slog.Warn("chanrpc async call failed",
+			slog.Any("id", id),
+			slog.String("name", name),
+			slog.Any("error", err),
+		)
 		return err
 	}
 
@@ -263,10 +289,14 @@ func (c *Client) AsyncCall(svr *Server, request any, callback Callback, opts ...
 // Server 处理后直接丢弃结果，不产生任何回调开销。
 // 对 ErrServerNil 不打 warn 日志：允许对端模块尚未就绪时静默丢弃，避免大量误报。
 func (c *Client) Cast(svr *Server, request any, opts ...CallOption) {
-	id, err := c.check(svr, request)
+	id, name, err := c.check(svr, request)
 	if err != nil {
 		if !errors.Is(err, ErrServerNil) {
-			slog.Warn("chanrpc cast failed", slog.Any("id", id), slog.Any("error", err))
+			slog.Warn("chanrpc cast failed",
+				slog.Any("id", id),
+				slog.String("name", name),
+				slog.Any("error", err),
+			)
 		}
 		return
 	}
@@ -274,12 +304,17 @@ func (c *Client) Cast(svr *Server, request any, opts ...CallOption) {
 
 	err = c.call(context.Background(), svr, &CallInfo{
 		id:       id,
+		name:     name,
 		Request:  request,
 		metadata: o.metadata,
 		// chanRet 和 callback 均为 nil，Server 端处理后不回包
 	}, false)
 	if err != nil {
-		slog.Warn("chanrpc cast failed", slog.Any("id", id), slog.Any("error", err))
+		slog.Warn("chanrpc cast failed",
+			slog.Any("id", id),
+			slog.String("name", name),
+			slog.Any("error", err),
+		)
 	}
 }
 
@@ -289,7 +324,10 @@ func (c *Client) Cast(svr *Server, request any, opts ...CallOption) {
 func (c *Client) execCallback(ri *RetInfo) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("chanrpc callback panic", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+			slog.Error("chanrpc callback panic",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
 		}
 	}()
 
@@ -426,16 +464,15 @@ func (c *Client) call(ctx context.Context, svr *Server, ci *CallInfo, block bool
 		return ErrCallInfoNil
 	}
 
-	reqType := "unknown"
-	if ci.Request != nil {
-		reqType = reflect.TypeOf(ci.Request).String()
-	}
-
 	enqueued := false
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v\n%s", r, string(debug.Stack()))
-			slog.Warn("chanrpc call panic", slog.String("req_type", reqType), slog.Any("error", err))
+			slog.Warn("chanrpc call panic",
+				slog.Any("id", ci.ID()),
+				slog.String("name", ci.Name()),
+				slog.Any("error", err),
+			)
 		}
 		if !enqueued {
 			svr.pending.Add(-1) // 没进队列，把上面预加的那一笔撤销
@@ -460,8 +497,8 @@ func (c *Client) call(ctx context.Context, svr *Server, ci *CallInfo, block bool
 	}
 
 	if !block {
-		return fmt.Errorf("%w: id=%d type=%s len=%d cap=%d",
-			ErrChanFull, ci.id, reqType, svr.chanCall.Len(), svr.chanCall.Cap())
+		return fmt.Errorf("%w: id=%d name=%s len=%d cap=%d",
+			ErrChanFull, ci.ID(), ci.Name(), svr.chanCall.Len(), svr.chanCall.Cap())
 	}
 
 	// 阻塞模式下仍然周期性告警：队列打满是个需要被看见的事故，
@@ -477,7 +514,11 @@ func (c *Client) call(ctx context.Context, svr *Server, ci *CallInfo, block bool
 			return ctx.Err()
 		case <-tick.C:
 			slog.Warn("chanrpc call blocked on full server channel",
-				slog.String("req_type", reqType), slog.Int("len", svr.chanCall.Len()), slog.Int("cap", svr.chanCall.Cap()))
+				slog.Any("id", ci.ID()),
+				slog.String("name", ci.Name()),
+				slog.Int("len", svr.chanCall.Len()),
+				slog.Int("cap", svr.chanCall.Cap()),
+			)
 			continue
 		}
 

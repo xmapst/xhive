@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
@@ -152,15 +151,17 @@ func (s *Server) Register(message any, f Handler) error {
 		return ErrRegisterHandlerNil
 	}
 	id := ID(message)
+	name := Name(message)
+
 	if id == 0 {
-		return fmt.Errorf("chanrpc register: invalid message type %v", reflect.TypeOf(message))
+		return fmt.Errorf("chanrpc register: invalid message name %v", name)
 	}
 
 	if _, ok := s.functions[id]; ok {
-		slog.Error("duplicate message", slog.Any("id", id), slog.Any("type", reflect.TypeOf(message)))
-		return fmt.Errorf("chanrpc register: id=%d type=%v already registered", id, reflect.TypeOf(message))
+		slog.Error("duplicate message", slog.Any("id", id), slog.String("name", name))
+		return fmt.Errorf("chanrpc register: id=%d name=%v already registered", id, name)
 	}
-	slog.Info("chanrpc register", slog.Any("id", id))
+	slog.Info("chanrpc register", slog.Any("id", id), slog.String("name", name))
 	s.functions[id] = f
 	return nil
 }
@@ -195,7 +196,12 @@ func (s *Server) exec(ci *CallInfo) (err error) {
 			} else {
 				err = fmt.Errorf("panic: %v", r)
 			}
-			slog.Error("chanrpc exec panic", slog.Any("id", ci.ID()), slog.Any("error", err), slog.String("stack", string(debug.Stack())))
+			slog.Error("chanrpc exec panic",
+				slog.Any("id", ci.ID()),
+				slog.String("name", ci.Name()),
+				slog.Any("error", err),
+				slog.String("stack", string(debug.Stack())),
+			)
 		}
 		if (panicked || !ci.held.Load()) && !ci.hasRet.Load() {
 			_ = ci.ret(&RetInfo{Err: err})
@@ -204,7 +210,7 @@ func (s *Server) exec(ci *CallInfo) (err error) {
 
 	handler, ok := s.functions[ci.ID()]
 	if !ok {
-		err = fmt.Errorf("chanrpc %d not registered", ci.ID())
+		err = fmt.Errorf("chanrpc id=%d name=%s not registered", ci.ID(), ci.Name())
 		return
 	}
 
@@ -231,7 +237,10 @@ func (s *Server) Exec(ci *CallInfo) {
 	ci.hasRet.Store(false)
 	ci.held.Store(false)
 	if err := s.exec(ci); err != nil {
-		slog.Warn("chanrpc exec failed", slog.Any("error", err))
+		slog.Warn("chanrpc exec failed",
+			slog.Any("id", ci.ID()),
+			slog.String("name", ci.Name()),
+			slog.Any("error", err))
 	}
 }
 

@@ -33,20 +33,49 @@ func BKDRHashStr(s string) uint32 {
 	return hashInt
 }
 
-// IMessage 允许消息结构体自定义其消息名的接口。
+// IMessage 允许消息结构体自定义其消息 ID 和日志名称的接口。
 //
-// 默认策略通过反射获取类型全限定名，但存在两种场景需要自定义：
-//  1. 同一结构体在不同上下文中表示不同语义（复用结构体降低内存分配）
-//  2. 需要与外部协议名对齐
+// 默认策略通过反射获取类型全限定名并计算 ID、名称；需要与外部协议或其他系统
+// 对齐时，可以实现此接口提供固定 ID 和名称。
 type IMessage interface {
 	// ID 返回消息结构体自定义的全局唯一消息 ID。
 	ID() uint32
+	// Name 返回消息结构体自定义的消息名称。
+	Name() string
 }
 
 var (
 	// idCache 缓存已通过反射计算过的消息类型 → ID 映射，避免重复的反射调用。
 	idCache sync.Map // map[reflect.Type]uint32
+	// nameCache 缓存已通过反射计算过的消息类型 → Name 映射，避免重复的反射调用。
+	nameCache sync.Map // map[reflect.Type]string
 )
+
+// Name 返回请求对象的 Go 类型名，供日志和错误信息定位消息类型。
+//
+// 指针请求会解引用一层，与 ID 的类型归一化规则保持一致；nil 请求没有可用的
+// 类型名，沿用调用路径中已有的 unknown 表示。
+func Name(m any) string {
+	if m == nil {
+		return "unknown"
+	}
+	if message, ok := m.(IMessage); ok {
+		return message.Name()
+	}
+
+	typ := reflect.TypeOf(m)
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+
+	if v, ok := nameCache.Load(typ); ok {
+		return v.(string)
+	}
+
+	name := fmt.Sprintf("%s:%s", typ.PkgPath(), typ.String())
+	nameCache.Store(typ, name)
+	return name
+}
 
 // ID 根据消息对象的类型返回其全局唯一ID（包含包路径的全限定类型名）。
 //
@@ -230,6 +259,7 @@ type CallInfo struct {
 	callback Callback       // 异步调用的回调函数，同步调用时为 nil
 	metadata map[string]any // 元数据
 	id       uint32         // 消息类型全限定ID，用于路由到对应的 Handler
+	name     string         // 消息类型名称，用于日志追踪打印
 	hasRet   atomic.Bool    // 防重复响应标志，通过 CAS 操作保证并发安全
 	held     atomic.Bool    // 延迟响应标志，见 Hold
 }
@@ -307,7 +337,10 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	// 返回 ErrAlreadyRet 而非静默 nil：延迟响应下回包在别的 goroutine 里发生，
 	// 调用方需要有办法知道自己这次回包没送出去。
 	if !ci.hasRet.CompareAndSwap(false, true) {
-		slog.Warn("chanrpc can not ret twice", slog.Any("id", ci.ID()), slog.String("stack", string(debug.Stack())))
+		slog.Warn("chanrpc can not ret twice",
+			slog.Any("id", ci.ID()),
+			slog.String("name", ci.Name()),
+			slog.String("stack", string(debug.Stack())))
 		return ErrAlreadyRet
 	}
 
@@ -316,7 +349,11 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
-			slog.Error("chanrpc ret error", slog.Any("id", ci.ID()), slog.Any("error", err), slog.String("stack", string(debug.Stack())))
+			slog.Error("chanrpc ret error",
+				slog.Any("id", ci.ID()),
+				slog.String("name", ci.Name()),
+				slog.Any("error", err),
+				slog.String("stack", string(debug.Stack())))
 		}
 	}()
 
@@ -339,15 +376,29 @@ func (ci *CallInfo) ret(ri *RetInfo) (err error) {
 	if !ci.chanRet.send(ri) {
 		// 丢包必须留痕：调用方那边只会表现为“回调没被执行”或“同步 Call 一直
 		// 等不到结果”，不在丢弃的这一刻打日志，现场就彻底没了。
-		slog.Error("chanrpc ret dropped", slog.Any("id", ci.ID()))
-		return fmt.Errorf("%w: id=%d", ErrRetDropped, ci.ID())
+		slog.Error("chanrpc ret dropped",
+			slog.Any("id", ci.ID()),
+			slog.String("name", ci.Name()),
+		)
+		return fmt.Errorf("%w: id=%d name=%s", ErrRetDropped, ci.ID(), ci.Name())
 	}
 	return nil
 }
 
 // ID 返回本次调用的消息类型全限定ID。
 func (ci *CallInfo) ID() uint32 {
+	if ci.id <= 0 {
+		return ID(ci.Request)
+	}
 	return ci.id
+}
+
+// Name 返回本次调用的消息名称。
+func (ci *CallInfo) Name() string {
+	if ci.name == "" {
+		return Name(ci.Request)
+	}
+	return ci.name
 }
 
 // RequestAs 把 Request 断言为 T，类型不符（或 Request 为 nil）时返回 T 的
