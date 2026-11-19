@@ -18,7 +18,8 @@ type pingAck struct {
 
 type customMsg struct{}
 
-func (customMsg) ID() uint32 { return 424242 }
+func (customMsg) ID() uint32   { return 424242 }
+func (customMsg) Name() string { return "customMsg" }
 
 // waitCallInfo 等一条待处理调用。先 Pop 再等信号：NotEmpty 是边沿信号且会
 // 合并，上来就等会在调用早已入队、信号却已被上一轮取走时白等到超时。
@@ -68,6 +69,15 @@ func TestIDDefaultPointerAndCustom(t *testing.T) {
 	}
 	if got := ID(nil); got != 0 {
 		t.Fatalf("nil ID = %d, want 0", got)
+	}
+	if got := Name(customMsg{}); got != "customMsg" {
+		t.Fatalf("custom message Name = %q, want customMsg", got)
+	}
+	if got := Name(&customMsg{}); got != "customMsg" {
+		t.Fatalf("pointer custom message Name = %q, want customMsg", got)
+	}
+	if got := Name(nil); got != "unknown" {
+		t.Fatalf("nil Name = %q, want unknown", got)
 	}
 }
 
@@ -620,15 +630,15 @@ func TestBKDRHashKnownValuesAndConsistency(t *testing.T) {
 func TestClientCheckValidationMatrixAndCastNoPanic(t *testing.T) {
 	c := NewClient(WithClientChanLen(1))
 	defer c.Close()
-	if _, err := c.check(nil, pingReq{}); !errors.Is(err, ErrServerNil) {
+	if _, _, err := c.check(nil, pingReq{}); !errors.Is(err, ErrServerNil) {
 		t.Fatalf("check nil server err = %v", err)
 	}
 	s := NewServer(WithChanLen(1))
-	if _, err := c.check(s, nil); !errors.Is(err, ErrInvalidMsgType) {
+	if _, _, err := c.check(s, nil); !errors.Is(err, ErrInvalidMsgType) {
 		t.Fatalf("check nil request err = %v", err)
 	}
 	s.Close()
-	if _, err := c.check(s, pingReq{}); !errors.Is(err, ErrServerClosed) {
+	if _, _, err := c.check(s, pingReq{}); !errors.Is(err, ErrServerClosed) {
 		t.Fatalf("check closed server err = %v", err)
 	}
 
@@ -636,7 +646,7 @@ func TestClientCheckValidationMatrixAndCastNoPanic(t *testing.T) {
 	closedClient.Close()
 	openServer := NewServer(WithChanLen(1))
 	defer openServer.Close()
-	if _, err := closedClient.check(openServer, pingReq{}); !errors.Is(err, ErrClientClosed) {
+	if _, _, err := closedClient.check(openServer, pingReq{}); !errors.Is(err, ErrClientClosed) {
 		t.Fatalf("check closed client err = %v", err)
 	}
 	closedClient.Cast(openServer, pingReq{})
@@ -653,7 +663,8 @@ func TestServerRegisterInvalidMessageID(t *testing.T) {
 
 type customZeroIDMsg struct{}
 
-func (customZeroIDMsg) ID() uint32 { return 0 }
+func (customZeroIDMsg) ID() uint32   { return 0 }
+func (customZeroIDMsg) Name() string { return "customZeroIDMsg" }
 
 func TestServerExecHandlerReturnsNilAndCastReturnPath(t *testing.T) {
 	s := NewServer(WithChanLen(2))

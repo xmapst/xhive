@@ -54,21 +54,10 @@ const shrinkThreshold = 8
 //
 // 零值不可用，必须通过 New 创建。
 type Queue[T any] struct {
-	mu   sync.Mutex
-	ring []T // 环形缓冲，长度即当前分配的容量，随积压增长、随空闲收缩
-	head int // 队首在 ring 中的下标
-	n    int // 当前元素个数
-
-	initCap int  // 初始容量，同时是收缩下限
-	max     int  // 硬性容量上限，等价于原生 make(chan T, max) 的 max
-	lowCnt  int  // 连续低水位计数，见 shrinkThreshold
-	closed  bool // Close 之后为 true，拒绝新元素但仍可 Pop 出残留
-
 	// notEmpty 是 cap=1 的**边沿**信号，不承载数据；它的唯一作用是让 Queue
 	// 能出现在 select 的一路上。信号会合并，消费方靠 Pop 的接力维持
 	// 「队列非空 ⟹ 有信号」这个不变式。
 	notEmpty chan struct{}
-
 	// notFull 走的是**广播**而不是边沿信号：队列变满时换上一个新的未关闭
 	// 通道，从满变回不满时把它 close，所有阻塞的生产者一次全醒。
 	//
@@ -79,6 +68,14 @@ type Queue[T any] struct {
 	//
 	// 它同时也更快：稳态下队列既不满也不空，这两个字段一次都不用碰。
 	notFull       chan struct{}
+	ring          []T // 环形缓冲，长度即当前分配的容量，随积压增长、随空闲收缩
+	head          int // 队首在 ring 中的下标
+	n             int // 当前元素个数
+	initCap       int // 初始容量，同时是收缩下限
+	max           int // 硬性容量上限，等价于原生 make(chan T, max) 的 max
+	lowCnt        int // 连续低水位计数，见 shrinkThreshold
+	mu            sync.Mutex
+	closed        bool // Close 之后为 true，拒绝新元素但仍可 Pop 出残留
 	notFullClosed bool
 }
 
