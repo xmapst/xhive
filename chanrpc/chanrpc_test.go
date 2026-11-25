@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,6 +97,56 @@ func TestServerRegisterValidationAndDuplicate(t *testing.T) {
 	}
 	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo { return nil }); err == nil {
 		t.Fatal("duplicate register should fail")
+	}
+}
+
+func TestServerUnregister(t *testing.T) {
+	s := NewServer(WithChanLen(4))
+	defer s.Close()
+	c := NewClient(WithClientChanLen(4))
+	defer c.Close()
+
+	if err := s.Unregister(nil); !errors.Is(err, ErrInvalidMsgType) {
+		t.Fatalf("unregister nil message err = %v, want ErrInvalidMsgType", err)
+	}
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo {
+		t.Error("unregistered handler should not run")
+		return nil
+	}); err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	var reply *RetInfo
+	enqueue := func() {
+		t.Helper()
+		if err := c.AsyncCall(s, pingReq{}, func(ri *RetInfo) { reply = ri }); err != nil {
+			t.Fatalf("AsyncCall failed: %v", err)
+		}
+	}
+	enqueue()
+	if err := s.Unregister((*pingReq)(nil)); err != nil {
+		t.Fatalf("unregister by pointer type failed: %v", err)
+	}
+	if err := s.Unregister(pingReq{}); err == nil {
+		t.Fatal("unregistering an absent handler should fail")
+	}
+	s.Exec(waitCallInfo(t, s))
+	c.AsyncCallback(waitRetInfo(t, c))
+	if reply == nil || reply.Err == nil || !strings.Contains(reply.Err.Error(), "not registered") {
+		t.Fatalf("queued call reply = %#v, want not registered error", reply)
+	}
+
+	if err := s.Register(pingReq{}, func(*CallInfo) *RetInfo {
+		return &RetInfo{Ack: "replacement", Err: s.Unregister(pingReq{})}
+	}); err != nil {
+		t.Fatalf("re-register failed: %v", err)
+	}
+	reply = nil
+	enqueue()
+	s.Exec(waitCallInfo(t, s))
+	c.AsyncCallback(waitRetInfo(t, c))
+	if reply == nil || reply.Err != nil || reply.Ack != "replacement" {
+		t.Fatalf("replacement call reply = %#v, want successful self-unregistration", reply)
 	}
 }
 

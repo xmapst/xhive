@@ -467,9 +467,15 @@ func (s *Skeleton) ChanRPC() *chanrpc.Server {
 
 // RegisterChanRPC 注册 RPC 消息处理函数，通过 msg 的类型自动推导消息 ID 并完成路由注册。
 //
-// 通常在 OnInit 中批量注册，注册完成后路由表不再变更，访问无需加锁。
+// 通常在 OnInit 中批量注册，也可在模块运行期间注册。
 func (s *Skeleton) RegisterChanRPC(msg any, f chanrpc.Handler) error {
 	return s.server.Register(msg, f)
+}
+
+// UnregisterChanRPC 移除 msg 对应的 RPC 消息处理函数，未注册时返回错误。
+// 注销不影响已经取得处理函数的调用，详见 chanrpc.Server.Unregister。
+func (s *Skeleton) UnregisterChanRPC(msg any) error {
+	return s.server.Unregister(msg)
 }
 
 // AsyncCall 向 svr 发起异步 RPC 调用，结果通过 cb 回调在本模块事件循环中执行。

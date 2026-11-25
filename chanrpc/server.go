@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -80,7 +81,8 @@ func WithCloseDrainTimeout(d time.Duration) ServerOption {
 // 架构优势：消息路由通过 functions 哈希表实现 O(1) 查找，
 // 相比传统的 switch-case 分发，新增消息类型只需调用 Register 注册一次，扩展成本极低。
 type Server struct {
-	functions         map[uint32]Handler      // 消息名 → 处理函数的路由表，初始化后只读，无需加锁
+	functionsMu       sync.RWMutex
+	functions         map[uint32]Handler      // 消息 ID → 处理函数，由 functionsMu 保护
 	chanCall          *queue.Queue[*CallInfo] // RPC 调用队列，容量按积压伸缩但有硬上限；满时异步投递失败、同步调用阻塞等待
 	closing           atomic.Bool             // Close 是否已经开始，只用于保证 Close 本身的幂等性
 	closed            atomic.Bool             // 是否已经完全关闭（排空彻底完成），client.check 据此拒绝新调用
@@ -140,7 +142,7 @@ func (s *Server) Cap() int64 {
 // Register 注册消息处理函数，通过传入 message 实例的类型自动推导消息名。
 //
 // 每种消息类型只允许注册一个处理函数（防止意外覆盖）。
-// 通常在模块的 OnInit 阶段完成注册，此后路由表只读，访问无需加锁。
+// 可在模块运行期间注册；路由表支持与 Unregister 和 Exec 并发访问。
 func (s *Server) Register(message any, f Handler) error {
 	if message == nil {
 		slog.Error("message is nil")
@@ -157,12 +159,36 @@ func (s *Server) Register(message any, f Handler) error {
 		return fmt.Errorf("chanrpc register: invalid message name %v", name)
 	}
 
-	if _, ok := s.functions[id]; ok {
+	s.functionsMu.Lock()
+	_, exists := s.functions[id]
+	if !exists {
+		s.functions[id] = f
+	}
+	s.functionsMu.Unlock()
+	if exists {
 		slog.Error("duplicate message", slog.Any("id", id), slog.String("name", name))
 		return fmt.Errorf("chanrpc register: id=%d name=%v already registered", id, name)
 	}
 	slog.Info("chanrpc register", slog.Any("id", id), slog.String("name", name))
-	s.functions[id] = f
+	return nil
+}
+
+// Unregister 按消息 ID 移除已注册的处理函数，未注册时返回错误。
+// 请求在 Exec 时查找处理函数：注销不影响已经取得处理函数的调用，
+// 尚未查找的调用（包括已入队的请求）按查找时的路由表处理。
+func (s *Server) Unregister(message any) error {
+	id := ID(message)
+	if id == 0 {
+		return fmt.Errorf("chanrpc unregister: %w (name=%s)", ErrInvalidMsgType, Name(message))
+	}
+
+	s.functionsMu.Lock()
+	_, exists := s.functions[id]
+	delete(s.functions, id)
+	s.functionsMu.Unlock()
+	if !exists {
+		return fmt.Errorf("chanrpc unregister: id=%d name=%s not registered", id, Name(message))
+	}
 	return nil
 }
 
@@ -208,9 +234,12 @@ func (s *Server) exec(ci *CallInfo) (err error) {
 		}
 	}()
 
-	handler, ok := s.functions[ci.ID()]
+	id := ci.ID()
+	s.functionsMu.RLock()
+	handler, ok := s.functions[id]
+	s.functionsMu.RUnlock()
 	if !ok {
-		err = fmt.Errorf("chanrpc id=%d name=%s not registered", ci.ID(), ci.Name())
+		err = fmt.Errorf("chanrpc id=%d name=%s not registered", id, ci.Name())
 		return
 	}
 

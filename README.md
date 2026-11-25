@@ -226,7 +226,7 @@ type IModule interface {
 
 | 分类             | 方法                                                                                                                          |
 |------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| RPC 注册         | `RegisterChanRPC(msg, handler)`                                                                                               |
+| RPC 注册与注销   | `RegisterChanRPC(msg, handler)`、`UnregisterChanRPC(msg)`                                                                       |
 | RPC 调用         | `Cast(svr, req)`、`AsyncCall(svr, req, cb)`、`Call(svr, req)`、`CallWithContext(ctx, svr, req)`；`svr` 为 `*chanrpc.Server`。 |
 | 本地异步任务     | `AsyncGo(name, f, cb)`、`NewLinearContext()`（详见[本地异步任务](#本地异步任务)）                                             |
 | 定时器           | `RegisterTimer`、`NewTimer`、`AccAbsTimer`、`AccPctTimer`、`DelayAbsTimer`、`DelayPctTimer`、`UpdateTimer`、`CancelTimer`     |
